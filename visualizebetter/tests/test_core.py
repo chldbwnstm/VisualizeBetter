@@ -1124,20 +1124,50 @@ def test_a_raising_subscriber_cannot_undo_a_committed_mutation():
     assert ("third", "node.update") in delivered  # 뒤 구독자까지 도달했다
 
 
-def test_citations_are_bounded():
-    """(CH1-4) 세 예약 배열 중 _citations 만 무캡이었다. cite() 는 append 후
-    **리스트 전체**를 patch 로 발행하고 touch_node 는 매번 노드를 deepcopy 하므로
-    XX 가 고친 것과 같은 O(n²) 경로다 (실측 2000건 = properties 215KB /
-    배치 페이로드 214MB)."""
+def test_the_citation_cap_refuses_instead_of_evicting():
+    """(CH1-4) 세 예약 배열 중 _citations 만 무캡이었다 — cite() 는 append 후
+    리스트 **전체**를 patch 로 발행하고 touch_node 는 매번 노드를 deepcopy 하므로
+    XX 가 고친 것과 같은 O(n²) 경로다 (실측 2000건 = 배치 페이로드 214MB).
+
+    ★ 캡을 **FIFO 가 아니라 거부**로 거는 이유: _citations 는 AI 가 도구로 못박은
+    저작물이고(Finding.evidence 와 동일 성격 — 그쪽은 이미 초과 시 raise),
+    README 는 "돌아왔을 때 검증 가능"을 약속한다. FIFO 는 **첫 근거**부터 지운다.
+    게다가 예약키라 set/remove 가 둘 다 거부되므로 AI 는 캡에 닿은 뒤 스스로
+    자리를 만들 수도 없다 — 볼 수도 되돌릴 수도 없는 손실이 된다."""
     g = Graph()
     g.add_node(id="n", label="N", type="class")
-    for i in range(MAX_CITATIONS_ENTRIES + 40):
+    for i in range(MAX_CITATIONS_ENTRIES):
+        g.cite("n", f"https://example.test/{i}", "src")
+    before = [dict(c) for c in g.get_node("n").properties[CITATIONS_PROPERTY]]
+    assert len(before) == MAX_CITATIONS_ENTRIES  # 전제: 캡까지는 실제로 들어간다
+
+    with pytest.raises(ValueError, match="maximum"):
+        g.cite("n", "https://example.test/overflow", "src")
+
+    after = g.get_node("n").properties[CITATIONS_PROPERTY]
+    assert after == before               # 첫 근거가 그대로 남는다
+    assert after[0]["url"].endswith("/0")
+
+
+def test_a_refused_citation_leaves_no_trace():
+    """(CH1-4) RN6 LL — 거부는 이력·이벤트·undo 에 흔적을 남기지 않는다.
+    검사가 touch_node 보다 **앞**에 있어야 성립한다."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class")
+    for i in range(MAX_CITATIONS_ENTRIES):
         g.cite("n", f"https://example.test/{i}", "src")
 
-    citations = g.get_node("n").properties[CITATIONS_PROPERTY]
-    assert len(citations) == MAX_CITATIONS_ENTRIES
-    assert citations[-1]["url"].endswith(str(MAX_CITATIONS_ENTRIES + 39))  # FIFO
+    seen = _capture_events(g)
+    g.update_node("n", {"set": {"label": "N2"}})  # 전제: 캡처가 살아 있다
+    assert seen == ["node.update"]
+    seen.clear()
+    depth_before = len(g.history.undo_stack)
 
+    with pytest.raises(ValueError):
+        g.cite("n", "https://example.test/overflow", "src")
+
+    assert seen == []
+    assert len(g.history.undo_stack) == depth_before
 
 def test_rejected_creation_leaves_every_downstream_surface_working():
     """(CH1 완료검증) ★ 오염 시나리오가 **애초에 성립하지 않음**을 단언한다 —
@@ -1251,3 +1281,31 @@ def test_a_refused_retype_leaves_the_old_bucket_intact():
 
     indices.retype_node("n", "class", "service")  # 정상 경로 회귀
     assert indices.by_type == {"service": {"n"}}
+
+
+def test_a_failed_index_removal_leaves_the_record_in_place():
+    """(CH1-3 개정) 삭제 방향도 같은 규칙이다 — "실패할 수 있는 쪽(인덱스)이
+    먼저". record-first 였을 때는 인덱스 제거가 raise 하면 호출자는 실패를 받는데
+    레코드는 이미 사라져 있었다(= 실패 통보인데 실제로는 삭제됨)."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class")
+    g.add_node(id="m", label="M", type="class")
+    g.add_edge(source="n", target="m", relation="calls")
+
+    boom = RuntimeError("index removal failed")
+    original = g.indices.remove_node
+
+    def explode(node):
+        raise boom
+
+    g.indices.remove_node = explode
+    try:
+        with pytest.raises(RuntimeError):
+            g.delete_node("n", cascade=True)
+    finally:
+        g.indices.remove_node = original
+
+    assert "n" in g.nodes                       # 실패면 레코드는 남는다
+    assert g.get_node("n").label == "N"
+    g.delete_node("n", cascade=True)            # 정상 경로 회귀
+    assert "n" not in g.nodes and "n" not in g.indices.adjacency

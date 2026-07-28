@@ -27,7 +27,14 @@ from visualizebetter.graph.core import (
 )
 import aiosqlite
 
-from visualizebetter.graph.snapshots import AutoSnapshotter, DB_FILENAME, SnapshotStore
+from visualizebetter.graph.snapshots import (
+    AutoSnapshotter,
+    DB_FILENAME,
+    SnapshotStore,
+    _dumps,
+    _sizing_payload,
+    _snapshot_payload,
+)
 
 
 @pytest.fixture
@@ -2083,3 +2090,166 @@ def test_lifespan_finally_runs_the_final_save():
     stop_at = source.index("await snapshotter.stop()")
     unsubscribe_at = source.index("hub.unsubscribe()", stop_at)
     assert "snapshot_if_dirty()" in source[stop_at:unsubscribe_at]
+
+
+# --- [13-B] CH1 2차 — 로드 검증 / ABA / 유휴 디바운스 / 크기 계산 ---
+
+
+def test_reload_during_a_save_keeps_the_graph_dirty(store):
+    """(CH1-4 정정) ★ 토큰을 `other._mutations` 에서 **복사**하면 카운터가 뒤로
+    간다 — load_snapshot/replace-import 가 만드는 Graph 는 add_* 를 안 거쳐 항상
+    0 이다. 그래서 저장 전 캡처한 토큰(3)이 다시 일치하게 되고(ABA), 저장이 쓰지
+    않은 뮤테이션까지 clear 되어 CH1(3) 이 없앤 손실이 load 경로로 재진입한다."""
+    graph = Graph()
+    for i in range(3):
+        graph.add_node(id=f"n{i}", label=f"N{i}", type="class")
+
+    replacement = Graph()
+    replacement.add_node(id="loaded", label="Loaded", type="class")
+    replacement.clear_dirty()
+
+    original = store._ensure_schema
+    raced = []
+
+    async def reload_mid_save(db):
+        await original(db)
+        graph.reload_from(replacement)      # 저장 도중 전체 교체
+        # ★ 토큰을 복사하면 카운터가 0 으로 돌아가므로, 캡처값(3)과 **같은 수**만큼
+        # 다시 뮤테이션하면 clear_dirty(3) 이 통과한다. 그 정확한 지점을 찌른다 —
+        # 아무 횟수나 하면 우연히 토큰이 어긋나 뮤테이션이 살아남는다.
+        for i in range(3):
+            graph.add_node(id=f"after{i}", label=f"After{i}", type="class")
+        raced.append(True)
+
+    store._ensure_schema = reload_mid_save
+    try:
+        run(store.save_snapshot(graph, name="race"))
+    finally:
+        store._ensure_schema = original
+
+    assert raced, "저장 도중 reload 가 실제로 일어나지 않았다 — 죽은 단언"
+    assert graph.dirty, "reload 이후의 뮤테이션이 clean 으로 표시됐다"
+    assert "after2" in graph.nodes  # 그 뮤테이션들이 실제로 그래프에 있다
+
+
+def test_findings_added_during_a_save_do_not_break_foreign_keys(store):
+    """(CH1-3) finding 은 finding + finding_node 두 테이블에 걸쳐 있어, 두 패스가
+    서로 다른 시점을 보면 앵커가 존재하지 않는 노드를 가리킨다."""
+    graph = Graph()
+    graph.add_node(id="a", label="A", type="class")
+    graph.add_finding(title="F1", node_ids=["a"])
+
+    original = store._ensure_schema
+    raced = []
+
+    async def add_finding_mid_save(db):
+        await original(db)
+        graph.add_node(id="late", label="Late", type="class")
+        graph.add_finding(title="F2", node_ids=["late"])
+        raced.append(True)
+
+    store._ensure_schema = add_finding_mid_save
+    try:
+        result = run(store.save_snapshot(graph, name="race"))
+    finally:
+        store._ensure_schema = original
+
+    assert raced, "저장 도중 finding 추가가 일어나지 않았다 — 죽은 단언"
+    loaded = run(store.load_snapshot(result["snapshot_id"]))
+    assert [f.title for f in loaded.findings.values()] == ["F1"]
+    for finding in loaded.findings.values():
+        assert all(node_id in loaded.nodes for node_id in finding.node_ids)
+
+
+def test_a_legacy_row_that_predates_the_value_contract_is_refused(tmp_path):
+    """(CH1-3 개정) ★ 네 번째 생성 문 — load_snapshot. CH1 이전 push_batch/import
+    는 `type=None` 을 조용히 승인했고, None 은 해시 가능해서 SQLite 에 NULL 로
+    멀쩡히 저장됐다(dict 과 달리 에러가 안 난다). 그런 행을 로드하면
+    by_type[None] 이 생기고 get_graph_summary — [23-D] 핸드오프의 첫 도구 — 가
+    "'<' not supported between NoneType and str" 로 죽는다. 라이브 경로를 다 고쳐도
+    **디스크에 있는 스냅샷 하나가** 다시 죽이므로 로드에도 계약이 걸려야 한다."""
+    data_dir = tmp_path / "legacy"
+    data_dir.mkdir()
+    # NOT NULL 제약 이전 스키마 — CREATE TABLE IF NOT EXISTS 라 실제 사용자 스토어에
+    # 이 형태가 남아 있을 수 있고, 그게 이 경로가 이론이 아닌 이유다.
+    conn = sqlite3.connect(data_dir / DB_FILENAME)
+    conn.executescript(
+        """
+        CREATE TABLE snapshot (id TEXT PRIMARY KEY, name TEXT, description TEXT,
+            created_at TEXT, kind TEXT, node_count INT, edge_count INT,
+            metadata TEXT, layers TEXT, version INT);
+        CREATE TABLE node (snapshot_id TEXT, id TEXT, label TEXT, "type" TEXT,
+            properties TEXT, parent_id TEXT, style_hint TEXT, position_hint TEXT,
+            layer TEXT, ttl INT, tags TEXT, created_at TEXT, updated_at TEXT,
+            created_by TEXT, PRIMARY KEY (snapshot_id, id));
+        INSERT INTO snapshot VALUES ('s1','legacy','','2026-01-01T00:00:00Z',
+            'manual',1,0,'{}','[]',1);
+        INSERT INTO node VALUES ('s1','a','A',NULL,'{}',NULL,NULL,NULL,NULL,0,'[]',
+            '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SnapshotStore(data_dir)
+    with pytest.raises(ValueError, match="cannot be loaded"):
+        run(store.load_snapshot("s1"))
+
+
+def test_the_sizing_payload_is_byte_identical_to_the_deep_one(store):
+    """(CH1-6) size 는 정수 하나인데 그걸 위해 그래프 전체를 deepcopy 했다
+    (100K 에서 캡처 2.25s 블로킹 / +192MB). 얕은 payload 로 바꾼 근거는 "같은
+    바이트가 나온다"이므로, 적대적 값에서 그게 실제로 성립하는지 고정한다."""
+    graph = Graph()
+    graph.add_node(
+        id="n",
+        label="이모지 😀 " + chr(34) + chr(92) + chr(10),
+        type="class",
+        properties={"nested": {"a": [1, -0.0, 1e-320, 2**53 + 1, None, True]}},
+        tags=["t"],
+    )
+    graph.add_node(id="m", label="M", type="class")
+    graph.add_edge(source="n", target="m", relation="calls", weight=0.1)
+    graph.add_finding(title="F", node_ids=["n"], evidence=["https://x"])
+
+    assert _dumps(_sizing_payload(graph)) == _dumps(_snapshot_payload(graph))
+
+    result = run(store.save_snapshot(graph, name="sized"))
+    assert result["size"] == len(_dumps(_snapshot_payload(graph)).encode("utf-8"))
+
+
+def test_the_idle_debounce_saves_without_waiting_for_the_tick(tmp_path):
+    """(CH1-5 정정) 종료 훅은 배포되는 두 형태 어디에도 도달하지 않는다 — Tauri 는
+    taskkill /F /T(TerminateProcess), 프록시가 띄운 serve 는 detached 다. 그래서
+    보장을 훅이 아니라 **유휴 디바운스**에 건다: 강제 종료·크래시·전원 차단까지
+    덮는 유일한 수단이고, 유휴 조건이라 1000 push/s 구간에는 발화하지 않는다."""
+
+    async def scenario():
+        store = SnapshotStore(tmp_path / "idle")
+        await store.initialize()
+        graph = Graph()
+        snapshotter = AutoSnapshotter(
+            graph, store, interval_seconds=3600, idle_debounce_seconds=0.3
+        )
+        snapshotter.start()
+        try:
+            graph.add_node(id="x", label="X", type="class")
+            await asyncio.sleep(0.15)
+            assert await store.list_snapshots() == []  # 전제: 아직 조용하지 않다
+
+            await asyncio.sleep(0.6)
+            after_idle = await store.list_snapshots()
+            assert len(after_idle) == 1
+            assert not graph.dirty
+
+            await asyncio.sleep(0.6)  # 계속 조용하면 중복 저장하지 않는다
+            assert len(await store.list_snapshots()) == 1
+
+            graph.add_node(id="y", label="Y", type="class")
+            await asyncio.sleep(0.6)
+            assert len(await store.list_snapshots()) == 2
+        finally:
+            await snapshotter.stop()
+        assert snapshotter._task is None and snapshotter._idle_task is None
+
+    run(scenario())

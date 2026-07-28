@@ -189,10 +189,19 @@ def create_app(
                 # process on an *orderly* shutdown, which is the one case the
                 # user expects to be safe. Best-effort: a failure here must not
                 # replace the real shutdown path with an exception.
+                # [13-B] CH1(5 정정) — bounded. Measured end-to-end for 100K is
+                # 2.63s, but if another process holds the write lock sqlite's 5s
+                # busy timeout applies *per statement*, and uvicorn does not pass
+                # timeout_graceful_shutdown, so an unbounded await here waits
+                # forever. 10s matches the existing ladder (migration 10s < proxy
+                # 25s < Tauri 40s). This hook is one layer of three — the idle
+                # debounce is what actually covers force-kill and crash.
                 try:
-                    await snapshotter.snapshot_if_dirty()
+                    await asyncio.wait_for(snapshotter.snapshot_if_dirty(), timeout=10)
+                except TimeoutError:
+                    logger.warning("final snapshot on shutdown timed out after 10s")
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning('final snapshot on shutdown failed: %s', exc)
+                    logger.warning("final snapshot on shutdown failed: %s", exc)
                 hub.unsubscribe()
 
     app = FastAPI(title="visualizebetter", lifespan=lifespan)

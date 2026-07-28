@@ -489,6 +489,8 @@ def create_server(
             node = graph.cite(node_id, source_url, source_title)
         except KeyError:
             raise ToolError(f"node not found: {node_id}") from None
+        except ValueError as exc:  # [13-B] CH1(4) — the citation cap is a refusal
+            raise ToolError(str(exc)) from None
         return {"ok": True, "node": node.to_dict()}
 
     _register_read(mcp, graph)

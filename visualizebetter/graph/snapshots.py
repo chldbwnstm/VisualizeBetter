@@ -24,13 +24,21 @@ import sqlite3
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
-from visualizebetter.graph.core import Edge, EdgeKey, Finding, Graph, Node, _now
+from visualizebetter.graph.core import (
+    Edge,
+    EdgeKey,
+    Finding,
+    Graph,
+    Node,
+    _now,
+    check_new_record,
+)
 
 DB_FILENAME = "visualizebetter.sqlite3"
 # Pre-rename identities (the project was "mcpgraph" until 2026-07-28). Existing
@@ -822,7 +830,11 @@ def _load_optional(raw: str | None) -> Any:
 
 
 def _snapshot_payload(graph: Graph) -> dict[str, Any]:
-    """The snapshot's logical content — what ``size`` measures ([5-E])."""
+    """The snapshot's logical content — what ``size`` measures ([5-E]).
+
+    ``to_dict`` is ``asdict``, i.e. a deep copy, which is what makes the capture
+    safe to hold across the ``await``s in ``save_snapshot``.
+    """
     return {
         "metadata": graph.metadata,
         "layers": graph.layers,
@@ -831,6 +843,52 @@ def _snapshot_payload(graph: Graph) -> dict[str, Any]:
         "edges": [edge.to_dict() for edge in graph.edges.values()],
         "findings": [finding.to_dict() for finding in graph.findings.values()],
     }
+
+
+def _sizing_payload(graph: Graph) -> dict[str, Any]:
+    """[13-B] CH1(6) — the same JSON as ``_snapshot_payload``, without the copy.
+
+    ``size`` is one integer, and computing it used to cost a full ``asdict`` deep
+    copy of the graph: at 100K nodes the capture blocked for ~2.25s (deepcopy
+    1.13s + dumps 0.37s + row building 0.75s) and peaked +192MB. Serialising the
+    records' ``__dict__`` directly produces byte-identical JSON — verified equal
+    at both KPI sizes — for 409ms and 1.6MB, taking the capture to ~1.16s.
+
+    ★ The result **must not cross an ``await``**. These are live references, and
+    ``properties`` is mutated in place (``update()``, ``setdefault().append()``),
+    so anything held past a suspension point would let a concurrent edit leak
+    into a snapshot that had already been measured. Use it, take its length, drop
+    it — the rows come from ``_snapshot_payload``'s deep capture.
+    """
+    return {
+        "metadata": graph.metadata,
+        "layers": graph.layers,
+        "version": graph.version,
+        "nodes": [node.__dict__ for node in graph.nodes.values()],
+        "edges": [edge.__dict__ for edge in graph.edges.values()],
+        "findings": [finding.__dict__ for finding in graph.findings.values()],
+    }
+
+
+def _check_restored(
+    cls: type, record: Any, kind: str, identity: Any, snapshot_id: str
+) -> None:
+    """[13-B] CH1(3 개정) — the value contract, applied to rows coming off disk.
+
+    ``check_new_record`` refuses the same values here that ``add_node``/``add_edge``
+    refuse on the way in, so a snapshot written before that contract existed
+    cannot smuggle them back. The error names the snapshot and the row because a
+    refusal the operator cannot act on is barely better than the corruption.
+    """
+    values = {f.name: getattr(record, f.name) for f in fields(cls)}
+    try:
+        check_new_record(cls, values)
+    except ValueError as exc:
+        raise ValueError(
+            f"snapshot {snapshot_id} cannot be loaded: {kind} {identity!r} is invalid"
+            f" — {exc}. It was written before the [13-B] value contract existed;"
+            " the snapshot is left untouched."
+        ) from None
 
 
 class SnapshotStore:
@@ -941,8 +999,11 @@ class SnapshotStore:
         """
         snapshot_id = str(uuid.uuid4())
         token = graph.dirty_token
+        # [13-B] CH1(6) — measure off live references (cheap), then take the deep
+        # capture the rows are built from. Both happen before the first await, so
+        # they describe the same instant; the shallow one is dropped right here.
+        size = len(_dumps(_sizing_payload(graph)).encode("utf-8"))
         payload = _snapshot_payload(graph)
-        size = len(_dumps(payload).encode("utf-8"))
         nodes, edges, findings = payload["nodes"], payload["edges"], payload["findings"]
 
         async with aiosqlite.connect(self.db_path) as db:
@@ -1014,6 +1075,11 @@ class SnapshotStore:
                     for edge in edges
                 ],
             )
+            # ★ Finding is the one record whose dataclass field order differs
+            # from its INSERT column order (``node_ids`` is the 4th field and has
+            # no column here — it lives in ``finding_node``). Keys, never
+            # positions: shortening this to ``tuple(d.values())`` would shift
+            # every finding column by one and still insert cleanly.
             await db.executemany(
                 "INSERT INTO finding (snapshot_id, finding_id, title, body,"
                 " confidence, evidence, layer, tags, created_by, created_at,"
@@ -1059,6 +1125,21 @@ class SnapshotStore:
         a restore must preserve created_at/updated_at exactly, must not publish
         mutation events, and must not mark the graph dirty. The [5-E] "전체 그래프
         교체" semantics belong to the tool/serve layer.
+
+        [13-B] CH1(3 개정) — this is the **fourth** creation path, and it was the
+        one left unguarded: rebuilding by hand skipped the value contract as well
+        as add_node's ordering. That is not hypothetical. Before CH1, push_batch
+        and import accepted ``type=None`` silently, and ``None`` *is* hashable, so
+        such a node reached SQLite as a clean NULL rather than erroring. Loading
+        that row builds ``by_type[None]``, and the next ``get_graph_summary`` — the
+        [23-D] handoff's first tool — dies with "'<' not supported between
+        NoneType and str". Fixing the live paths does not help: a snapshot already
+        on disk re-injects the bad row.
+
+        Fail-closed: one bad row rejects the whole load, naming the row and the
+        field. Nothing auto-loads a snapshot at startup, so this cannot brick the
+        app, and refusing wholesale matches [5-E]'s all-or-nothing replace — a
+        half-restored graph is the state no caller can reason about.
         """
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -1095,8 +1176,9 @@ class SnapshotStore:
                         updated_at=row["updated_at"],
                         created_by=row["created_by"],
                     )
+                    _check_restored(Node, node, "node", node.id, snapshot_id)
+                    graph.indices.add_node(node)  # index first, as add_node does
                     graph.nodes[node.id] = node
-                    graph.indices.add_node(node)
 
             async with db.execute(
                 "SELECT * FROM edge WHERE snapshot_id = ?", (snapshot_id,)
@@ -1118,8 +1200,9 @@ class SnapshotStore:
                         created_by=row["created_by"],
                     )
                     identity: EdgeKey = edge.identity
+                    _check_restored(Edge, edge, "edge", identity, snapshot_id)
+                    graph.indices.add_edge(identity, edge)  # index first
                     graph.edges[identity] = edge
-                    graph.indices.add_edge(identity, edge)
 
             anchors = await self._load_anchors(db, snapshot_id)
 
@@ -1195,6 +1278,23 @@ class SnapshotStore:
         return [dict(row) for row in rows]
 
 
+IDLE_DEBOUNCE_SECONDS = 5.0
+"""[13-B] CH1(5 정정) — save this long after the last mutation, once it goes quiet.
+
+The shutdown hook only fires on an orderly shutdown, and neither shipped form has
+one: Tauri kills the sidecar with ``taskkill /F /T`` (TerminateProcess — no
+lifespan shutdown at all), and the proxy launches ``serve`` detached, so nobody
+asks it to stop. The hook therefore protects ``serve`` + Ctrl+C and nothing else,
+leaving the periodic tick's 300s as the real worst-case exposure.
+
+An idle debounce is the only trigger that also survives a force-kill, a crash or
+a power cut, because it has already written before the process dies. It cannot
+fight the [15] 1000 push/s KPI either: that workload has no 5s quiet gap, so the
+debounce simply never fires during it — it fires in the pauses, which is when a
+snapshot is cheap and when an AI session actually ends.
+"""
+
+
 class AutoSnapshotter:
     """[23-C] 자동 스냅샷 — gold 유실 방지.
 
@@ -1228,31 +1328,37 @@ class AutoSnapshotter:
         store: SnapshotStore,
         interval_seconds: float = DEFAULT_AUTO_INTERVAL_SECONDS,
         keep: int = MAX_AUTO_SNAPSHOTS,
+        idle_debounce_seconds: float = IDLE_DEBOUNCE_SECONDS,
     ) -> None:
         self.graph = graph
         self.store = store
         self.interval_seconds = interval_seconds
         self.keep = keep
+        self.idle_debounce_seconds = idle_debounce_seconds
         self._task: asyncio.Task[None] | None = None
+        self._idle_task: asyncio.Task[None] | None = None
 
     @property
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
 
     def start(self) -> None:
-        """Begin the periodic task. Called by serve at boot."""
+        """Begin the periodic and idle-debounce tasks. Called by serve at boot."""
         if self.running:
             return
         self._task = asyncio.create_task(self._run())
+        self._idle_task = asyncio.create_task(self._run_idle())
 
     async def stop(self) -> None:
-        """Cancel the periodic task and wait for it to unwind."""
-        task, self._task = self._task, None
-        if task is None:
-            return
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        """Cancel both tasks and wait for them to unwind."""
+        tasks = [self._task, self._idle_task]
+        self._task = self._idle_task = None
+        for task in tasks:
+            if task is None:
+                continue
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     async def _run(self) -> None:
         """[23-C] TT — one failing tick must not end the safety net.
@@ -1274,6 +1380,39 @@ class AutoSnapshotter:
                 raise
             except Exception as exc:  # noqa: BLE001
                 log.warning("auto snapshot tick failed: %s", exc)
+
+    async def _run_idle(self) -> None:
+        """[13-B] CH1(5 정정) — save once the graph has been quiet for a while.
+
+        Polls the same ``dirty`` flag and the same mutation counter the periodic
+        tick uses, so the two triggers never both write the same state: whichever
+        fires first clears the flag and the other finds nothing to do.
+
+        Follows TT's guard policy exactly — a failing tick logs and continues,
+        ``CancelledError`` propagates so ``stop()`` still works.
+        """
+        last_seen = self.graph.dirty_token
+        quiet_for = 0.0
+        poll = min(1.0, self.idle_debounce_seconds)
+        while True:
+            await asyncio.sleep(poll)
+            token = self.graph.dirty_token
+            if token != last_seen:
+                last_seen, quiet_for = token, 0.0
+                continue
+            if not self.graph.dirty:
+                quiet_for = 0.0
+                continue
+            quiet_for += poll
+            if quiet_for < self.idle_debounce_seconds:
+                continue
+            quiet_for = 0.0
+            try:
+                await self.snapshot_if_dirty()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("idle auto snapshot failed: %s", exc)
 
     async def snapshot_if_dirty(self) -> dict[str, Any] | None:
         """One periodic tick: save only when the graph changed ([23-C])."""

@@ -22,9 +22,6 @@ Coalescing into graph.batch and the seq-based resync procedure belong to the hub
 from __future__ import annotations
 
 import logging
-
-log = logging.getLogger(__name__)
-
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -39,6 +36,9 @@ FINDING_ADD = "finding.add"
 FINDING_UPDATE = "finding.update"
 FINDING_DELETE = "finding.delete"
 CLEAR = "clear"
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)

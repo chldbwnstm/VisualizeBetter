@@ -53,7 +53,7 @@ VALID_REASONS = frozenset({REASON_CORRECTION, REASON_SUPERSEDE})
 MAX_SUPERSEDED_ENTRIES = 10
 
 MAX_CITATIONS_ENTRIES = 100
-"""[13-B] CH1(4) — cap on a node's ``_citations`` array.
+"""[13-B] CH1(4) — cap on a node's ``_citations`` array. **Refused, not trimmed.**
 
 The third reserved array was the only uncapped one (``_superseded`` 10,
 ``_provenance`` 50), and it grows through the same quadratic path XX was fixed
@@ -61,10 +61,29 @@ for: ``cite()`` appends, then publishes the *whole* list in the patch, while
 ``history.touch_node`` deep-copies the entire node per call. Measured: 200 cites
 = 21KB properties / 2.1MB of batch payload; 2000 cites = 215KB / **214MB**.
 
-100 rather than 50: an entry is small (url + title + ts) and evidence lists are
-legitimately longer than change logs — a node can reasonably carry dozens of
-sources. What must stay bounded is the wire payload, which grows linearly with
-this number, so it is capped rather than left open. Oldest evicted first.
+The cap is enforced by refusing the 101st ``cite()``, not by evicting the oldest.
+The dividing line is **who authored the entry**, not "is it an array":
+
+- ``_superseded`` / ``_provenance`` are the server's own bookkeeping, so FIFO
+  costs nothing but log resolution.
+- ``_citations`` — like ``Finding.evidence`` — is something an AI deliberately
+  nailed down with a tool call. [23-B] already spells this out for the sibling
+  data (``_check_finding_size`` raises rather than truncating; the plan calls
+  evidence "근거 URL/주소 리스트 (cite 와 동일 성격)"), and the README promises
+  every discovery stays "verifiable whenever you come back". A silent FIFO makes
+  the *first* evidence the thing that disappears. [23-A] 원칙 4: never lose
+  anything silently. RN6 LL was this exact accident already.
+- Decisively: an AI that hits the cap cannot make room. ``_citations`` is
+  reserved, so both ``set`` and ``remove`` are refused — a silent eviction would
+  be a loss it can neither see nor undo.
+
+100 rather than 50: an entry is small (url + title + ts) and the sibling cap is
+64 (``MAX_FINDING_EVIDENCE``), while real usage is one or two per node. What must
+stay bounded is the wire payload, which grows linearly with this number.
+
+A legacy store may hold a node already past 100. It is left as it is — normalising
+it would be exactly the silent truncation this rule exists to forbid — and the
+error simply explains the state.
 """
 
 MAX_PROVENANCE_ENTRIES = 50
@@ -371,7 +390,7 @@ def check_new_record(cls: type, values: dict[str, Any]) -> None:
     """[13-B] CH1(1) — the *creation* path gets the same value contract as update.
 
     RN7 closed the update door with ``check_field_types`` but left this one open,
-    on the assumption that the MCP signature (``type: str``) already типed it.
+    on the assumption that the MCP signature (``type: str``) already typed it.
     That holds for ``push_node``/``push_edge`` only: ``push_batch`` takes raw
     dicts (its bounds model allows extras and checks ttl alone) and
     ``import_graph``/``import_from_file`` hand arbitrary JSON straight to
@@ -698,7 +717,15 @@ class Graph:
         self.version = other.version
         self.indices = other.indices
         self.dirty = False
-        self._mutations = other._mutations
+        # [13-B] CH1(4 정정) — advance, never adopt. ``other`` is built by
+        # load_snapshot/import without going through add_*, so its counter is 0;
+        # copying it walks this graph's token *backwards* and a clear_dirty(token)
+        # captured before the reload starts matching again (ABA). A save that was
+        # in flight would then clear a flag raised by mutations it never wrote,
+        # re-opening the loss CH1(3) closed — through the load path this time.
+        # A full replace is itself a mutation, so incrementing is also the honest
+        # reading.
+        self._mutations += 1
         # [M2e D-6] a full replace invalidates the undo/redo history — its images
         # point at records this graph no longer holds (snapshot load / replace import).
         self.history.clear()
@@ -1006,8 +1033,12 @@ class Graph:
         for edge_key in sorted(edge_keys):
             self.delete_edge(*edge_key)
 
-        del self.nodes[id]
+        # [13-B] CH1(3 개정) — the rule is not "index first on create", it is
+        # "whichever side can fail goes first", and on the way out that is still
+        # the index. Record-first meant an index removal that raised left the
+        # caller holding a failure for a record that was already gone.
         self.indices.remove_node(node)
+        del self.nodes[id]
         self._touch()
         self.events.publish(NODE_DELETE, {"id": id})
         self._detach_node_from_findings(id)
@@ -1020,16 +1051,27 @@ class Graph:
         Appends to the node's reserved ``_citations`` array ([23-B]), creating it
         on first use. Citations accumulate: several per node is the point.
         source_url may be a file path or an address (an IDA address, say) — it
-        need not be http ([5-F]). Raises KeyError if the node does not exist.
+        need not be http ([5-F]). Raises KeyError if the node does not exist, and
+        ValueError once the node holds ``MAX_CITATIONS_ENTRIES`` — evidence an AI
+        nailed down is never evicted to make room ([23-A] 원칙 4).
         """
         node = self.nodes.get(node_id)
         if node is None:
             raise KeyError(node_id)
 
+        # [13-B] CH1(4) — checked before touch_node, so a refusal leaves no trace
+        # (RN6 LL). Refusing rather than evicting: see MAX_CITATIONS_ENTRIES.
+        existing = node.properties.get(CITATIONS_PROPERTY) or []
+        if len(existing) >= MAX_CITATIONS_ENTRIES:
+            raise ValueError(
+                f"node {node_id!r} has the maximum {MAX_CITATIONS_ENTRIES} citations"
+                " ([5-F]); cite a more specific node or record_finding(evidence=[...])"
+                " instead"
+            )
+
         self.history.touch_node(node_id)  # [M2e] before the _citations append
         citations = node.properties.setdefault(CITATIONS_PROPERTY, [])
         citations.append({"url": source_url, "title": source_title, "ts": _now()})
-        _trim_by_count(citations, MAX_CITATIONS_ENTRIES)  # [13-B] CH1(4)
         node.updated_at = _now()
         self._touch()
         # Copied, so a later cite() cannot mutate an already-published payload.
@@ -1091,14 +1133,16 @@ class Graph:
         """
         for edge_key in edge_keys:
             self.history.touch_edge(edge_key)  # [M2e] before-image for undo of clear
-            edge = self.edges.pop(edge_key, None)
+            edge = self.edges.get(edge_key)
             if edge is not None:
-                self.indices.remove_edge(edge_key, edge)
+                self.indices.remove_edge(edge_key, edge)  # [13-B] CH1(3) index first
+                del self.edges[edge_key]
         for node_id in node_ids:
             self.history.touch_node(node_id)  # [M2e]
-            node = self.nodes.pop(node_id, None)
+            node = self.nodes.get(node_id)
             if node is not None:
-                self.indices.remove_node(node)
+                self.indices.remove_node(node)  # [13-B] CH1(3) index first
+                del self.nodes[node_id]
         self._touch()
         return {"removed_nodes": len(node_ids), "removed_edges": len(edge_keys)}
 
@@ -1289,8 +1333,8 @@ class Graph:
         if edge is None:
             raise KeyError(identity)
         self.history.touch_edge(identity)  # [M2e] before removal
+        self.indices.remove_edge(identity, edge)  # [13-B] CH1(3) index first
         del self.edges[identity]
-        self.indices.remove_edge(identity, edge)
         self._touch()
         self.events.publish(
             EDGE_DELETE,
