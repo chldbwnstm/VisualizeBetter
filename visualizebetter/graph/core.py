@@ -492,6 +492,23 @@ backlog. Lowering this instead would collide with ``MAX_CITATIONS_ENTRIES = 100`
 which we sized deliberately.
 """
 
+SQLITE_INT_MIN = -(2 ** 63)
+SQLITE_INT_MAX = 2 ** 63 - 1
+"""[13-B] CH1c2 B — the range SQLite's INTEGER column can actually bind.
+
+The storability gate rested on a premise that turns out to be false: that
+``json.dumps`` succeeding proves the value can be stored. JSON has *arbitrary
+precision* integers, so ``ttl = 2**63`` serialises perfectly and then dies in
+``sqlite3`` with ``OverflowError: Python int too large to convert to SQLite
+INTEGER``. And ``ttl`` is not inside a JSON blob like ``properties`` — it binds
+straight to an INTEGER column, as do the REAL columns for ``weight`` and
+``confidence``. ``push_node``'s ``Field(ge=0)`` has no upper bound either.
+
+Storability is therefore **two** conditions, not one: serialisable *and*
+bindable. This constant is the second half.
+"""
+
+
 def _check_depth(value: Any, field_name: str, limit: int) -> None:
     """[13-B] CH1b/CH1c — bound nesting without recursing.
 
@@ -512,6 +529,18 @@ def _check_depth(value: Any, field_name: str, limit: int) -> None:
                 " such a value cannot be copied, serialised or snapshotted ([13-B])"
             )
         if type(current) is dict:
+            # [13-B] CH1c2 F — every depth, not just the top level. ``json.dumps``
+            # coerces int/float/bool/None keys to strings **without an error**, so
+            # {"m": {1: "a"}} round-trips with the key changed from 1 to "1" — and
+            # when both exist, {1: "int", "1": "str"} is written as duplicate JSON
+            # keys and one of them is simply gone after a load. ``check_properties``
+            # only ever looked at the outermost map.
+            bad = sorted((repr(k) for k in current if type(k) is not str), key=str)
+            if bad:
+                raise ValueError(
+                    f"field {field_name!r} has non-string keys {bad} nested inside it;"
+                    " JSON would silently coerce them and collide ([23-B])"
+                )
             stack.extend((item, depth + 1) for item in current.values())
         elif type(current) is list:
             stack.extend((item, depth + 1) for item in current)
@@ -601,10 +630,22 @@ def check_storable(cls: type, values: dict[str, Any]) -> None:
     5. **serialisation** — the record's own values through
        ``json.dumps(ensure_ascii=False, allow_nan=False).encode("utf-8")``, the
        exact call the snapshot writer, the [8-C] wire and ``export_graph`` all
-       make. Whatever fails here could never have been stored, so refusing it at
-       the door is the only outcome that leaves the graph usable. This one line
-       closes surrogates, NaN, cycles and unknown types together, and keeps
-       closing them when a new field is added.
+       make. It closes surrogates, NaN, cycles and unknown types.
+
+    ★ [13-B] CH1c2 B — (5) is **not** a superset of (1)–(4), and the earlier claim
+    that "this one line closes everything" was wrong. What (5) provably cannot
+    catch, so that nobody deletes the other layers as redundant:
+
+    - **integer range** — JSON has arbitrary-precision integers, so ``ttl=2**63``
+      serialises fine and then raises ``OverflowError`` at the SQLite bind. Storable
+      means serialisable **and** bindable; only layer (1)'s range check sees this.
+    - **depth** — ``json.dumps`` recurses, so a value deep enough to matter takes
+      the gate down with it instead of being reported. (4) runs first, iteratively.
+    - **list element types** — ``["a", 7]`` is valid JSON; only (3) knows the field
+      declared ``list[str]``.
+    - **non-string dict keys** — ``json.dumps`` *coerces* them silently, so a
+      round trip changes ``{1: "a"}`` into ``{"1": "a"}`` and merges collisions.
+      Only the (4) walk sees it.
 
     Gating the **incoming** values rather than the whole record is deliberate and
     sufficient: every value already in a record passed this same gate on its way
@@ -651,6 +692,14 @@ def _walk_values(cls: type, values: dict[str, Any], *, depth_limit: int) -> None
             raise ValueError(
                 f"field {name!r} must be a finite number, got {value!r};"
                 " NaN and Infinity have no JSON form ([13-B])"
+            )
+        if type(value) is int and not SQLITE_INT_MIN <= value <= SQLITE_INT_MAX:
+            # [13-B] CH1c2 B — this field binds to an INTEGER column directly, and
+            # JSON's arbitrary-precision integers sail past the serialisation gate.
+            raise ValueError(
+                f"field {name!r} is {value!r}, outside the range SQLite can store"
+                f" ({SQLITE_INT_MIN}..{SQLITE_INT_MAX}); it serialises but cannot"
+                " be bound ([13-B])"
             )
         # [13-B] CH1c — only containers can nest, and skipping the ~1.7us call on
         # every scalar is most of the gate's cost on the bulk paths.
@@ -789,7 +838,18 @@ def check_restorable(cls: type, values: dict[str, Any]) -> list[str]:
                 f"field {name!r} is {value!r}, which has no JSON form ([13-B])"
             )
         if type(value) in (dict, list):
-            _check_depth(value, name, MAX_STRUCTURE_DEPTH)
+            # [13-B] CH1c2 A — ★ depth is **not** a refusal ground on restore.
+            # Measured on 2bdaca1: depths 32/128/200/300/402/450/480/485/490 all
+            # create, save, load, summarise, list, get, export, re-save and delete
+            # correctly; 493 raises RecursionError at *create*, so it can never
+            # reach disk. Refusing at 128 would therefore have cut out only the
+            # 129..490 band that is *proven* to work.
+            #
+            # The argument is constructive: anything on disk got there through
+            # create, create implies depth <= ~490, and <= ~490 is known-good. So
+            # "a snapshot that opens today keeps opening" holds by construction
+            # rather than by our having enumerated the cases. 128 stays as the
+            # ceiling for *new* writes, which is a policy choice and a sound one.
             over = _depth_over(value, MAX_CALLER_VALUE_DEPTH)
             if over:
                 notes.append(
@@ -976,6 +1036,7 @@ def validate_patch(
     if unknown:
         raise ValueError(f"unknown fields: {sorted(unknown)}")
     check_field_types(target, updates)  # [23-C] RN7 SS
+    _check_projected_record(target, updates, patch.get("remove") or ())
 
     if removals:
         if not hasattr(target, "properties"):
@@ -992,6 +1053,61 @@ def validate_patch(
                 "properties keys starting with '_' are system-owned and cannot be "
                 f"removed: {reserved_removals} ([23-B])"
             )
+
+
+def _check_projected_record(
+    target: Node | Edge | Finding, updates: dict[str, Any], removals: Any
+) -> None:
+    """[13-B] CH1c2 D — refuse a write that would build an unstorable record.
+
+    The asymmetry was backwards. A write measured only the **caller's** values
+    against the record ceiling while the restore measured the **whole record**, so
+    the server happily assembled records it could then refuse to load. Four ways
+    to get there, all with every individual call legal: four merge pushes of 30KB
+    under different keys (120,313 B), three properties patches (90,300 B), three
+    supersedes with a 30KB label (120,526 B).
+
+    Projecting is cheap: ``__dict__`` is used directly rather than ``to_dict()``
+    because the projection is measured and dropped inside this call, never held
+    across an ``await`` — the same reasoning as ``_sizing_payload`` ([13-B] CH1b).
+
+    The server's own bookkeeping is bounded separately (``_superseded`` by bytes,
+    ``_provenance`` and ``_citations`` by count), so what it can add after this
+    check is capped and cannot turn an accepted write into an over-budget record.
+    """
+    projected = {**target.__dict__, **updates}
+    if "properties" in projected and type(projected["properties"]) is dict:
+        merged = {**target.properties, **(updates.get("properties") or {})}
+        for key in removals:
+            merged.pop(key, None)
+        projected["properties"] = merged
+    try:
+        size = len(json.dumps(projected, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+        return  # the field-level gate above already reported the real problem
+    if size > MAX_VALUE_BYTES:
+        raise ValueError(
+            f"this edit would make the record {size} bytes, over the"
+            f" {MAX_VALUE_BYTES} limit ([13-B]). {_record_budget_breakdown(target)}"
+        )
+
+
+def _record_budget_breakdown(target: Node | Edge | Finding) -> str:
+    """[13-B] CH1c2 D — say what is actually using the budget, not just that it is full."""
+    properties = getattr(target, "properties", None)
+    if type(properties) is not dict:
+        return "Reduce the size of the fields you are setting."
+    parts = []
+    for key in sorted(properties):
+        try:
+            used = len(json.dumps(properties[key], ensure_ascii=False).encode("utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        if used > 1024:
+            parts.append(f"{key}={used}B")
+    if not parts:
+        return "Reduce the size of the fields you are setting."
+    return "Largest existing entries: " + ", ".join(parts[:6]) + "."
 
 
 def _apply_patch(
@@ -1084,7 +1200,7 @@ def _trim_by_count(archive: list[dict[str, Any]], cap: int) -> None:
         del archive[:excess]
 
 
-MAX_NODE_SUPERSEDED_BYTES = 16384
+MAX_RECORD_SUPERSEDED_BYTES = 16384
 """[13-B] CH1c B — the byte cap a node's ``_superseded`` was missing.
 
 ``MAX_SUPERSEDED_ENTRIES`` bounded the count only, and an entry's ``prev`` is as
@@ -1101,10 +1217,15 @@ log resolution. (Refusal is for what the AI authored — ``_citations``,
 """
 
 
-def _trim_node_archive(archive: list[dict[str, Any]]) -> None:
-    """[13-B] CH1c B — bound a node's supersession log by count and by size."""
+def _trim_record_archive(archive: list[dict[str, Any]]) -> None:
+    """[13-B] CH1c B — bound a supersession log by count *and* by size.
+
+    ``_record_lifecycle`` is shared by nodes and edges, so this covers both; only
+    ``Finding`` keeps its own ([24-C]) because its history lives in a field rather
+    than in ``properties``.
+    """
     _trim_by_count(archive, MAX_SUPERSEDED_ENTRIES)
-    while len(archive) > 1 and _serialized_bytes(archive) > MAX_NODE_SUPERSEDED_BYTES:
+    while len(archive) > 1 and _serialized_bytes(archive) > MAX_RECORD_SUPERSEDED_BYTES:
         archive.pop(0)
 
 
@@ -1509,7 +1630,7 @@ class Graph:
                 return patch
             archive = target.properties.setdefault(SUPERSEDED_PROPERTY, [])
             archive.append(_history_entry(previous, by))
-            _trim_node_archive(archive)  # [13-B] CH1c B — count *and* bytes
+            _trim_record_archive(archive)  # [13-B] CH1c B — count *and* bytes
             extra[SUPERSEDED_PROPERTY] = copy.deepcopy(archive)
         else:  # REASON_CORRECTION — [24-B] 틀린 값은 버린다.
             log = target.properties.setdefault(PROVENANCE_PROPERTY, [])
@@ -1568,6 +1689,20 @@ class Graph:
         if node is None:
             raise KeyError(node_id)
 
+        # [13-B] CH1c2 C — ★ cite() was the ninth door, and nobody had counted it.
+        # It appended caller strings straight into `_citations` without ever
+        # calling check_storable or check_properties, and the MCP tool validated
+        # nothing either — so the surrogate blocker CH1b closed walked right back
+        # in through cite(), and the node then failed every save_snapshot and made
+        # /graph.json a 500. The lesson is not "we missed one": it is that a
+        # hand-maintained list of doors is the wrong mechanism, which is why there
+        # is now an AST audit that finds them instead of us remembering.
+        entry = {"url": source_url, "title": source_title, "ts": _now()}
+        check_storable(Node, {"properties": {CITATIONS_PROPERTY: [entry]}})
+        _check_projected_record(
+            node, {"properties": {CITATIONS_PROPERTY: [*(node.properties.get(CITATIONS_PROPERTY) or []), entry]}}, ()
+        )
+
         # [13-B] CH1(4) — checked before touch_node, so a refusal leaves no trace
         # (RN6 LL). Refusing rather than evicting: see MAX_CITATIONS_ENTRIES.
         existing = node.properties.get(CITATIONS_PROPERTY) or []
@@ -1580,7 +1715,7 @@ class Graph:
 
         self.history.touch_node(node_id)  # [M2e] before the _citations append
         citations = node.properties.setdefault(CITATIONS_PROPERTY, [])
-        citations.append({"url": source_url, "title": source_title, "ts": _now()})
+        citations.append(entry)
         node.updated_at = _now()
         self._touch()
         # Copied, so a later cite() cannot mutate an already-published payload.

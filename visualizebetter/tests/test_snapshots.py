@@ -2482,16 +2482,27 @@ def test_a_row_that_cannot_be_indexed_is_still_a_hard_refusal(tmp_path):
     assert "node 'n'" in message and "cannot be indexed" in message
 
 
-def test_a_deeply_nested_row_is_still_a_hard_refusal(store):
-    """(CH1c C) 구조 깊이 >= MAX_STRUCTURE_DEPTH 는 거부다 — 그 위로는 history 의
-    deepcopy 가 깨져 노드를 지울 수조차 없다."""
+@pytest.mark.parametrize("depth", [128, 200, 402, 490])
+def test_depth_is_never_a_reason_to_refuse_a_restore(store, depth):
+    """(CH1c2 A) ★ 코디 정정 — 깊이 128 거부는 **증명된 정상 대역만** 잘라냈다.
+
+    실측(2bdaca1): 깊이 32/128/200/300/402/450/480/485/490 이 create·save·load·
+    summary·list·get·export·resave·delete 전부 정상이고, 493 부터는 **create 단계**
+    에서 RecursionError 라 애초에 디스크에 앉지 못한다. 그래서 논리가 구성적이다 —
+    디스크에 있는 값은 create 를 통과했고, create 통과는 깊이 <= ~490 을 뜻하며,
+    그 대역은 정상이 증명됐다. 인수 기준이 열거가 아니라 구성으로 참이 된다.
+
+    128 은 **새 쓰기**의 천장으로만 남는다."""
     snapshot_id = _plant_node(store, {
         "id": "n", "label": "N", "type": "class",
-        "properties": json.dumps(_nest_props(200)), "tags": "[]",
+        "properties": json.dumps(_nest_props(depth - 2)), "tags": "[]",
     })
-    with pytest.raises(ValueError, match="nests deeper") as caught:
-        run(store.load_snapshot(snapshot_id))
-    assert "node 'n'" in str(caught.value)
+    loaded = run(store.load_snapshot(snapshot_id))
+    assert "n" in loaded.nodes
+    assert loaded.restore_quarantine                     # 조용하지는 않다
+    assert sorted(loaded.nodes) == ["n"]                 # 후속 표면 정상
+    again = run(store.save_snapshot(loaded, name="round-trip"))
+    assert "n" in run(store.load_snapshot(again["snapshot_id"])).nodes
 
 
 def test_an_unencodable_record_is_refused_though_it_cannot_reach_disk():
@@ -2563,3 +2574,25 @@ def test_an_int_weight_round_trips_as_the_same_float(store):
     assert type(reloaded.weight) is type(edge.weight)
     assert reloaded.weight == edge.weight
     assert json.dumps(reloaded.to_dict()) == json.dumps(edge.to_dict())
+
+
+def test_a_quarantined_nan_graph_can_still_be_listed(store):
+    """(CH1c2 E) ★ 이건 CH1c 가 만든 회귀였다 — 읽기 경로인 `_serialized_size` 에
+    allow_nan=False 를 걸어서, quarantine 으로 **일부러 로드한** legacy NaN 그래프가
+    list_nodes 에서 죽었다(2bdaca1 에선 통과했다). 크기를 재는 자리는 쓰기 정책을
+    강제할 자리가 아니다. allow_nan=False 는 쓰기 게이트에만 남는다."""
+    from visualizebetter.mcp_server import _serialized_size
+
+    snapshot_id = _plant_node(store, {
+        "id": "n", "label": "N", "type": "class",
+        "properties": '{"n": NaN}', "tags": "[]",
+    })
+    loaded = run(store.load_snapshot(snapshot_id))
+    assert loaded.restore_quarantine  # 전제: 실제로 quarantine 으로 들어왔다
+
+    rows = [node.to_dict() for node in loaded.nodes.values()]
+    assert _serialized_size({"nodes": rows}) > 0   # 읽기 경로가 죽지 않는다
+
+    # 반대 축: 새 NaN 은 여전히 못 들어온다
+    with pytest.raises(ValueError):
+        loaded.add_node(id="fresh", label="F", type="t", properties={"x": float("nan")})

@@ -1679,10 +1679,10 @@ def test_a_nodes_supersession_log_is_bounded_by_bytes_too():
 
     ★ FIFO 인 이유: 이건 **서버**의 부기이므로 잃는 것이 로그 해상도뿐이다
     (거부는 AI 가 저작한 것 — _citations, Finding.evidence — 에 쓴다)."""
-    from visualizebetter.graph.core import MAX_NODE_SUPERSEDED_BYTES
+    from visualizebetter.graph.core import MAX_RECORD_SUPERSEDED_BYTES
 
     g = Graph()
-    big = "y" * 30_000
+    big = "y" * 8_000
     g.add_node(id="n", label="N", type="class", properties={"blob": big})
     for i in range(12):
         g.update_node("n", {"set": {"properties": {"blob": big[: -i - 1]}}},
@@ -1691,8 +1691,8 @@ def test_a_nodes_supersession_log_is_bounded_by_bytes_too():
     archive = g.get_node("n").properties[SUPERSEDED_PROPERTY]
     assert archive, "supersede 가 실제로 기록되지 않았다 — 죽은 단언"
     size = len(json.dumps(archive, ensure_ascii=False).encode("utf-8"))
-    assert size <= MAX_NODE_SUPERSEDED_BYTES + 30_000  # 마지막 1건은 남긴다
-    assert len(json.dumps(g.get_node("n").to_dict(), ensure_ascii=False)) < 200_000
+    assert size <= MAX_RECORD_SUPERSEDED_BYTES + 8_000  # 마지막 1건은 남긴다
+    assert len(json.dumps(g.get_node("n").to_dict(), ensure_ascii=False)) < 65_536
 
 
 def test_an_import_gate_error_says_which_item():
@@ -1715,3 +1715,205 @@ def test_an_import_gate_error_says_which_item():
                                      {"id": "b", "label": "B", "type": "t"}],
                             "edges": edges}, merge=True)
     assert g.nodes == {}
+
+
+# --- [13-B] CH1c2 C — 문 목록을 사람이 열거하지 않는다 ---
+
+
+_GATE_CALLS = frozenset({
+    "check_storable", "check_new_record", "check_field_types", "validate_patch",
+    "_check_projected_record", "_apply_patch", "check_restorable",
+})
+"""게이트에 도달하는 호출. `_apply_patch` 는 내부에서 validate_patch 를 부른다."""
+
+_RECORD_FIELDS = frozenset({
+    "label", "type", "properties", "parent_id", "style_hint", "position_hint",
+    "layer", "ttl", "tags", "weight", "directed", "relation", "key",
+    "title", "body", "node_ids", "confidence", "evidence",
+})
+
+_AUDIT_EXEMPT = {
+    # 서버 소유 필드만 쓰거나, 이미 게이트를 지난 레코드를 재배치하는 것들.
+    "reload_from",        # 통째 교체 — 들어오는 Graph 는 자기 문에서 검사됐다
+    "clear_all", "clear_layer", "delete_node", "delete_edge", "delete_finding",
+    "undo", "redo", "batch_command", "clear_dirty",
+    "_remove", "_detach_node_from_findings", "_track_layer", "_touch",
+    "_add_placeholder",   # add_node 로 위임한다
+    "_merge_node",        # validate_patch 경유 (아래 감사가 실제로 확인한다)
+    "_record_lifecycle",  # 서버 소유 예약 배열(_superseded/_provenance)만 쓴다
+    "_detach_node_from_findings",   # finding.node_ids 에서 사라진 노드를 뺀다
+    "_detach_nodes_from_findings",  # 위의 다건 버전
+}
+
+
+def _graph_methods_that_write_records(source=None, class_name="Graph"):
+    """[13-B] CH1c2 C — 레코드 필드/properties 를 쓰는 메서드를 소스에서 찾는다.
+
+    AST 로 찾는다 — 파괴 호출 정적 감사([23-C] R6)와 같은 방식이다. ``source`` 를
+    주면 그걸 검사한다(감사 자신에 이빨이 있는지 증명하는 데 쓴다)."""
+    import ast
+    import inspect
+
+    if source is None:
+        from visualizebetter.graph import core
+
+        source = inspect.getsource(core)
+    tree = ast.parse(source)
+    graph_class = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    found = {}
+    for method in graph_class.body:
+        if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        writes = False
+        gated = False
+        for node in ast.walk(method):
+            # 레코드 필드에 대한 setattr / 속성 대입
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Attribute) and target.attr in _RECORD_FIELDS:
+                        writes = True
+                    if isinstance(target, ast.Subscript):
+                        value = target.value
+                        if isinstance(value, ast.Attribute) and value.attr in (
+                            "properties", "nodes", "edges", "findings"
+                        ):
+                            writes = True
+            # properties 를 직접 키우는 호출
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = getattr(func, "id", None) or getattr(func, "attr", None)
+                if name in _GATE_CALLS:
+                    gated = True
+                if name in ("setdefault", "append", "update") and isinstance(func, ast.Attribute):
+                    inner = func.value
+                    if isinstance(inner, ast.Attribute) and inner.attr == "properties":
+                        writes = True
+                    if isinstance(inner, ast.Call):
+                        writes = True
+                # 생성자 호출 = 새 레코드
+                if isinstance(func, ast.Name) and func.id in ("Node", "Edge", "Finding"):
+                    writes = True
+        if writes:
+            found[method.name] = gated
+    return found
+
+
+def test_every_door_that_writes_a_record_passes_the_gate():
+    """(CH1c2 C) ★ cite() 가 **9번째 문**이었다 — check_storable 도 check_properties
+    도 부르지 않고 호출자 문자열을 _citations 에 직접 append 했고, MCP tool 도 검증이
+    0이었다. 그래서 CH1b 가 닫은 서로게이트 blocker 가 cite 로 그대로 되살아났다.
+
+    ★ 교훈은 "하나 놓쳤다" 가 아니다. **사람이 문 목록을 관리하는 방식이 틀렸다**는
+    것이다 — 8개를 열거했는데 9번째가 있었다. 그래서 이 테스트는 목록을 갖지 않고
+    소스에서 문을 찾는다(파괴 호출 정적 감사와 같은 AST 방식). 10번째 문이 생기면
+    사람의 기억이 아니라 이 단언이 잡는다."""
+    doors = _graph_methods_that_write_records()
+    assert doors, "감사가 문을 하나도 못 찾았다 — 죽은 단언"
+
+    ungated = sorted(
+        name for name, gated in doors.items()
+        if not gated and name not in _AUDIT_EXEMPT
+    )
+    assert not ungated, (
+        f"게이트를 지나지 않고 레코드를 쓰는 문: {ungated}."
+        " check_storable / validate_patch / _check_projected_record 중 하나를 경유하거나,"
+        " 서버 소유 필드만 쓴다면 _AUDIT_EXEMPT 에 근거와 함께 추가해라."
+    )
+
+
+def test_the_audit_actually_sees_the_door_that_was_breached():
+    """(CH1c2 C) 감사가 '아무것도 못 찾아서' 통과하는 죽은 단언이 아님을 증명한다 —
+    이번에 실제로 뚫렸던 cite 와 생성 3문이 목록에 있고 전부 게이트를 지난다."""
+    doors = _graph_methods_that_write_records()
+    for door in ("cite", "add_node", "add_edge", "add_finding"):
+        assert door in doors, f"감사가 {door} 를 문으로 인식하지 못한다"
+        assert doors[door] is True, f"{door} 가 게이트를 지나지 않는다"
+
+
+def test_the_audit_would_catch_a_new_ungated_door():
+    """(CH1c2 C) ★ 이게 이 감사의 존재 이유다 — 10번째 문이 생겼을 때 사람의 기억이
+    아니라 테스트가 잡는지. 합성 소스로 이빨을 증명한다: 게이트를 지나지 않고
+    properties 를 쓰는 메서드는 반드시 무게이트로 잡혀야 한다."""
+    breached = """
+class Graph:
+    def annotate(self, node_id, text):
+        node = self.nodes[node_id]
+        node.properties.setdefault("notes", []).append(text)
+        return node
+
+    def annotate_safely(self, node_id, text):
+        node = self.nodes[node_id]
+        check_storable(Node, {"properties": {"notes": [text]}})
+        node.properties.setdefault("notes", []).append(text)
+        return node
+"""
+    doors = _graph_methods_that_write_records(source=breached)
+    assert doors.get("annotate") is False, "무게이트 문을 놓쳤다 — 감사에 이빨이 없다"
+    assert doors.get("annotate_safely") is True
+
+
+def test_an_integer_too_large_for_sqlite_is_refused():
+    """(CH1c2 B) ★ 게이트의 전제가 틀렸다 — json.dumps 성공은 저장 가능을 증명하지
+    않는다. JSON 은 임의 정밀도 정수를 허용하므로 ttl=2**63 은 (5)를 **완전히**
+    통과하고 sqlite3 바인딩에서 OverflowError 로 죽는다. ttl 은 properties 같은
+    JSON blob 이 아니라 INTEGER 컬럼에 직접 바인딩되고, push_node 의 Field(ge=0) 에는
+    상한이 없다. 저장 가능성 = 직렬화 가능 **AND** 바인딩 가능이다."""
+    from visualizebetter.graph.core import SQLITE_INT_MAX, SQLITE_INT_MIN
+
+    g = Graph()
+    for bad in (SQLITE_INT_MAX + 1, SQLITE_INT_MIN - 1, 2 ** 128):
+        with pytest.raises(ValueError, match="outside the range SQLite"):
+            g.add_node(id="n", label="N", type="t", ttl=bad)
+    assert g.nodes == {}
+
+    # (5) 만으로는 못 잡는다는 것 자체를 고정한다 — 층 (1) 을 중복으로 오해해
+    # 지우면 이 단언이 깨진다
+    assert json.dumps({"ttl": SQLITE_INT_MAX + 1}, allow_nan=False)
+
+    g.add_node(id="n", label="N", type="t", ttl=SQLITE_INT_MAX)  # 경계는 통과
+    assert g.get_node("n").ttl == SQLITE_INT_MAX
+
+
+def test_nested_non_string_keys_are_refused_at_every_depth():
+    """(CH1c2 F) check_properties 는 **최상위 키만** 봤고 json.dumps 는 int/float/
+    bool/None 키를 **에러 없이** 문자열로 강제한다. 그래서 {'m': {1: 'a'}} 가 통과하고
+    왕복에서 키가 1 → '1' 로 바뀐다. 충돌하면 손실이다: {1: 'int', '1': 'str'} 은
+    디스크에 중복 키 JSON 으로 쓰이고 로드 시 하나가 사라진다."""
+    g = Graph()
+    for bad in ({"m": {1: "a"}}, {"m": {"deeper": {None: "x"}}}, {"m": [{2.5: "y"}]},
+                {"m": {1: "int-v", "1": "str-v"}}):
+        with pytest.raises(ValueError, match="non-string keys"):
+            g.add_node(id="n", label="N", type="t", properties=bad)
+    assert g.nodes == {}
+
+    # 강제가 조용하다는 사실 자체를 고정한다 (게이트가 유일한 방어라는 근거)
+    assert json.loads(json.dumps({1: "int-v"})) == {"1": "int-v"}
+
+    g.add_node(id="ok", label="OK", type="t", properties={"m": {"1": "a"}})
+    assert g.get_node("ok").properties["m"] == {"1": "a"}
+
+
+def test_the_server_refuses_to_build_a_record_it_could_not_restore():
+    """(CH1c2 D) 상한 비대칭이 반대였다 — 쓰기는 **호출자 값만** 재고 복원은
+    **레코드 전체**를 쟀다. 그래서 개별 호출이 전부 합법인데 레코드만 초과하는
+    경로가 열렸다(merge push ×4 = 120,313 B / properties 패치 ×3 = 90,300 B /
+    30KB 라벨 supersede ×3 = 120,526 B). 서버가 스스로 복원 불가 레코드를 만든다."""
+    from visualizebetter.graph.core import MAX_VALUE_BYTES
+
+    g = Graph()
+    big = "x" * 30_000
+    g.add_node(id="n", label="N", type="class", properties={"k0": big})
+    g.add_node(id="n", label="N", type="class", properties={"k1": big})  # merge, 합법
+
+    with pytest.raises(ValueError, match="over the"):
+        g.add_node(id="n", label="N", type="class", properties={"k2": big})
+
+    record = len(json.dumps(g.get_node("n").to_dict(), ensure_ascii=False).encode("utf-8"))
+    assert record <= MAX_VALUE_BYTES
+
+    # 메시지가 행동 가능해야 한다 — 무엇이 예산을 쓰는지 말한다
+    with pytest.raises(ValueError, match="Largest existing entries"):
+        g.update_node("n", {"set": {"properties": {"k3": big}}})

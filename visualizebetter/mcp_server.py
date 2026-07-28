@@ -72,12 +72,26 @@ def _resolve_layer(layer: str | None) -> str | None:
 
 
 def _serialized_size(payload: Any) -> int:
-    """[13-B] CH1c E — ``allow_nan=False`` here costs nothing (measured 0.00ms on a
-    batch) and rejects NaN before the batch is walked.
+    """Serialised byte length, permissively.
 
-    ★ It is not a substitute for the per-record gate: this dumps the *whole*
-    batch, so one poisoned item would fail all of them and break [5-A]'s
-    per-item ``errors[]`` contract. Early exit, not the fence.
+    [13-B] CH1c2 E — ``allow_nan`` stays **on** here. This is a *read*-path
+    measurement (``list_nodes``, ``list_findings``, response truncation), and
+    forcing strictness on it meant a legacy graph carrying a NaN — quarantined and
+    loaded on purpose ([13-B] CH1c C) — died in ``list_nodes`` instead of being
+    listed. Measuring a size is not the place to enforce a write policy.
+
+    ``allow_nan=False`` belongs to the write gate, and to ``_batch_payload_size``
+    below: new NaN cannot get in, existing NaN can still be read.
+    """
+    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+
+def _batch_payload_size(payload: Any) -> int:
+    """[13-B] CH1c E — the write-path counterpart: reject NaN before walking a batch.
+
+    Measured at 0.00ms extra on a full batch. ★ Not a substitute for the per-record
+    gate: this dumps the *whole* batch, so one poisoned item would fail all of
+    them and break [5-A]'s per-item ``errors[]`` contract. Early exit, not fence.
     """
     return len(json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8"))
 
@@ -278,7 +292,7 @@ def _check_batch_limits(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]
     total = len(nodes) + len(edges)
     if total > MAX_BATCH_ITEMS:
         raise ToolError(f"batch of {total} exceeds {MAX_BATCH_ITEMS} items. {_IMPORT_HINT}")
-    size = _serialized_size({"nodes": nodes, "edges": edges})
+    size = _batch_payload_size({"nodes": nodes, "edges": edges})
     if size > MAX_BATCH_PAYLOAD_BYTES:
         raise ToolError(
             f"batch payload {size} bytes exceeds {MAX_BATCH_PAYLOAD_BYTES}. {_IMPORT_HINT}"

@@ -622,3 +622,36 @@ def test_malformed_patch_is_a_tool_error_not_a_crash(mcp, graph, patch):
     with pytest.raises(ToolError):
         call(mcp, "update_node", id="a", patch=patch)
     assert graph.get_node("a").to_dict() == before
+
+
+def test_push_batch_rejects_nan_before_walking_the_batch(mcp, graph):
+    """(CH1c2 E) 배치 크기 측정은 **쓰기** 경로이므로 allow_nan=False 를 유지한다
+    (읽기 경로 측정은 CH1c2 E 로 되돌렸다 — 거기 강제하면 quarantine 으로 로드한
+    legacy NaN 그래프가 list_nodes 에서 죽었다).
+
+    ★ 이건 레코드 게이트의 대체가 아니라 조기 탈출이다: 배치 전체를 dumps 하므로
+    1건 오염이 전체 거부가 되어 [5-A] 항목별 errors[] 계약을 깨뜨린다."""
+    from visualizebetter.mcp_server import _batch_payload_size, _serialized_size
+
+    poisoned = [{"id": "a", "label": "A", "type": "t"},
+                {"id": "b", "label": "B", "type": "t", "ttl": float("nan")}]
+    assert _serialized_size({"nodes": poisoned}) > 0   # 읽기 측정은 관대하다
+    with pytest.raises(ValueError):
+        _batch_payload_size({"nodes": poisoned})       # 쓰기 측정은 거부한다
+
+    # ★ 헬퍼가 아니라 **배선**을 단언한다 — push_batch 가 실제로 쓰기 쪽 측정을
+    # 부르는지. 소스로 단언하는 이유는 실측된 사실 때문이다: MCP 전송 계층이 인자를
+    # strict JSON 으로 직렬화하므로 NaN 은 tool 에 **도달조차 하지 않는다**. 즉 이
+    # 조기 거부가 실제로 지키는 것은 in-process 호출자(어댑터 [12], 직접 호출)이고,
+    # 그 경로를 client 로는 재현할 수 없다.
+    import inspect
+
+    from visualizebetter import mcp_server
+
+    limits = inspect.getsource(mcp_server._check_batch_limits)
+    assert "_batch_payload_size(" in limits, "배치 한도 검사가 쓰기 쪽 크기 측정을 쓰지 않는다"
+    assert "_serialized_size(" not in limits, "배치 한도 검사가 관대한 읽기 측정을 쓴다"
+    assert "_check_batch_limits(" in inspect.getsource(mcp_server._register_write)
+
+    ok = call(mcp, "push_batch", nodes=[{"id": "a", "label": "A", "type": "t"}])
+    assert ok["added_nodes"] == 1                 # 전제: 성한 배치는 통과한다
