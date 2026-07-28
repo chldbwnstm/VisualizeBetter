@@ -9,6 +9,8 @@ import pytest
 
 from visualizebetter.graph.core import (
     CITATIONS_PROPERTY,
+    MAX_FINDING_BODY_CHARS,
+    MAX_SUPERSEDED_ENTRIES,
     PROVENANCE_PROPERTY,
     SUPERSEDED_PROPERTY,
     PLACEHOLDER_PROPERTY,
@@ -719,3 +721,124 @@ def test_wellformed_patches_still_work():
     g.update_node("n", {"remove": ()})          # 빈 tuple 도 허용
     g.update_node("n", {})                       # set/remove 없음도 허용
     assert g.get_node("n").properties == {"a": 1, "b": 3}
+
+
+# --- [23-C] ★★★★★ RN6 LL — 거부된 patch 는 어떤 흔적도 남기지 않는다 ---
+
+
+_REJECTED = [
+    {"set": {"labell": "N2"}},              # unknown field — LL 의 실측 재현 입력
+    {"set": {"_citations": "FORGED"}},      # 예약 필드
+    {"set": {"properties": {"_citations": "F"}}},   # 중첩 예약키
+    {"set": {"id": "hijack"}},              # server-managed
+    {"remove": ["_citations"]},             # 예약키 삭제 시도
+    {"sett": {"label": "HACK"}},            # 오타 키 (NN(2))
+]
+
+
+def _node_state(g, node_id="n"):
+    node = g.get_node(node_id)
+    return (
+        node.to_dict(),
+        len(node.properties.get(SUPERSEDED_PROPERTY, [])),
+        len(node.properties.get(PROVENANCE_PROPERTY, [])),
+    )
+
+
+@pytest.mark.parametrize("reason", [None, "supersede", "correction"])
+@pytest.mark.parametrize("patch", _REJECTED)
+def test_rejected_node_patch_leaves_no_trace(patch, reason):
+    """★ reason 을 **양쪽으로** 돈다 — RN5 가 이 축을 놓친 이유가 _BAD_PATCHES 를
+    reason=None 으로만 돌려서였다. supersede/correction 은 _record_lifecycle 이
+    검증보다 먼저 돌아 거부된 호출이 _superseded 쓰레기를 남겼다."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class", properties={"keep": 1})
+    g.cite("n", "https://example.test/real", "real")
+    g.update_node("n", {"set": {"label": "REAL"}}, reason="supersede")  # 진짜 이력 1건
+
+    before = _node_state(g)
+    events = []
+    g.events.subscribe(lambda topic, payload: events.append(topic))
+
+    with pytest.raises(ValueError):
+        g.update_node("n", patch, reason=reason)
+
+    assert _node_state(g) == before      # 레코드·이력 길이 전부 동일
+    assert events == []                   # [8-C] 이벤트 0건
+
+
+@pytest.mark.parametrize("reason", [None, "supersede", "correction"])
+def test_rejected_edge_and_finding_patches_leave_no_trace(reason):
+    g = Graph()
+    g.add_node(id="a", label="A", type="class")
+    g.add_node(id="b", label="B", type="class")
+    g.add_edge(source="a", target="b", relation="calls", properties={"keep": 1})
+    finding = g.add_finding(title="t", body="b")
+    g.update_finding(finding.finding_id, {"set": {"body": "real"}}, reason="supersede")
+
+    edge_before = g.edges[("a", "b", "calls", "")].to_dict()
+    finding_before = g.get_finding(finding.finding_id).to_dict()
+    events = []
+    g.events.subscribe(lambda topic, payload: events.append(topic))
+
+    with pytest.raises(ValueError):
+        g.update_edge("a", "b", "calls", "", {"set": {"labell": "x"}}, reason=reason)
+    with pytest.raises(ValueError):
+        g.update_finding(finding.finding_id, {"set": {"titlee": "x"}}, reason=reason)
+
+    assert g.edges[("a", "b", "calls", "")].to_dict() == edge_before
+    assert g.get_finding(finding.finding_id).to_dict() == finding_before
+    assert events == []
+
+
+def test_failed_calls_cannot_evict_a_real_supersession():
+    """★ LL 의 결정적 증상 — 거부된 호출 12회가 MAX_SUPERSEDED_ENTRIES(10) FIFO 를
+    돌려 **진짜 supersession 기록을 영구 소실**시켰다. [24-C] 가 지키겠다고 한 것을
+    실패한 호출이 파괴하는 상태였다."""
+    g = Graph()
+    g.add_node(id="n", label="ORIGINAL", type="class")
+    g.update_node("n", {"set": {"label": "V2"}}, reason="supersede")
+    archived = g.get_node("n").properties[SUPERSEDED_PROPERTY][0]["prev"]["label"]
+    assert archived == "ORIGINAL"
+
+    for _ in range(MAX_SUPERSEDED_ENTRIES + 2):
+        with pytest.raises(ValueError):
+            g.update_node("n", {"set": {"labell": "N2"}}, reason="supersede")
+
+    history = g.get_node("n").properties[SUPERSEDED_PROPERTY]
+    assert len(history) == 1                       # 쓰레기 적립 0
+    assert history[0]["prev"]["label"] == "ORIGINAL"   # ★ 진짜 기록 생존
+
+
+def test_finding_size_rejection_still_leaves_it_untouched():
+    """LL 로 검증 순서가 바뀌어도 [23-B] 크기 불변식 거부는 그대로 동작한다."""
+    g = Graph()
+    finding = g.add_finding(title="t", body="b")
+    before = finding.to_dict()
+    with pytest.raises(ValueError):
+        g.update_finding(finding.finding_id, {"set": {"body": "x" * (MAX_FINDING_BODY_CHARS + 1)}},
+                         reason="supersede")
+    assert g.get_finding(finding.finding_id).to_dict() == before
+
+
+@pytest.mark.parametrize("patch", [None, [], "", 0, False])
+def test_falsy_patches_raise_valueerror_in_all_three_updaters(patch):
+    """(NN(1)(3)) None/falsy 는 **ValueError** 로 거부된다 — 세 updater 동일.
+
+    MCP 층은 어떤 예외든 ToolError 로 감싸므로 tool 경유로는 AttributeError 와
+    구분되지 않는다. 그래서 core 에서 직접 단언한다: None 이 통과하면
+    _apply_patch 의 `patch.get` 이 AttributeError 를 내고, update_edge/
+    update_finding 만 `patch or {}` 로 우연히 살아남아 세 tool 이 같은 입력에
+    다르게 반응했다."""
+    g = Graph()
+    g.add_node(id="a", label="A", type="class")
+    g.add_node(id="b", label="B", type="class")
+    g.add_edge(source="a", target="b", relation="calls")
+    finding = g.add_finding(title="t")
+
+    with pytest.raises(ValueError):
+        g.update_node("a", patch)
+    with pytest.raises(ValueError):
+        g.update_edge("a", "b", "calls", "", patch)
+    with pytest.raises(ValueError):
+        g.update_finding(finding.finding_id, patch)

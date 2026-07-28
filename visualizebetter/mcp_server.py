@@ -884,7 +884,7 @@ def _register_write(
         """엣지를 부분 갱신한다. patch/reason 규약은 update_node 와 같다."""
         _reject_reserved_properties(_patch_properties(patch))
         try:
-            edge = graph.update_edge(source, target, relation, key, patch or {}, reason=reason)
+            edge = graph.update_edge(source, target, relation, key, patch, reason=reason)
         except KeyError:
             raise ToolError(f"edge not found: {(source, target, relation, key)}") from None
         except ValueError as exc:

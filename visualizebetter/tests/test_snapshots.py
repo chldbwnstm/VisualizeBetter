@@ -1715,7 +1715,9 @@ def test_expired_deadline_defers_the_remaining_snapshots(canonical):
         legacy_db, target / DB_FILENAME, deadline=time.monotonic() - 1
     )
 
-    assert outcome.deferred == 4      # 남은 건수를 담는다 (재개 대상)
+    # RN6 MM 이후로는 단계 경계에서 더 일찍 보류될 수 있다 — 그때는 pending 을
+    # 세기 전이라 -1(미집계)이다. 어느 쪽이든 '이번엔 못 함, 다음에 재개' 다.
+    assert outcome.deferred != 0
     assert outcome.copied == 0
     assert _snapshot_ids(target / DB_FILENAME) == set()   # 아무것도 안 들어갔고
     assert _snapshot_ids(legacy_db) == {f"s{i}" for i in range(4)}   # legacy 온전
@@ -1778,3 +1780,50 @@ def test_a_store_larger_than_the_deadline_completes_across_boots(canonical):
 
     assert _snapshot_ids(target_db) == wanted          # ★ 결국 전부 도착
     assert _snapshot_ids(legacy_db) == wanted          # legacy 온전
+
+
+def test_timing_guard_reads_the_real_tauri_timeout():
+    """(QQ) 순서 가드가 main.rs 를 실제로 읽는다. 리터럴 40 을 박아두면 main.rs 의
+    값을 낮춰도 테스트가 초록이라 가드가 아무것도 지키지 못한다."""
+    import re
+
+    main_rs = Path(snap_mod.__file__).parents[2] / "src-tauri" / "src" / "main.rs"
+    source = main_rs.read_text(encoding="utf-8")
+    match = re.search(r"wait_for_serve\([^)]*Duration::from_secs\((\d+)\)", source)
+    assert match, "main.rs 의 wait_for_serve 타임아웃을 못 찾았다 — 가드가 무력하다"
+    tauri_timeout = int(match.group(1))
+
+    from visualizebetter import stdio_proxy
+
+    assert snap_mod._COPY_LOCK_TIMEOUT_S < snap_mod._COPY_DEADLINE_S
+    assert snap_mod._COPY_DEADLINE_S < stdio_proxy.LAUNCH_TIMEOUT_S
+    assert stdio_proxy.LAUNCH_TIMEOUT_S < tauri_timeout
+
+
+def test_measured_worst_case_stays_under_the_proxy_budget(canonical):
+    """(MM) 락 홀더가 붙은 상태의 **실측** 최악 시간이 소비자 예산 아래인지.
+    docstring 이 주장하는 바와 코드가 하는 바를 일치시키기 위한 숫자다."""
+    from visualizebetter import stdio_proxy
+
+    target, legacy = canonical
+    _store_db_kinds(
+        legacy / snap_mod._LEGACY_DB_FILENAME, [(f"m{i}", "manual") for i in range(8)]
+    )
+    target.mkdir(parents=True, exist_ok=True)
+    target_db = target / DB_FILENAME
+    _store_db(target_db, [])
+
+    holder = sqlite3.connect(target_db, isolation_level=None)
+    try:
+        holder.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        SnapshotStore(target)
+        elapsed = time.monotonic() - started
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert elapsed < stdio_proxy.LAUNCH_TIMEOUT_S, (
+        f"실측 {elapsed:.1f}s 가 proxy 예산 {stdio_proxy.LAUNCH_TIMEOUT_S}s 를 넘는다"
+    )
+    print(f"\n[MM] 락 홀더 상태 실측 최악: {elapsed:.2f}s")

@@ -83,6 +83,10 @@ def is_reserved_property(key: str) -> bool:
     return key.startswith(RESERVED_PROPERTY_PREFIX)
 
 
+_PATCH_KEYS = frozenset({"set", "remove"})
+"""[5-A] the only keys a patch may carry ([23-C] RN6 NN(2))."""
+
+
 def check_patch_shape(patch: Any) -> None:
     """[5-A] a patch is ``{set: {...}, remove: [...]}`` — settle that shape first.
 
@@ -94,10 +98,24 @@ def check_patch_shape(patch: Any) -> None:
     iterable, so it was walked character by character and silently changed
     nothing, telling the caller its edit had landed.
     """
-    if patch is None:
-        return
+    # [23-C] RN6 NN(1): None is refused, not waved through. It used to pass here
+    # and then hit ``patch.get`` inside _apply_patch as an AttributeError, except
+    # in update_edge/update_finding where a stray ``patch or {}`` happened to
+    # absorb it — three tools, three behaviours for one input.
     if not isinstance(patch, dict):
         raise ValueError(f"patch must be an object, got {type(patch).__name__}")
+
+    # [23-C] RN6 NN(2): only the [5-A] keys. A typo — {"sett": {...}}, {"add": …} —
+    # used to return ok:True having changed nothing, while still bumping
+    # updated_at and publishing a node.update. An LLM that mistypes the key would
+    # be told its edit succeeded and lose it forever; this is the same class of
+    # silent no-op that {"remove": "label"} was refused for ([23-C] RN5 JJ).
+    unknown_keys = sorted(k for k in patch if k not in _PATCH_KEYS)
+    if unknown_keys:
+        raise ValueError(
+            f"unknown patch keys: {unknown_keys}. A patch takes {sorted(_PATCH_KEYS)} ([5-A])"
+        )
+
     updates = patch.get("set")
     if updates is not None:
         if not isinstance(updates, dict):
@@ -283,20 +301,25 @@ def _check_finding_size(
             )
 
 
-def _apply_patch(
+def validate_patch(
     target: Node | Edge | Finding, patch: dict[str, Any], server_managed: frozenset[str]
 ) -> None:
-    """[5-A] patch = { set: {...}, remove: [...] }.
+    """[5-A] Decide whether a patch is acceptable — changing nothing either way.
 
-    ``set`` merges onto the record — a ``properties`` entry merges into the
-    existing properties rather than replacing them. ``remove`` deletes property
-    keys, which merge alone cannot do. Server-managed fields are rejected.
+    [23-C] RN6 LL. This used to live inside ``_apply_patch``, which runs *after*
+    ``_record_lifecycle``. A patch that was going to be rejected therefore still
+    got a ``_superseded`` entry written first: the caller was told the edit
+    failed, the record kept an un-erasable reserved-key artefact ({'prev': {}}),
+    no [8-C] event was published, and the undo stack gained a node.update. Twelve
+    such failed calls pushed a *real* supersession out through the
+    MAX_SUPERSEDED_ENTRIES FIFO — a rejected call destroying exactly the history
+    [24-C] exists to keep. ``update_finding`` promised the opposite in its own
+    docstring ("a rejected patch leaves the finding untouched").
 
-    Finding ([23-B]) has no properties map, so ``remove`` has nothing to act on
-    there and is rejected rather than silently ignored.
+    So validation is pure and happens first. The invariant the entry points
+    uphold: **a rejected patch leaves no trace — not on the record, not in the
+    history, not on the event bus, not in the undo stack.**
     """
-    # ★ RN5 JJ — shape first (see check_patch_shape for the callers that need
-    # this even earlier). Kept here too: adapters call _apply_patch directly.
     check_patch_shape(patch)
     updates = patch.get("set") or {}
     removals = patch.get("remove") or []
@@ -330,12 +353,6 @@ def _apply_patch(
     if unknown:
         raise ValueError(f"unknown fields: {sorted(unknown)}")
 
-    for name, value in updates.items():
-        if name == "properties":
-            target.properties.update(value)
-        else:
-            setattr(target, name, value)
-
     if removals:
         if not hasattr(target, "properties"):
             raise ValueError(
@@ -351,8 +368,34 @@ def _apply_patch(
                 "properties keys starting with '_' are system-owned and cannot be "
                 f"removed: {reserved_removals} ([23-B])"
             )
-        for key in removals:
-            target.properties.pop(key, None)
+
+
+def _apply_patch(
+    target: Node | Edge | Finding, patch: dict[str, Any], server_managed: frozenset[str]
+) -> None:
+    """[5-A] Apply an already-validated patch — ``{set: {...}, remove: [...]}``.
+
+    ``set`` merges onto the record (a ``properties`` entry merges into the
+    existing properties rather than replacing them); ``remove`` deletes property
+    keys, which merge alone cannot do.
+
+    Validation stays a separate call ([23-C] RN6 LL) so entry points can decide
+    *before* they write history. It is repeated here rather than assumed, because
+    adapters and import call ``_apply_patch`` directly — the cost is one more
+    pass over a small dict, and the alternative is an unvalidated write path.
+    """
+    validate_patch(target, patch, server_managed)
+    updates = patch.get("set") or {}
+    removals = patch.get("remove") or []
+
+    for name, value in updates.items():
+        if name == "properties":
+            target.properties.update(value)
+        else:
+            setattr(target, name, value)
+
+    for key in removals:
+        target.properties.pop(key, None)
 
 
 def _validate_reason(reason: str | None) -> None:
@@ -682,11 +725,15 @@ class Graph:
           is archived to ``_superseded`` before the patch applies, because
           preserving what was once true is the point of this project.
         """
-        check_patch_shape(patch)  # [23-C] RN5 JJ — before anything reads it
         _validate_reason(reason)
         node = self.nodes.get(id)
         if node is None:
             raise KeyError(id)
+        # [23-C] RN6 LL — decide before touching anything. Everything below this
+        # line writes (history before-image, lifecycle archive, the record
+        # itself, the event), so a patch that is going to be refused must be
+        # refused here or its refusal leaves debris.
+        validate_patch(node, patch, _NODE_SERVER_MANAGED)
         self.history.touch_node(id)  # [M2e] before any lifecycle/patch mutates it
         old_type = node.type
         published = self._record_lifecycle(node, patch, reason)
@@ -985,14 +1032,17 @@ class Graph:
         reason: str | None = None,
     ) -> Edge:
         """[5-A] update_edge; patch 규약 = update_node. reason 의미론 = [24]."""
-        check_patch_shape(patch)  # [23-C] RN5 JJ — before anything reads it
         _validate_reason(reason)
         identity: EdgeKey = (source, target, relation, key)
         edge = self.edges.get(identity)
         if edge is None:
             raise KeyError(identity)
+        # [23-C] RN6 NN(3): no `patch or {}` degradation here. update_node and
+        # update_finding raise on a falsy patch; this tool advertises "patch 규약
+        # = update_node", so quietly accepting [] / '' / 0 / None made that
+        # advertisement false.
+        validate_patch(edge, patch, _EDGE_SERVER_MANAGED)  # [23-C] RN6 LL
         self.history.touch_edge(identity)  # [M2e] before any lifecycle/patch mutates it
-        patch = patch or {}
         published = self._record_lifecycle(edge, patch, reason)
         _apply_patch(edge, patch, _EDGE_SERVER_MANAGED)
         self._track_layer(edge.layer)
@@ -1085,13 +1135,16 @@ class Graph:
         rather than in properties, which it does not have ([23-B]). The archive
         is bounded by size, not only count — see _trim_finding_archive.
         """
-        check_patch_shape(patch)  # [23-C] RN5 JJ — before anything reads it
         _validate_reason(reason)
         finding = self.findings.get(finding_id)
         if finding is None:
             raise KeyError(finding_id)
-        self.history.touch_finding(finding_id)  # [M2e] before any lifecycle/patch mutates it
-        patch = patch or {}
+        # [23-C] RN6 NN(3): falsy patches raise here as they do in update_node.
+        # [23-C] RN6 LL — the whole decision happens before any write. The size
+        # invariant was already checked up-front; the rest of the validation now
+        # joins it, so "a rejected patch leaves the finding untouched" (this
+        # docstring's own promise) is finally true for every rejection reason.
+        validate_patch(finding, patch, _FINDING_SERVER_MANAGED)
         updates = patch.get("set") or {}
         _check_finding_size(
             title=updates.get("title", finding.title),
@@ -1101,6 +1154,7 @@ class Graph:
             tags=updates.get("tags", finding.tags),
         )
 
+        self.history.touch_finding(finding_id)  # [M2e] before any lifecycle/patch mutates it
         published = patch
         if reason is not None:
             by = finding.created_by

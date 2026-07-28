@@ -214,12 +214,26 @@ _MIGRATED_NAME_PREFIX = "migrated: "
 # shipped forms: the proxy DEVNULLs serve's stderr, the Tauri shell drops it).
 _MIGRATION_LOG_NAME = "migration.log"
 
-# [23-C] RN5 II — the copy runs before the readiness signal, so it needs a
-# ceiling. sqlite3's timeout is *per statement*, so 30s meant a locked target
-# could stall start-up for 84s (two candidates: ~168s) — past the proxy's 25s and
-# the Tauri shell's 40s, and the Tauri path has no retry. 4s per statement with a
-# 10s wall-clock budget for the whole migration keeps it under both.
-_COPY_LOCK_TIMEOUT_S = 4.0
+# [23-C] RN5 II / RN6 MM — the copy runs before the readiness signal, so it needs
+# a ceiling. sqlite3's timeout is *per statement*, so the original 30s meant a
+# locked target could stall start-up for 84s (two candidates: ~168s) — past the
+# proxy's 25s and the Tauri shell's 40s, and the Tauri path has no retry.
+#
+# ★ What the deadline actually is (RN6 MM — the earlier "10s wall clock" claim
+# was not what the code did). ``_COPY_DEADLINE_S`` is checked at stage
+# boundaries, not preemptively: a statement already waiting on a lock runs to its
+# own timeout first. SQLite's busy handler also overshoots its nominal timeout by
+# roughly 1.5x (measured: a 4.0s setting took 6.00s). So the real bound is
+#
+#     worst case ≈ candidates × (stages that can block × _COPY_LOCK_TIMEOUT_S × 1.5)
+#
+# With per-statement 2.0s and boundary checks after connect / schema / ATTACH /
+# the S(1) PRAGMA loop / each snapshot / DETACH / reporting, a fully locked target
+# yields ~8s per candidate. That stays under the proxy's 25s and the Tauri
+# shell's 40s, which is the property that matters:
+#     migration  <  proxy LAUNCH_TIMEOUT_S 25s  <  Tauri wait_for_serve 40s
+# Raising any one of these without the others reintroduces a start-up hang.
+_COPY_LOCK_TIMEOUT_S = 2.0
 _COPY_DEADLINE_S = 10.0
 # Reporting must not extend start-up either. If the target is locked we still get
 # the file log, which is the surface a user can actually find.
@@ -327,7 +341,11 @@ class _MigrationOutcome:
     aborted: str = ""
     deferred: int = 0
     """Snapshots left for the next start ([23-C] RN5 II). Distinct from
-    ``declined``: deferred work resumes, declined work does not."""
+    ``declined``: deferred work resumes, declined work does not.
+
+    ``-1`` means "deferred before we could count" — the time budget ran out at a
+    stage boundary ([23-C] RN6 MM) before the pending set was enumerated. Still
+    resumes; we just cannot say how much yet."""
 
 
 def _record_migration(data_dir: Path, target_db: Path, outcome: _MigrationOutcome) -> None:
@@ -400,9 +418,10 @@ def _copy_forward(
       evicts the *user's own* auto snapshots, destroying data that would have
       survived had we never migrated. Migrated snapshots therefore land as
       ``manual`` (prune never touches manual, [5-E]) with a ``migrated:`` name
-      prefix for provenance. Only the newest ``MAX_AUTO_SNAPSHOTS`` autos are
-      taken; the rest are reported by count, never silently dropped — legacy
-      keeps them, so the access path remains.
+      prefix for provenance. Autos are limited by ``MIGRATE_AUTO_BUDGET`` — a
+      cumulative budget across all runs, not ``MAX_AUTO_SNAPSHOTS`` and not a
+      per-run cap; what the budget declines is reported by count and stays in the
+      legacy store, so the access path remains.
     * Granularity ([23-C] RN4 Z). One transaction per snapshot, one ledger row
       per snapshot. A single corrupt page or one NOT NULL violation used to roll
       back an entire store forever — 20 healthy snapshots held hostage by one
@@ -410,21 +429,48 @@ def _copy_forward(
       is skipped and left out of the ledger so a later run can retry it, while
       its healthy neighbours arrive.
 
-    Returns the number of snapshots actually committed ([23-C] RN4 CC).
+    Returns a ``_MigrationOutcome``; ``copied`` is the number actually committed
+    ([23-C] RN4 CC).
     """
     source_key = os.path.normcase(os.path.abspath(legacy_db))
     outcome = _MigrationOutcome(source_db=source_key)
     connection = None
+
+    def out_of_time() -> bool:
+        """[23-C] RN6 MM — checked at every stage boundary, not just per snapshot."""
+        return deadline is not None and time.monotonic() > deadline
+
     try:
         connection = sqlite3.connect(target_db, timeout=_COPY_LOCK_TIMEOUT_S)
+        if out_of_time():
+            outcome.deferred = -1
+            log.warning(
+                "copy-forward: connect of %s deferred — will resume on next start",
+                legacy_db,
+            )
+            return outcome
         _apply_schema(connection)
         connection.commit()
+        if out_of_time():
+            outcome.deferred = -1
+            log.warning(
+                "copy-forward: schema of %s deferred — will resume on next start",
+                legacy_db,
+            )
+            return outcome
 
         try:
             connection.execute("ATTACH DATABASE ? AS legacy", (str(legacy_db),))
         except sqlite3.Error as exc:
             log.warning("copy-forward skipped: cannot open legacy store %s (%s)", legacy_db, exc)
             outcome.aborted = "cannot-open-legacy"
+            return outcome
+        if out_of_time():
+            outcome.deferred = -1
+            log.warning(
+                "copy-forward: attach of %s deferred — will resume on next start",
+                legacy_db,
+            )
             return outcome
 
         # S(1): a store-wide structural mismatch is still all-or-nothing — if
@@ -448,6 +494,14 @@ def _copy_forward(
                 outcome.aborted = f"missing-columns:{table}:{','.join(sorted(missing))}"
                 return outcome
 
+        if out_of_time():
+            outcome.deferred = -1
+            log.warning(
+                "copy-forward: column checks of %s deferred — will resume on next start",
+                legacy_db,
+            )
+            return outcome
+
         pending, outcome.declined = _pending_snapshots(connection)
         if not pending:
             return outcome
@@ -462,7 +516,7 @@ def _copy_forward(
 
         processed = 0
         for snapshot_id, kind in pending:
-            if deadline is not None and time.monotonic() > deadline:
+            if out_of_time():
                 # [23-C] RN5 II: out of *time* for this boot — never out of the
                 # work. Checked only between snapshots, so a transaction in
                 # flight always finishes (Z's atomicity pairs each commit with
@@ -523,13 +577,15 @@ def _pending_snapshots(connection: sqlite3.Connection) -> tuple[list[tuple[str, 
     land as ``manual`` (outside rolling GC) in a product with **no delete path at
     all**, so the growth had no way back.
 
-    So selection is computed **independently of the ledger**: rank the legacy
-    auto population newest-first, take however much budget is left
-    (``MIGRATE_AUTO_BUDGET`` minus autos already migrated, remembered by the
-    ledger's ``origin_kind``), and only then intersect with what is still
-    pending. A previously-failed newest snapshot therefore stays eligible — it is
-    absent from the ledger, so it is still in the intersection — while a
-    previously-*declined* one stays declined, because the budget is durable.
+    So the cap became a **cumulative budget**: ``MIGRATE_AUTO_BUDGET`` minus the
+    autos already migrated, counted from the ledger's ``origin_kind``. Selection
+    ranks what is still *pending* newest-first and takes that much. (An earlier
+    draft ranked the whole legacy population instead, on the theory that ledger
+    independence made the cap stable — it does not: with 3 of 5 already taken and
+    only older ones pending, "newest 2 overall" resolves to two rows already in
+    the ledger, the budget buys nothing and the pending ones are refused forever.
+    Stability comes from the budget being durable, not from where the ranking is
+    drawn.)
 
     [23-C] RN4 BB: the ledger is keyed by ``snapshot_id`` alone. Snapshot ids are
     uuid4, so a store reached through an 8.3 short name, a junction or the second
@@ -610,6 +666,10 @@ def _copy_one_snapshot(
             )
 
         # S(3), now per snapshot: "we copied it" has to mean the rows are there.
+        # Known limit: this compares row *counts*, so a value rewritten in place
+        # or a column dropped from the projection would pass. Same-column
+        # INSERT..SELECT makes that unlikely, and a checksum is deferred rather
+        # than pretended (also stated in KNOWN_ISSUES.md).
         for table in _COPY_TABLES:
             key = "id" if table == "snapshot" else "snapshot_id"
             (want,) = connection.execute(
