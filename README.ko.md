@@ -258,8 +258,11 @@ MCP 차트 서버들은 차트 위주라 노드-엣지 그래프나 대규모(10
 | **도메인 무관** | schema-less(임의 K/V properties) — 코드, API, 조직도, 무엇이든 |
 | **100% 로컬** | 외부 통신 없음, 텔레메트리 없음, 모든 asset self-hosted |
 
-100K는 목표가 아니라 실측이다: M3 튜닝에서 100K 노드 기준 렌더 59.9 FPS,
-import 9.3초, 라이브 push 반영 73.9 ms를 측정했다 (RTX 4070 SUPER).
+100K는 목표가 아니라 실측이다: 100K 노드 기준 렌더 59.9 FPS, import 9.3초,
+라이브 push 반영 73.9 ms — 메인테이너 장비(RTX 4070 SUPER)에서 측정한 값이다.
+하니스·픽스처 생성기·재현 절차는 [docs/benchmarks.md](./docs/benchmarks.md) 에
+있고, 무엇을 보장하지 **않는지**도 함께 적었다 — 손으로 돌리는 프로브이지
+CI 게이트가 아니다.
 
 ---
 
@@ -358,6 +361,7 @@ Claude: save_snapshot("프로젝트-구조-v1")   ← 다음 세션이 이걸 �
 - [docs/handoff.md](./docs/handoff.md) — 세션 핸드오프 프로토콜 + 시스템 프롬프트
   스니펫 + 구현된 도구 레퍼런스
 - [docs/filter-dsl.md](./docs/filter-dsl.md) — 필터 DSL 문법·의미론·안전 상한 정본
+- [docs/benchmarks.md](./docs/benchmarks.md) — 100K 성능 수치의 측정 절차와 재현 방법 (영문)
 - [KNOWN_ISSUES.md](./KNOWN_ISSUES.md) — 알려진 제약과 우회 방법 (영문)
 
 ## 라이선스

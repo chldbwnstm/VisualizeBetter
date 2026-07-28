@@ -275,8 +275,11 @@ One system-prompt line, usable with any AI, enforces the habit (planned):
 | **Domain-agnostic** | Schema-less (arbitrary K/V properties) — code, APIs, org charts, anything |
 | **100% local** | No external calls, no telemetry, every asset self-hosted |
 
-The 100K figure is measured, not aspirational: the M3 tuning pass clocked 59.9 FPS
-rendering, a 9.3 s import, and 73.9 ms live-push apply at 100K nodes (RTX 4070 SUPER).
+The 100K figure is measured, not aspirational: 59.9 FPS rendering, a 9.3 s import,
+and 73.9 ms live-push apply at 100K nodes — measured on the maintainer's hardware
+(RTX 4070 SUPER). The harness, the fixture generator and the repro steps are in
+[docs/benchmarks.md](./docs/benchmarks.md), including what it does *not* guarantee:
+it is a probe you run by hand, not a CI gate.
 
 ---
 
@@ -379,6 +382,7 @@ Claude: save_snapshot("project-structure-v1")   ← the next session loads this 
 - [docs/handoff.md](./docs/handoff.md) — session handoff protocol + system prompt
   snippet + implemented tool reference
 - [docs/filter-dsl.md](./docs/filter-dsl.md) — filter DSL grammar, semantics, and safety
+- [docs/benchmarks.md](./docs/benchmarks.md) — how the 100K numbers were measured
 - [KNOWN_ISSUES.md](./KNOWN_ISSUES.md) — open limitations, with workarounds
   caps (canonical)
 
