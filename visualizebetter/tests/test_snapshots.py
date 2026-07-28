@@ -1715,13 +1715,66 @@ def test_expired_deadline_defers_the_remaining_snapshots(canonical):
         legacy_db, target / DB_FILENAME, deadline=time.monotonic() - 1
     )
 
-    assert outcome.deferred is True
+    assert outcome.deferred == 4      # 남은 건수를 담는다 (재개 대상)
     assert outcome.copied == 0
     assert _snapshot_ids(target / DB_FILENAME) == set()   # 아무것도 안 들어갔고
     assert _snapshot_ids(legacy_db) == {f"s{i}" for i in range(4)}   # legacy 온전
 
     # 예산이 있는 다음 실행이 정확히 이어받는다 (additive + 원장)
     resumed = snap_mod._copy_forward(legacy_db, target / DB_FILENAME)
-    assert resumed.deferred is False
+    assert resumed.deferred == 0
     assert resumed.copied == 4
     assert _snapshot_ids(target / DB_FILENAME) == {f"s{i}" for i in range(4)}
+
+
+def test_budget_is_not_wasted_on_already_copied_snapshots(canonical):
+    """(GG 정정 1) ★ 선택을 legacy **전체 인구**에서 최신순으로 하면, 이미 이관된
+    최신 건들이 남은 예산을 먹고 pending 교집합이 비어 아무것도 복사되지 않는다 —
+    예산이 남아있는데 오래된 것들이 영구 거절된다. 선택은 pending 안에서 한다."""
+    target, legacy = canonical
+    # A1 이 가장 최신, A6 이 가장 오래됨
+    _store_db_kinds(
+        legacy / snap_mod._LEGACY_DB_FILENAME,
+        [(f"A{i}", "auto") for i in (6, 5, 4, 3, 2, 1)],
+    )
+    store = SnapshotStore(target)
+    assert len(_snapshot_ids(store.db_path)) == snap_mod.MIGRATE_AUTO_BUDGET
+
+    # '최신 3건만 이관된' 상태로 되돌린다 (정정 1 의 전제)
+    con = sqlite3.connect(store.db_path)
+    try:
+        con.execute("DELETE FROM copied_snapshot WHERE snapshot_id NOT IN ('A1','A2','A3')")
+        con.execute("DELETE FROM snapshot WHERE id NOT IN ('A1','A2','A3')")
+        con.commit()
+    finally:
+        con.close()
+
+    resumed = SnapshotStore(target)
+
+    ids = _snapshot_ids(resumed.db_path)
+    assert len(ids) == snap_mod.MIGRATE_AUTO_BUDGET   # 남은 예산 2 를 실제로 쓴다
+    assert {"A4", "A5"} <= ids                        # pending 중 최신부터
+
+
+def test_a_store_larger_than_the_deadline_completes_across_boots(canonical):
+    """(II 정정 2) ★ deadline 을 넘는 스토어는 여러 부팅에 걸쳐 진행되는 것이
+    **설계된 동작**이다 — 스냅샷 단위 커밋·원장 덕에 부분 진행이 영속되므로
+    다음 부팅이 정확히 이어받아 결국 완료된다 (절단이 아니다)."""
+    target, legacy = canonical
+    legacy_db = legacy / snap_mod._LEGACY_DB_FILENAME
+    wanted = {f"m{i}" for i in range(6)}
+    _store_db_kinds(legacy_db, [(f"m{i}", "manual") for i in range(6)])
+    target.mkdir(parents=True, exist_ok=True)
+    target_db = target / DB_FILENAME
+
+    # 매번 2건만 처리되도록 deadline 을 짧게 끊어 여러 부팅을 시뮬레이션
+    for _ in range(10):
+        outcome = snap_mod._copy_forward(legacy_db, target_db, deadline=time.monotonic() + 0.0)
+        if outcome.deferred == 0 and outcome.copied == 0:
+            break
+        snap_mod._copy_forward(legacy_db, target_db)   # 예산 있는 실행이 이어받는다
+        if _snapshot_ids(target_db) == wanted:
+            break
+
+    assert _snapshot_ids(target_db) == wanted          # ★ 결국 전부 도착
+    assert _snapshot_ids(legacy_db) == wanted          # legacy 온전

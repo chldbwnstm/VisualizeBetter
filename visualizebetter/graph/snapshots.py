@@ -325,7 +325,9 @@ class _MigrationOutcome:
     declined: int = 0
     failed: int = 0
     aborted: str = ""
-    deferred: bool = False
+    deferred: int = 0
+    """Snapshots left for the next start ([23-C] RN5 II). Distinct from
+    ``declined``: deferred work resumes, declined work does not."""
 
 
 def _record_migration(data_dir: Path, target_db: Path, outcome: _MigrationOutcome) -> None:
@@ -370,7 +372,7 @@ def _record_migration(data_dir: Path, target_db: Path, outcome: _MigrationOutcom
                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     _now(), outcome.source_db, outcome.copied, outcome.declined,
-                    outcome.failed, outcome.aborted, int(outcome.deferred),
+                    outcome.failed, outcome.aborted, outcome.deferred,
                 ),
             )
             connection.commit()
@@ -458,17 +460,25 @@ def _copy_forward(
             for table in _COPY_TABLES
         }
 
+        processed = 0
         for snapshot_id, kind in pending:
             if deadline is not None and time.monotonic() > deadline:
-                # [23-C] RN5 II: out of budget for this boot. Nothing is lost —
-                # additive copying plus the ledger means the next run resumes
-                # exactly here, and the same reasoning as U applies: migration
-                # must never be the reason start-up stalls.
-                outcome.deferred = True
+                # [23-C] RN5 II: out of *time* for this boot — never out of the
+                # work. Checked only between snapshots, so a transaction in
+                # flight always finishes (Z's atomicity pairs each commit with
+                # its ledger row; cutting one apart would desynchronise them).
+                # A large store exceeding this budget is normal and the design
+                # intends it: per-snapshot commits make partial progress durable,
+                # so the next start resumes exactly here and it eventually
+                # completes.
+                outcome.deferred = len(pending) - processed
                 log.warning(
-                    "copy-forward: deferring the rest of %s (time budget reached)", legacy_db
+                    "copy-forward: deferred %d snapshot(s) of %s"
+                    " — will resume on next start",
+                    outcome.deferred, legacy_db,
                 )
                 break
+            processed += 1
             if _copy_one_snapshot(connection, snapshot_id, kind, shared_columns, source_key):
                 outcome.copied += 1
             else:
@@ -532,34 +542,6 @@ def _pending_snapshots(connection: sqlite3.Connection) -> tuple[list[tuple[str, 
     ).fetchone()[0]
     budget = max(0, MIGRATE_AUTO_BUDGET - already)
 
-    # Newest-first over the whole legacy auto population — the ledger plays no
-    # part in *choosing*, only in filtering afterwards.
-    chosen_autos = [
-        row[0]
-        for row in connection.execute(
-            "SELECT id FROM legacy.snapshot"
-            " WHERE id IS NOT NULL AND kind = ?"
-            " ORDER BY created_at DESC, rowid DESC"
-            " LIMIT ?",
-            (SNAPSHOT_KIND_AUTO, budget),
-        )
-    ]
-    (auto_total,) = connection.execute(
-        "SELECT count(*) FROM legacy.snapshot WHERE id IS NOT NULL AND kind = ?",
-        (SNAPSHOT_KIND_AUTO,),
-    ).fetchone()
-    declined = auto_total - already - len(chosen_autos)
-    if declined > 0:
-        # Durable statement: the budget does not reset next boot, so this number
-        # is stable across restarts instead of shrinking to zero as the declined
-        # ones quietly arrived anyway.
-        log.warning(
-            "copy-forward: declined %d auto snapshot(s) — auto budget exhausted"
-            " (%d of %d migrated); they remain in the legacy store",
-            declined, already + len(chosen_autos), MIGRATE_AUTO_BUDGET,
-        )
-
-    eligible = set(chosen_autos)
     rows = connection.execute(
         "SELECT id, kind FROM legacy.snapshot"
         " WHERE id IS NOT NULL"
@@ -567,8 +549,38 @@ def _pending_snapshots(connection: sqlite3.Connection) -> tuple[list[tuple[str, 
         " ORDER BY created_at ASC, rowid ASC"
     ).fetchall()
     manual = [(i, k) for i, k in rows if k != SNAPSHOT_KIND_AUTO]
-    autos = [(i, k) for i, k in rows if k == SNAPSHOT_KIND_AUTO and i in eligible]
-    return manual + autos, max(0, declined)
+
+    # Newest-first **among what is still pending**, limited by what is left of the
+    # budget. Ranking the whole legacy population instead would spend the budget
+    # on snapshots already copied: with 5 budgeted, 3 already taken (the newest
+    # three) and A4..A6 pending, "newest 2 overall" resolves to the two already in
+    # the ledger, the intersection is empty, and 2 units of budget buy nothing
+    # while A4..A6 are refused forever. Stability comes from the budget being
+    # durable, not from where the ranking is drawn.
+    pending_autos = [
+        row[0]
+        for row in connection.execute(
+            "SELECT id FROM legacy.snapshot"
+            " WHERE id IS NOT NULL AND kind = ?"
+            "   AND id NOT IN (SELECT snapshot_id FROM main.copied_snapshot)"
+            " ORDER BY created_at DESC, rowid DESC",
+            (SNAPSHOT_KIND_AUTO,),
+        )
+    ]
+    taken = set(pending_autos[:budget])
+    declined = len(pending_autos) - len(taken)
+    if declined > 0:
+        # ``declined`` is a *policy* verdict and permanent: the budget does not
+        # reset next boot, so these are not coming later. Distinct from
+        # ``deferred`` below, which only means "not this time".
+        log.warning(
+            "copy-forward: declined %d auto snapshot(s) — auto budget exhausted"
+            " (%d of %d migrated); they remain in the legacy store",
+            declined, already + len(taken), MIGRATE_AUTO_BUDGET,
+        )
+
+    autos = [(i, k) for i, k in rows if k == SNAPSHOT_KIND_AUTO and i in taken]
+    return manual + autos, declined
 
 
 def _copy_one_snapshot(
@@ -751,7 +763,7 @@ class SnapshotStore:
                         self.data_dir, self.db_path,
                         _MigrationOutcome(
                             source_db=os.path.normcase(os.path.abspath(legacy_db)),
-                            deferred=True,
+                            deferred=-1,  # unknown: never opened
                         ),
                     )
                     continue
