@@ -22,7 +22,9 @@ import logging
 import os
 import sqlite3
 import sys
+import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +50,33 @@ SNAPSHOT_KIND_AUTO = "auto"
 
 MAX_AUTO_SNAPSHOTS = 20
 """[23-C] rolling GC — auto 스냅샷은 최근 20개만 유지. manual 은 영구 ([5-E])."""
+
+# [23-C] RN5 KK(2) — two limits worth stating plainly:
+#  · A migrated snapshot cannot be deleted through any surface this product
+#    exposes (there is no delete_snapshot tool, and deleting the target store
+#    means "copy it again"). Closing that is a [5-E] delete_snapshot, not this.
+#  · A legacy *manual* snapshot is copied under its own name, so a listing cannot
+#    tell it apart from a native one. Provenance lives in the ledger.
+MIGRATE_AUTO_BUDGET = 5
+"""[23-C] RN5 GG — how many legacy *auto* snapshots migration will ever bring
+over, in total, across all runs.
+
+Deliberately its own number rather than ``MAX_AUTO_SNAPSHOTS``: the two answer
+different questions. Rolling GC bounds a live pool whose members are cheap to
+lose (the next tick makes another); this bounds a one-way import whose arrivals
+land as ``manual`` and, today, **cannot be deleted by any surface the product
+exposes** — there is no delete_snapshot tool, no store API, no UI, no CLI. Size
+makes that concrete: a snapshot serializes at roughly 212 B per (node + edge), so
+at the [15] KPI scale of 100K nodes / 200K edges one is ~64 MB — 20 would be
+~1.3 GB, doubled at peak because the legacy store is kept. The purpose of
+migrating autos at all is "recover something close to the moment before the
+rename", and the newest 5 serve that. manual snapshots are copied in full: the
+user asked for those, and [5-E] says they live until deleted.
+
+Three timings that must stay ordered ([23-C] RN5 II) —
+migration deadline 10s  <  proxy LAUNCH_TIMEOUT_S 25s  <  Tauri wait_for_serve 40s.
+Raising one without the others reintroduces a start-up hang.
+"""
 
 DEFAULT_AUTO_INTERVAL_SECONDS = 300
 """[23-C] 주기 트리거 기본 300초 ([5-E]: 기본 5분)."""
@@ -139,6 +168,18 @@ CREATE INDEX IF NOT EXISTS idx_finding_node_node
 -- removes rows from `snapshot`, and inferring "already copied" from that table
 -- would re-copy pruned snapshots every boot and resurrect deleted ones ([5-E]
 -- makes a delete durable). This ledger records the copy, not the survival.
+-- [23-C] RN5 HH — one row per migration attempt, so the story survives even
+-- where stderr does not. Additive and read-only to everything else.
+CREATE TABLE IF NOT EXISTS migration_run (
+    ran_at    TEXT NOT NULL,
+    source_db TEXT NOT NULL,
+    copied    INTEGER NOT NULL DEFAULT 0,
+    declined  INTEGER NOT NULL DEFAULT 0,
+    failed    INTEGER NOT NULL DEFAULT 0,
+    aborted   TEXT NOT NULL DEFAULT '',
+    deferred  INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS copied_snapshot (
     -- [23-C] RN4 BB: keyed by snapshot_id alone. Snapshot ids are uuid4, so the
     -- id is globally unique; keying by (source_db, snapshot_id) made the same
@@ -147,15 +188,42 @@ CREATE TABLE IF NOT EXISTS copied_snapshot (
     -- source_db stays as information, not identity.
     snapshot_id TEXT PRIMARY KEY,
     source_db   TEXT NOT NULL,
-    copied_at   TEXT NOT NULL
+    copied_at   TEXT NOT NULL,
+    -- [23-C] RN5 GG: the snapshot's kind *in the legacy store*, before it was
+    -- landed as manual. The auto budget is spent against this, so it survives
+    -- restarts. Counting `name LIKE 'migrated: %'` instead would tie a durable
+    -- accounting decision to a display string.
+    origin_kind TEXT NOT NULL DEFAULT ''
 );
+-- [23-C] RN5 KK(3): an existing copied_snapshot carrying the older composite PK
+-- is left exactly as it is. Correctness does not depend on the key — the pending
+-- query carries no source predicate — and SQLite cannot ALTER a primary key, so
+-- rebuilding would risk the ledger for no gain. New databases get this DDL.
 """
 
 # [23-C] RN4 X — migrated auto snapshots land as manual (prune must not reach
-# them) and say so in their name rather than in a new `kind` value: kind is a
-# contract several tools/UI paths branch on, and widening it costs an audit of
-# all of them for no gain here.
+# them) and say so in their name rather than in a new `kind` value.
+# [23-C] RN5 KK(1): the original reason given here — "auditing every consumer
+# costs more than it gains" — was an overestimate; the measured consumers are one
+# docstring, zero branches, zero frontend, zero CLI. The real reason is simpler:
+# [5-E] advertises `kind: manual|auto` to the AI as a contract, and prune only
+# ever deletes 'auto', so a third value would buy nothing.
 _MIGRATED_NAME_PREFIX = "migrated: "
+
+# [23-C] RN5 HH — durable migration reporting (log.warning is invisible in both
+# shipped forms: the proxy DEVNULLs serve's stderr, the Tauri shell drops it).
+_MIGRATION_LOG_NAME = "migration.log"
+
+# [23-C] RN5 II — the copy runs before the readiness signal, so it needs a
+# ceiling. sqlite3's timeout is *per statement*, so 30s meant a locked target
+# could stall start-up for 84s (two candidates: ~168s) — past the proxy's 25s and
+# the Tauri shell's 40s, and the Tauri path has no retry. 4s per statement with a
+# 10s wall-clock budget for the whole migration keeps it under both.
+_COPY_LOCK_TIMEOUT_S = 4.0
+_COPY_DEADLINE_S = 10.0
+# Reporting must not extend start-up either. If the target is locked we still get
+# the file log, which is the surface a user can actually find.
+_REPORT_LOCK_TIMEOUT_S = 1.0
 
 # [24-C] history columns added by ALTER — see _apply_schema.
 _FINDING_HISTORY_COLUMNS = ("superseded", "provenance")
@@ -248,7 +316,73 @@ def _required_columns(connection: sqlite3.Connection, schema: str, table: str) -
     return required
 
 
-def _copy_forward(legacy_db: Path, target_db: Path) -> int:
+@dataclass
+class _MigrationOutcome:
+    """[23-C] RN5 HH — what one legacy candidate's copy actually did."""
+
+    source_db: str
+    copied: int = 0
+    declined: int = 0
+    failed: int = 0
+    aborted: str = ""
+    deferred: bool = False
+
+
+def _record_migration(data_dir: Path, target_db: Path, outcome: _MigrationOutcome) -> None:
+    """[23-C] RN5 HH — make the migration story survivable outside the log.
+
+    Everything copy-forward has to say — how many arrived, how many the budget
+    declined, which snapshots were skipped, why a store was refused outright,
+    whether we ran out of time — used to exist only as ``log.warning``. With no
+    logging configuration that lands on stderr via lastResort, and both shipped
+    forms throw stderr away: the proxy spawns serve with
+    ``stderr=subprocess.DEVNULL`` and the Tauri shell drops the sidecar's output
+    receiver on spawn. Only someone running ``serve`` by hand in a terminal ever
+    saw it — which excludes exactly the population this migration exists for.
+
+    So it is written twice, both additive:
+
+    * ``<data_dir>/migration.log``, **appended**. It lives in the directory we
+      own, so [23-C] RN4 Y (never write into the legacy directory) is untouched.
+    * a ``migration_run`` row in the target database, for a future diagnostic
+      tool or recovery UX to read.
+
+    Reporting must never be the reason a migration fails, so every failure here
+    is swallowed.
+    """
+    line = (
+        f"{_now()}\tsource={outcome.source_db}\tcopied={outcome.copied}"
+        f"\tdeclined={outcome.declined}\tfailed={outcome.failed}"
+        f"\taborted={outcome.aborted or '-'}\tdeferred={int(outcome.deferred)}\n"
+    )
+    try:
+        with open(data_dir / _MIGRATION_LOG_NAME, "a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError:
+        pass
+    try:
+        connection = sqlite3.connect(target_db, timeout=_REPORT_LOCK_TIMEOUT_S)
+        try:
+            _apply_schema(connection)
+            connection.execute(
+                "INSERT INTO migration_run"
+                " (ran_at, source_db, copied, declined, failed, aborted, deferred)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _now(), outcome.source_db, outcome.copied, outcome.declined,
+                    outcome.failed, outcome.aborted, int(outcome.deferred),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        pass
+
+
+def _copy_forward(
+    legacy_db: Path, target_db: Path, deadline: float | None = None
+) -> _MigrationOutcome:
     """[23-C] RN3 L~R + S~W, RN4 X/Z/BB/CC — copy snapshots legacy → target.
 
     Nothing is ever moved or deleted, so concurrency is SQLite's problem and it
@@ -277,9 +411,10 @@ def _copy_forward(legacy_db: Path, target_db: Path) -> int:
     Returns the number of snapshots actually committed ([23-C] RN4 CC).
     """
     source_key = os.path.normcase(os.path.abspath(legacy_db))
+    outcome = _MigrationOutcome(source_db=source_key)
     connection = None
     try:
-        connection = sqlite3.connect(target_db, timeout=30.0)
+        connection = sqlite3.connect(target_db, timeout=_COPY_LOCK_TIMEOUT_S)
         _apply_schema(connection)
         connection.commit()
 
@@ -287,7 +422,8 @@ def _copy_forward(legacy_db: Path, target_db: Path) -> int:
             connection.execute("ATTACH DATABASE ? AS legacy", (str(legacy_db),))
         except sqlite3.Error as exc:
             log.warning("copy-forward skipped: cannot open legacy store %s (%s)", legacy_db, exc)
-            return 0
+            outcome.aborted = "cannot-open-legacy"
+            return outcome
 
         # S(1): a store-wide structural mismatch is still all-or-nothing — if
         # legacy cannot supply a column target requires, no snapshot from it can
@@ -298,7 +434,8 @@ def _copy_forward(legacy_db: Path, target_db: Path) -> int:
                 log.warning(
                     "copy-forward aborted: legacy store %s has no '%s' table", legacy_db, table
                 )
-                return 0
+                outcome.aborted = f"missing-table:{table}"
+                return outcome
             missing = _required_columns(connection, "main", table) - source_columns
             if missing:
                 log.warning(
@@ -306,11 +443,12 @@ def _copy_forward(legacy_db: Path, target_db: Path) -> int:
                     " — nothing was copied and nothing was changed",
                     legacy_db, table, sorted(missing),
                 )
-                return 0
+                outcome.aborted = f"missing-columns:{table}:{','.join(sorted(missing))}"
+                return outcome
 
-        pending = _pending_snapshots(connection)
+        pending, outcome.declined = _pending_snapshots(connection)
         if not pending:
-            return 0
+            return outcome
 
         shared_columns = {
             table: [
@@ -320,13 +458,22 @@ def _copy_forward(legacy_db: Path, target_db: Path) -> int:
             for table in _COPY_TABLES
         }
 
-        copied = 0
-        failed = 0
         for snapshot_id, kind in pending:
+            if deadline is not None and time.monotonic() > deadline:
+                # [23-C] RN5 II: out of budget for this boot. Nothing is lost —
+                # additive copying plus the ledger means the next run resumes
+                # exactly here, and the same reasoning as U applies: migration
+                # must never be the reason start-up stalls.
+                outcome.deferred = True
+                log.warning(
+                    "copy-forward: deferring the rest of %s (time budget reached)", legacy_db
+                )
+                break
             if _copy_one_snapshot(connection, snapshot_id, kind, shared_columns, source_key):
-                copied += 1
+                outcome.copied += 1
             else:
-                failed += 1
+                outcome.failed += 1
+        copied, failed = outcome.copied, outcome.failed
         if copied:
             log.warning(
                 "copy-forward: copied %d snapshot(s) from %s -> %s", copied, legacy_db, target_db
@@ -337,13 +484,14 @@ def _copy_forward(legacy_db: Path, target_db: Path) -> int:
                 " — they stay in the legacy store and will be retried next run",
                 failed, legacy_db,
             )
-        return copied
+        return outcome
     except Exception as exc:  # noqa: BLE001
         # [23-C] U — migration is a convenience; it must never be why the app
         # will not start. Nothing here deletes anything, so "failed" only ever
         # means "not yet".
         log.warning("copy-forward failed (%s); both stores left untouched", exc)
-        return 0
+        outcome.aborted = f"error:{type(exc).__name__}"
+        return outcome
     finally:
         if connection is not None:
             with contextlib.suppress(sqlite3.Error):
@@ -352,21 +500,66 @@ def _copy_forward(legacy_db: Path, target_db: Path) -> int:
                 connection.close()
 
 
-def _pending_snapshots(connection: sqlite3.Connection) -> list[tuple[str, str]]:
-    """(id, kind) of legacy snapshots not yet in the ledger, oldest-first.
+def _pending_snapshots(connection: sqlite3.Connection) -> tuple[list[tuple[str, str]], int]:
+    """Snapshots to copy this run, as ``(id, kind)`` — manual first, oldest-first.
 
-    [23-C] RN4 X: manual snapshots all qualify; only the newest
-    ``MAX_AUTO_SNAPSHOTS`` autos do, because that is the most the target would
-    have kept anyway. Whatever is left behind is counted and logged, never
-    dropped in silence — and legacy still holds it.
+    [23-C] RN4 X / RN5 GG — **budgeted**, not capped-per-run. RN4 subtracted the
+    ledger first and then capped what was left, so the autos it declined were
+    never recorded and came right back as pending on the next boot: boot1 took 21
+    and reported "5 not copied", boot2 took those same 5 (26 total), and an old
+    app still writing autos pushed that further every restart. Three things broke
+    at once — the "newest N only" policy stopped holding after the first boot,
+    the reassuring "not copied" count became a false statement, and the arrivals
+    land as ``manual`` (outside rolling GC) in a product with **no delete path at
+    all**, so the growth had no way back.
 
-    [23-C] RN4 BB: the ledger is keyed by ``snapshot_id`` alone. Keying it by
-    (source_db, snapshot_id) meant the same store reached through an 8.3 short
-    name, a junction, or the second candidate path counted as a *new* source and
-    resurrected snapshots the user had deleted — exactly the [5-E] violation the
-    ledger exists to prevent, wearing a different hat. Snapshot ids are uuid4, so
-    the id alone is globally unique and the alias axis simply disappears.
+    So selection is computed **independently of the ledger**: rank the legacy
+    auto population newest-first, take however much budget is left
+    (``MIGRATE_AUTO_BUDGET`` minus autos already migrated, remembered by the
+    ledger's ``origin_kind``), and only then intersect with what is still
+    pending. A previously-failed newest snapshot therefore stays eligible — it is
+    absent from the ledger, so it is still in the intersection — while a
+    previously-*declined* one stays declined, because the budget is durable.
+
+    [23-C] RN4 BB: the ledger is keyed by ``snapshot_id`` alone. Snapshot ids are
+    uuid4, so a store reached through an 8.3 short name, a junction or the second
+    candidate path cannot masquerade as a new source and resurrect what the user
+    deleted ([5-E]).
     """
+    already = connection.execute(
+        "SELECT count(*) FROM main.copied_snapshot WHERE origin_kind = ?",
+        (SNAPSHOT_KIND_AUTO,),
+    ).fetchone()[0]
+    budget = max(0, MIGRATE_AUTO_BUDGET - already)
+
+    # Newest-first over the whole legacy auto population — the ledger plays no
+    # part in *choosing*, only in filtering afterwards.
+    chosen_autos = [
+        row[0]
+        for row in connection.execute(
+            "SELECT id FROM legacy.snapshot"
+            " WHERE id IS NOT NULL AND kind = ?"
+            " ORDER BY created_at DESC, rowid DESC"
+            " LIMIT ?",
+            (SNAPSHOT_KIND_AUTO, budget),
+        )
+    ]
+    (auto_total,) = connection.execute(
+        "SELECT count(*) FROM legacy.snapshot WHERE id IS NOT NULL AND kind = ?",
+        (SNAPSHOT_KIND_AUTO,),
+    ).fetchone()
+    declined = auto_total - already - len(chosen_autos)
+    if declined > 0:
+        # Durable statement: the budget does not reset next boot, so this number
+        # is stable across restarts instead of shrinking to zero as the declined
+        # ones quietly arrived anyway.
+        log.warning(
+            "copy-forward: declined %d auto snapshot(s) — auto budget exhausted"
+            " (%d of %d migrated); they remain in the legacy store",
+            declined, already + len(chosen_autos), MIGRATE_AUTO_BUDGET,
+        )
+
+    eligible = set(chosen_autos)
     rows = connection.execute(
         "SELECT id, kind FROM legacy.snapshot"
         " WHERE id IS NOT NULL"
@@ -374,15 +567,8 @@ def _pending_snapshots(connection: sqlite3.Connection) -> list[tuple[str, str]]:
         " ORDER BY created_at ASC, rowid ASC"
     ).fetchall()
     manual = [(i, k) for i, k in rows if k != SNAPSHOT_KIND_AUTO]
-    autos = [(i, k) for i, k in rows if k == SNAPSHOT_KIND_AUTO]
-    skipped = max(0, len(autos) - MAX_AUTO_SNAPSHOTS)
-    if skipped:
-        log.warning(
-            "copy-forward: %d older auto snapshot(s) not copied (newest %d kept);"
-            " they remain in the legacy store",
-            skipped, MAX_AUTO_SNAPSHOTS,
-        )
-    return manual + autos[skipped:]
+    autos = [(i, k) for i, k in rows if k == SNAPSHOT_KIND_AUTO and i in eligible]
+    return manual + autos, max(0, declined)
 
 
 def _copy_one_snapshot(
@@ -436,9 +622,9 @@ def _copy_one_snapshot(
                 (SNAPSHOT_KIND_MANUAL, _MIGRATED_NAME_PREFIX, snapshot_id),
             )
         connection.execute(
-            "INSERT OR IGNORE INTO main.copied_snapshot (snapshot_id, source_db, copied_at)"
-            " VALUES (?, ?, ?)",
-            (snapshot_id, source_key, _now()),
+            "INSERT OR IGNORE INTO main.copied_snapshot"
+            " (snapshot_id, source_db, copied_at, origin_kind) VALUES (?, ?, ?, ?)",
+            (snapshot_id, source_key, _now(), kind),
         )
         connection.commit()
         return True
@@ -547,6 +733,7 @@ class SnapshotStore:
         not an "is it empty?" judgement: a wrong answer here costs one skipped
         copy, never a deleted store, so no fail-closed handling is needed.
         """
+        deadline = time.monotonic() + _COPY_DEADLINE_S
         for legacy_db in _legacy_db_candidates(self.data_dir):
             # [23-C] RN4 EE: "start-up cannot fail here" is a structural
             # guarantee, not a promise that every callee remembers to keep. One
@@ -555,7 +742,22 @@ class SnapshotStore:
             try:
                 if _same_path(legacy_db, self.db_path):
                     continue
-                if _copy_forward(legacy_db, self.db_path):
+                if time.monotonic() > deadline:
+                    log.warning(
+                        "copy-forward: %s deferred (time budget reached before it started)",
+                        legacy_db,
+                    )
+                    _record_migration(
+                        self.data_dir, self.db_path,
+                        _MigrationOutcome(
+                            source_db=os.path.normcase(os.path.abspath(legacy_db)),
+                            deferred=True,
+                        ),
+                    )
+                    continue
+                outcome = _copy_forward(legacy_db, self.db_path, deadline)
+                _record_migration(self.data_dir, self.db_path, outcome)
+                if outcome.copied:
                     _leave_breadcrumb(legacy_db, self.db_path)
             except Exception as exc:  # noqa: BLE001
                 log.warning("copy-forward skipped for %s (%s)", legacy_db, exc)

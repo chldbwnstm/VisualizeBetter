@@ -608,3 +608,17 @@ def test_push_node_rejects_pair_list_properties(mcp):
     with pytest.raises(ToolError, match="must be an object"):
         call(mcp, "push_node", id="x", label="X", type="class",
              properties=[["_citations", "FORGED"]])
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [{"set": {1: "x"}}, {"remove": [1]}, {"set": ["label"]}, {"remove": "label"}],
+)
+def test_malformed_patch_is_a_tool_error_not_a_crash(mcp, graph, patch):
+    """[23-C] RN5 JJ — MCP 층에서도 ValueError→ToolError 로 수렴한다. 이전에는
+    AttributeError 가 그대로 새어나가거나(체이닝) 조용히 무동작이었다."""
+    call(mcp, "push_node", id="a", label="A", type="class")
+    before = graph.get_node("a").to_dict()
+    with pytest.raises(ToolError):
+        call(mcp, "update_node", id="a", patch=patch)
+    assert graph.get_node("a").to_dict() == before

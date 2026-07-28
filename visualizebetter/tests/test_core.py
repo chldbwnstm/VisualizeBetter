@@ -648,3 +648,74 @@ def test_history_paths_still_work_after_the_type_check():
     assert node.properties[CITATIONS_PROPERTY][0]["url"] == "https://example.test/a"
     assert node.properties[SUPERSEDED_PROPERTY][0]["prev"]["label"] == "N"
     assert node.properties[PROVENANCE_PROPERTY][0]["action"] == "correction"
+
+
+# --- [23-C] RN5 JJ — patch 의 모양을 예약키 판정 전에 확정한다 ---
+
+
+_BAD_PATCHES = [
+    {"set": {1: "x"}},          # 비문자열 키 → startswith AttributeError 였다
+    {"remove": [1]},            # 같은 축, remove 쪽
+    {"set": ["label"]},         # set 이 dict 아님 → MCP 체이닝이 터졌다
+    {"remove": "label"},        # ★ 조용히 성공(문자 단위 순회, 무동작) 이었다
+    {"set": "label"},
+    {"remove": {"label": 1}},
+    ["set"],                    # ★ patch 자체가 dict 이 아님
+    "label",
+    42,
+]
+
+
+@pytest.mark.parametrize("patch", _BAD_PATCHES)
+def test_malformed_node_patch_is_refused_without_changing_data(patch):
+    g = Graph()
+    g.add_node(id="n", label="N", type="class", properties={"keep": 1})
+    before = g.get_node("n").to_dict()
+
+    with pytest.raises(ValueError):
+        g.update_node("n", patch)
+
+    assert g.get_node("n").to_dict() == before
+
+
+@pytest.mark.parametrize("patch", _BAD_PATCHES)
+def test_malformed_edge_patch_is_refused_without_changing_data(patch):
+    g = Graph()
+    g.add_node(id="a", label="A", type="class")
+    g.add_node(id="b", label="B", type="class")
+    g.add_edge(source="a", target="b", relation="calls", properties={"keep": 1})
+    before = g.edges[("a", "b", "calls", "")].to_dict()
+
+    with pytest.raises(ValueError):
+        g.update_edge("a", "b", "calls", "", patch)
+
+    assert g.edges[("a", "b", "calls", "")].to_dict() == before
+
+
+@pytest.mark.parametrize("patch", [p for p in _BAD_PATCHES if not (isinstance(p, dict) and "remove" in p)])
+def test_malformed_finding_patch_is_refused_without_changing_data(patch):
+    g = Graph()
+    finding = g.add_finding(title="t", body="b")
+    before = finding.to_dict()
+
+    with pytest.raises(ValueError):
+        g.update_finding(finding.finding_id, patch)
+
+    assert g.get_finding(finding.finding_id).to_dict() == before
+
+
+def test_wellformed_patches_still_work():
+    """회귀 — 정상 patch(속성 set·remove·properties merge)는 그대로 동작한다."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class", properties={"a": 1, "drop": 2})
+
+    g.update_node("n", {"set": {"label": "N2", "properties": {"b": 3}}})
+    assert g.get_node("n").label == "N2"
+    assert g.get_node("n").properties == {"a": 1, "drop": 2, "b": 3}
+
+    g.update_node("n", {"remove": ["drop"]})
+    assert g.get_node("n").properties == {"a": 1, "b": 3}
+
+    g.update_node("n", {"remove": ()})          # 빈 tuple 도 허용
+    g.update_node("n", {})                       # set/remove 없음도 허용
+    assert g.get_node("n").properties == {"a": 1, "b": 3}

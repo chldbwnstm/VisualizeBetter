@@ -230,6 +230,20 @@ schema, which is what makes the correction/supersession distinction usable.
 """
 
 
+def _patch_properties(patch: dict[str, Any] | None) -> Any:
+    """[23-C] RN5 JJ — read ``patch["set"]["properties"]`` without assuming shape.
+
+    ``(patch or {}).get("set", {}).get("properties")`` raised AttributeError the
+    moment ``set`` was anything but a mapping (a list, say), and that escapes the
+    tool's error handling instead of becoming a ToolError. Core validates the
+    whole patch shape as well; this only has to survive long enough to get there.
+    """
+    if not isinstance(patch, dict):
+        return None
+    updates = patch.get("set")
+    return updates.get("properties") if isinstance(updates, dict) else None
+
+
 def _reject_reserved_properties(properties: dict[str, Any] | None) -> None:
     """[23-B] 예약키 쓰기보호 — `_` 접두 키는 시스템 소유다.
 
@@ -849,7 +863,7 @@ def _register_write(
                 'supersede' 는 이전 값을 properties._superseded 에 보존하고,
                 'correction' 은 보존하지 않는다 (틀린 값은 노이즈).
         """
-        _reject_reserved_properties((patch or {}).get("set", {}).get("properties"))
+        _reject_reserved_properties(_patch_properties(patch))
         try:
             node = graph.update_node(id, patch, reason=reason)
         except KeyError:
@@ -868,7 +882,7 @@ def _register_write(
         reason: UpdateReason = None,
     ) -> dict[str, Any]:
         """엣지를 부분 갱신한다. patch/reason 규약은 update_node 와 같다."""
-        _reject_reserved_properties((patch or {}).get("set", {}).get("properties"))
+        _reject_reserved_properties(_patch_properties(patch))
         try:
             edge = graph.update_edge(source, target, relation, key, patch or {}, reason=reason)
         except KeyError:

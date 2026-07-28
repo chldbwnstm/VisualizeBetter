@@ -9,6 +9,7 @@ snapshot name never reaches the filesystem.
 import asyncio
 import json
 import sqlite3
+import time
 
 import pytest
 from hypothesis import HealthCheck, given, settings
@@ -1294,10 +1295,10 @@ def test_migrated_autos_survive_prune_and_do_not_evict_user_autos(canonical, cap
 
     kinds = _kinds(store.db_path)
     migrated = {i for i in kinds if i.startswith("L")}
-    assert "Lm" in migrated                                  # manual 은 전부
-    assert len(migrated) == 1 + snap_mod.MAX_AUTO_SNAPSHOTS  # auto 는 최신 20건
-    assert all(kinds[i] == "manual" for i in migrated)       # ★ prune 대상 밖
-    assert "5 older auto snapshot(s) not copied" in caplog.text   # 무언의 절단 금지
+    assert "Lm" in migrated                                     # manual 은 전부
+    assert len(migrated) == 1 + snap_mod.MIGRATE_AUTO_BUDGET    # auto 는 예산만큼
+    assert all(kinds[i] == "manual" for i in migrated)          # ★ prune 대상 밖
+    assert "auto budget exhausted" in caplog.text               # 무언의 절단 금지
 
     # 사용자가 이후 자기 auto 를 20건 만든다 (실 prune API 사용)
     graph = Graph(name="user")
@@ -1479,3 +1480,248 @@ def test_default_wiring_uses_default_data_dir(tmp_path, monkeypatch):
     assert store.data_dir.is_dir()
     run(store.initialize())
     assert store.db_path.exists()
+
+
+# --- [23-C] ★★★★ RN5 GG~KK — RN4 설계 결함 보정 ---
+
+
+def _migration_rows(db: Path) -> list:
+    con = sqlite3.connect(db)
+    try:
+        return con.execute(
+            "SELECT copied, declined, failed, aborted, deferred FROM migration_run"
+            " ORDER BY rowid"
+        ).fetchall()
+    finally:
+        con.close()
+
+
+# --- GG: 누적 예산 (부팅 간 안정) ---
+
+
+def test_auto_budget_is_cumulative_across_boots(canonical, caplog):
+    """(GG) ★ blocker — RN4 는 원장 차분 **뒤** 집합에 상한을 걸어서, 거절된 auto 가
+    원장에 안 남고 다음 부팅에 전부 들어왔다 (boot1 21 → boot2 26 → 계속 누적).
+    예산이 durable 해야 '최신 N 만' 정책과 거절 건수 진술이 부팅 간 참이 된다."""
+    target, legacy = canonical
+    _store_db_kinds(
+        legacy / snap_mod._LEGACY_DB_FILENAME,
+        [(f"L{i:02d}", "auto") for i in range(25)] + [("Lm", "manual")],
+    )
+    budget = snap_mod.MIGRATE_AUTO_BUDGET
+
+    totals, declines = [], []
+    for _ in range(3):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=snap_mod.log.name):
+            store = SnapshotStore(target)
+        ids = _snapshot_ids(store.db_path)
+        totals.append(len({i for i in ids if i.startswith("L") and i != "Lm"}))
+        declines.append(
+            [ln for ln in caplog.text.splitlines() if "auto budget exhausted" in ln]
+        )
+
+    assert totals == [budget] * 3          # (a) 예산 초과 없음 (b) 추가 유입 없음
+    assert all(d for d in declines)        # (c) 거절 진술이 매 부팅 존재
+    assert declines[0][0].split("declined")[1] == declines[2][0].split("declined")[1]
+    assert "Lm" in _snapshot_ids(store.db_path)   # (d) manual 은 전량 도착
+
+    # 최신순으로 골랐는지 — L24 가 최신이다
+    assert "L24" in _snapshot_ids(store.db_path)
+    assert "L00" not in _snapshot_ids(store.db_path)
+
+
+def test_budget_holds_when_the_old_app_keeps_writing_autos(canonical):
+    """(GG) 구 앱이 계속 auto 를 만들어도 총수는 예산에 고정된다."""
+    target, legacy = canonical
+    legacy_db = legacy / snap_mod._LEGACY_DB_FILENAME
+    _store_db_kinds(legacy_db, [(f"A{i:02d}", "auto") for i in range(10)])
+    first = SnapshotStore(target)
+    migrated = {i for i in _snapshot_ids(first.db_path) if i.startswith("A")}
+    assert len(migrated) == snap_mod.MIGRATE_AUTO_BUDGET
+
+    _store_db_kinds(legacy_db, [(f"B{i:02d}", "auto") for i in range(10)])  # 구 앱이 추가
+    second = SnapshotStore(target)
+
+    after = {i for i in _snapshot_ids(second.db_path) if i[0] in "AB"}
+    assert len(after) == snap_mod.MIGRATE_AUTO_BUDGET     # ★ 총수 불변
+
+
+def test_ledger_remembers_origin_kind(canonical):
+    """(GG) 예산은 원장의 origin_kind 로 계산된다 — 이름 문자열 의존 금지."""
+    target, legacy = canonical
+    _store_db_kinds(legacy / snap_mod._LEGACY_DB_FILENAME, [("a1", "auto"), ("m1", "manual")])
+    store = SnapshotStore(target)
+    con = sqlite3.connect(store.db_path)
+    try:
+        kinds = dict(con.execute("SELECT snapshot_id, origin_kind FROM copied_snapshot"))
+    finally:
+        con.close()
+    assert kinds == {"a1": "auto", "m1": "manual"}
+
+
+# --- HH: 로그 밖으로 내구화 ---
+
+
+def test_migration_is_recorded_durably_and_appended(canonical):
+    """(HH) ★ 두 배포 형태 모두 stderr 를 버린다 — 이관 서사가 log.warning 에만
+    있으면 대상 사용자에게는 표면이 0개다."""
+    target, legacy = canonical
+    _store_db_kinds(legacy / snap_mod._LEGACY_DB_FILENAME, [("s1", "manual")])
+
+    first = SnapshotStore(target)
+    log_path = target / snap_mod._MIGRATION_LOG_NAME
+    assert log_path.exists()
+    first_body = log_path.read_text(encoding="utf-8")
+    assert "copied=1" in first_body
+    rows = _migration_rows(first.db_path)
+    assert rows and rows[-1][0] == 1
+
+    SnapshotStore(target)   # 2회차
+    body = log_path.read_text(encoding="utf-8")
+    assert body.startswith(first_body)          # ★ append (기존 줄 보존)
+    assert len(body.splitlines()) >= 2
+    assert len(_migration_rows(first.db_path)) >= 2
+
+
+def test_abort_reason_is_recorded(canonical):
+    """(HH) S(1) 중단 사유가 내구 표면에 남는다."""
+    target, legacy = canonical
+    _legacy_with_narrow_schema(legacy / snap_mod._LEGACY_DB_FILENAME)
+
+    store = SnapshotStore(target)
+
+    body = (target / snap_mod._MIGRATION_LOG_NAME).read_text(encoding="utf-8")
+    assert "missing-columns:node" in body
+    assert "label" in body
+    assert any("missing-columns" in (r[3] or "") for r in _migration_rows(store.db_path))
+
+
+def test_skipped_snapshot_is_recorded(canonical):
+    """(HH) Z 의 skip 건수도 내구 표면에 남는다."""
+    target, legacy = canonical
+    legacy_db = legacy / snap_mod._LEGACY_DB_FILENAME
+    legacy.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(legacy_db)
+    try:
+        con.executescript(
+            snap_mod._SCHEMA.replace("label         TEXT NOT NULL", "label         TEXT")
+        )
+        con.execute(
+            "INSERT INTO snapshot (id, name, description, created_at, kind, node_count,"
+            " edge_count, metadata, layers, version)"
+            " VALUES ('bad','n','','z','manual',1,0,'{}','[]','')"
+        )
+        con.execute(
+            'INSERT INTO node (snapshot_id, id, label, "type", properties, tags,'
+            " created_at, updated_at) VALUES ('bad','n1',NULL,'class','{}','[]','z','z')"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    store = SnapshotStore(target)
+
+    assert "failed=1" in (target / snap_mod._MIGRATION_LOG_NAME).read_text(encoding="utf-8")
+    assert any(r[2] == 1 for r in _migration_rows(store.db_path))
+
+
+def test_audit_allows_append_but_not_truncating_writes():
+    """(HH/EE) 정적 감사 — append 는 허용, 'w'/truncate 는 계속 금지."""
+    import ast
+
+    source = Path(snap_mod.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "open":
+            modes = [a.value for a in node.args[1:2] if isinstance(a, ast.Constant)]
+            modes += [
+                kw.value.value for kw in node.keywords
+                if kw.arg == "mode" and isinstance(kw.value, ast.Constant)
+            ]
+            assert modes, f"open() without an explicit mode @ line {node.lineno}"
+            for mode in modes:
+                assert "w" not in mode and "+" not in mode, (
+                    f"truncating open({mode!r}) @ line {node.lineno}"
+                )
+
+
+# --- II: readiness 앞 비용에 상한 ---
+
+
+def test_migration_gives_up_within_its_deadline_when_the_target_is_locked(canonical):
+    """(II) ★ sqlite3 timeout 은 **문장당**이라 30s 설정은 잠긴 target 에서 84s 를
+    태웠다 (후보 2개면 ~168s). 소비자 예산은 proxy 25s / Tauri 40s 이고 Tauri 는
+    실패 시 재시도가 없어 웹뷰가 영구 로딩에 머문다."""
+    target, legacy = canonical
+    # 여러 건이어야 문장당 락 대기가 누적된다 — 1건이면 deadline 없이도 짧게 끝나
+    # 회귀를 못 잡는다 (락 timeout 4s × 건수 vs 전체 예산 10s).
+    _store_db_kinds(
+        legacy / snap_mod._LEGACY_DB_FILENAME, [(f"s{i}", "manual") for i in range(6)]
+    )
+    target.mkdir(parents=True, exist_ok=True)
+    target_db = target / DB_FILENAME
+    _store_db(target_db, [])
+
+    holder = sqlite3.connect(target_db, isolation_level=None)
+    try:
+        holder.execute("BEGIN EXCLUSIVE")     # target 을 잠근 프로세스가 있다
+        started = time.monotonic()
+        store = SnapshotStore(target)
+        elapsed = time.monotonic() - started
+    finally:
+        holder.rollback()
+        holder.close()
+
+    budget = snap_mod._COPY_DEADLINE_S
+    assert elapsed < budget + 6, f"이관이 {elapsed:.1f}s 를 태웠다 (예산 {budget}s)"
+    assert store.db_path == target_db          # 기동은 정상적으로 끝난다
+    # 지켜야 할 불변식은 "시간 안에 끝나고, 왜 못 했는지가 내구 표면에 남는다" 이다.
+    # 어느 단계에서 포기했는지(스키마 적용 실패 vs deadline 도달)는 락의 타이밍에
+    # 달려 있으므로 둘 다 허용한다.
+    body = (target / snap_mod._MIGRATION_LOG_NAME).read_text(encoding="utf-8")
+    assert "deferred=1" in body or "aborted=error:" in body
+    assert "copied=0" in body
+
+
+def test_normal_path_has_no_deadline_regression(canonical):
+    """(II) 정상 경로는 빨라야 한다 — deadline 도입이 성능 회귀를 만들지 않았는지."""
+    target, legacy = canonical
+    _store_db_kinds(legacy / snap_mod._LEGACY_DB_FILENAME, [(f"s{i}", "manual") for i in range(5)])
+    started = time.monotonic()
+    store = SnapshotStore(target)
+    assert time.monotonic() - started < 5
+    assert len(_snapshot_ids(store.db_path)) == 5
+
+
+def test_timing_constants_stay_ordered():
+    """(II) 이관 ≤10s < proxy 25s < Tauri 40s — 한쪽만 늘리면 기동 행이 되살아난다."""
+    from visualizebetter import stdio_proxy
+
+    assert snap_mod._COPY_DEADLINE_S < stdio_proxy.LAUNCH_TIMEOUT_S
+    assert stdio_proxy.LAUNCH_TIMEOUT_S < 40   # Tauri wait_for_serve (main.rs)
+    assert snap_mod._COPY_LOCK_TIMEOUT_S < snap_mod._COPY_DEADLINE_S
+
+
+def test_expired_deadline_defers_the_remaining_snapshots(canonical):
+    """(II) deadline 분기 직격 — 락 시나리오는 스키마 단계에서 먼저 중단돼 이
+    분기에 도달하지 못한다. 예산이 이미 소진된 상태로 호출해 보류 경로를 고정한다."""
+    target, legacy = canonical
+    legacy_db = legacy / snap_mod._LEGACY_DB_FILENAME
+    _store_db_kinds(legacy_db, [(f"s{i}", "manual") for i in range(4)])
+    target.mkdir(parents=True, exist_ok=True)
+
+    outcome = snap_mod._copy_forward(
+        legacy_db, target / DB_FILENAME, deadline=time.monotonic() - 1
+    )
+
+    assert outcome.deferred is True
+    assert outcome.copied == 0
+    assert _snapshot_ids(target / DB_FILENAME) == set()   # 아무것도 안 들어갔고
+    assert _snapshot_ids(legacy_db) == {f"s{i}" for i in range(4)}   # legacy 온전
+
+    # 예산이 있는 다음 실행이 정확히 이어받는다 (additive + 원장)
+    resumed = snap_mod._copy_forward(legacy_db, target / DB_FILENAME)
+    assert resumed.deferred is False
+    assert resumed.copied == 4
+    assert _snapshot_ids(target / DB_FILENAME) == {f"s{i}" for i in range(4)}

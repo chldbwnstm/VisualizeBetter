@@ -83,6 +83,40 @@ def is_reserved_property(key: str) -> bool:
     return key.startswith(RESERVED_PROPERTY_PREFIX)
 
 
+def check_patch_shape(patch: Any) -> None:
+    """[5-A] a patch is ``{set: {...}, remove: [...]}`` — settle that shape first.
+
+    [23-C] RN5 JJ. Several entry points read ``patch["set"]`` *before* the patch
+    reaches ``_apply_patch`` — ``update_finding`` sizes the prospective result,
+    ``_previous_values`` snapshots the before-image — so validating only inside
+    ``_apply_patch`` left those paths raising AttributeError out of ``.get`` on a
+    list or a string. ``{"remove": "label"}`` was worse: a bare string is
+    iterable, so it was walked character by character and silently changed
+    nothing, telling the caller its edit had landed.
+    """
+    if patch is None:
+        return
+    if not isinstance(patch, dict):
+        raise ValueError(f"patch must be an object, got {type(patch).__name__}")
+    updates = patch.get("set")
+    if updates is not None:
+        if not isinstance(updates, dict):
+            raise ValueError(f"patch 'set' must be an object, got {type(updates).__name__}")
+        bad = sorted((repr(k) for k in updates if not isinstance(k, str)), key=str)
+        if bad:
+            raise ValueError(f"patch 'set' keys must be strings: {bad}")
+    removals = patch.get("remove")
+    if removals is not None:
+        if isinstance(removals, str) or not isinstance(removals, (list, tuple)):
+            raise ValueError(
+                f"patch 'remove' must be a list of property names, got "
+                f"{type(removals).__name__}"
+            )
+        bad = sorted((repr(k) for k in removals if not isinstance(k, str)), key=str)
+        if bad:
+            raise ValueError(f"patch 'remove' entries must be strings: {bad}")
+
+
 def check_properties(properties: Any) -> None:
     """[23-B] properties must be a plain mapping carrying no reserved (``_``) key.
 
@@ -261,6 +295,9 @@ def _apply_patch(
     Finding ([23-B]) has no properties map, so ``remove`` has nothing to act on
     there and is rejected rather than silently ignored.
     """
+    # ★ RN5 JJ — shape first (see check_patch_shape for the callers that need
+    # this even earlier). Kept here too: adapters call _apply_patch directly.
+    check_patch_shape(patch)
     updates = patch.get("set") or {}
     removals = patch.get("remove") or []
 
@@ -645,6 +682,7 @@ class Graph:
           is archived to ``_superseded`` before the patch applies, because
           preserving what was once true is the point of this project.
         """
+        check_patch_shape(patch)  # [23-C] RN5 JJ — before anything reads it
         _validate_reason(reason)
         node = self.nodes.get(id)
         if node is None:
@@ -947,6 +985,7 @@ class Graph:
         reason: str | None = None,
     ) -> Edge:
         """[5-A] update_edge; patch 규약 = update_node. reason 의미론 = [24]."""
+        check_patch_shape(patch)  # [23-C] RN5 JJ — before anything reads it
         _validate_reason(reason)
         identity: EdgeKey = (source, target, relation, key)
         edge = self.edges.get(identity)
@@ -1046,6 +1085,7 @@ class Graph:
         rather than in properties, which it does not have ([23-B]). The archive
         is bounded by size, not only count — see _trim_finding_archive.
         """
+        check_patch_shape(patch)  # [23-C] RN5 JJ — before anything reads it
         _validate_reason(reason)
         finding = self.findings.get(finding_id)
         if finding is None:
