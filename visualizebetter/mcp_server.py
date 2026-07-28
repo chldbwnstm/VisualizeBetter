@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from visualizebetter.filter import FilterError, compile_filter
 from visualizebetter.graph.core import (
+    check_properties,
     MAX_FINDING_BODY_CHARS,
     MAX_FINDING_EVIDENCE,
     MAX_FINDING_NODE_IDS,
@@ -236,13 +237,15 @@ def _reject_reserved_properties(properties: dict[str, Any] | None) -> None:
     AI-supplied text pose as server-recorded evidence, which is the one thing the
     inspector's evidence section is supposed to guarantee.
     """
-    if not properties:
-        return
-    reserved = sorted(k for k in properties if is_reserved_property(k))
-    if reserved:
-        raise ToolError(
-            f"properties keys starting with '_' are reserved: {reserved} ([23-B])"
-        )
+    # ★ RN4 AA: delegate to core so both layers apply the same order — type,
+    # key shape, then reserved. A pair-list passed the old keys-only check and
+    # dict.update applied it regardless; a non-string key raised AttributeError
+    # out of startswith, escaping push_batch's per-item errors[] and silently
+    # dropping every remaining item.
+    try:
+        check_properties(properties)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from None
 
 
 def _check_batch_limits(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> None:

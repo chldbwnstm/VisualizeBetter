@@ -83,18 +83,31 @@ def is_reserved_property(key: str) -> bool:
     return key.startswith(RESERVED_PROPERTY_PREFIX)
 
 
-def _reject_reserved_on_create(properties: dict[str, Any] | None) -> None:
-    """[23-B] the reserved-key rule, enforced on the **creation** path too.
+def check_properties(properties: Any) -> None:
+    """[23-B] properties must be a plain mapping carrying no reserved (``_``) key.
 
-    ``_apply_patch`` has always rejected ``_``-prefixed keys on update, but a
-    brand-new node/edge went straight into the dataclass, so creation could
-    plant a forged ``_citations`` or a ``_citations: None`` that later makes
-    ``cite()`` fail. The MCP layer does reject it, yet [23-B] deliberately puts
-    this rule in **core**: import, snapshot load and adapters all call core
-    directly, so guarding only MCP leaves the invariant unenforced.
+    The type check comes first, and it is load-bearing rather than cosmetic:
+    ``dict.update`` also accepts an iterable of key/value pairs, so a caller who
+    sent ``[["_citations", "forged"]]`` sailed past a keys-only check and still
+    overwrote the evidence ``cite()`` had accumulated. Asking "is it a mapping"
+    before "which keys" closes that door on creation and update alike.
+
+    A non-string key is rejected rather than left to raise AttributeError out of
+    ``startswith``: a surprise exception escapes per-item error handling and
+    drops the rest of a batch in silence.
+
+    Enforced in **core** on purpose ([23-B]) — import, snapshot load and adapters
+    call core directly and would bypass an MCP-only guard.
     """
-    if not properties:
+    if properties is None:
         return
+    if not isinstance(properties, dict):
+        raise ValueError(
+            f"properties must be an object, got {type(properties).__name__} ([23-B])"
+        )
+    non_string = sorted((repr(k) for k in properties if not isinstance(k, str)), key=str)
+    if non_string:
+        raise ValueError(f"properties keys must be strings: {non_string} ([23-B])")
     reserved = sorted(k for k in properties if is_reserved_property(k))
     if reserved:
         raise ValueError(
@@ -269,13 +282,10 @@ def _apply_patch(
     # own history writes are unaffected — _record_lifecycle and cite() mutate
     # target.properties directly, and only the *published* patch carries the
     # reserved key, never this apply path.
-    nested = updates.get("properties")
-    if isinstance(nested, dict):
-        forged = sorted(k for k in nested if is_reserved_property(k))
-        if forged:
-            raise ValueError(
-                f"properties keys starting with '_' are reserved: {forged} ([23-B])"
-            )
+    if "properties" in updates:
+        # ★ RN4 AA: type first. isinstance(..., dict) used to be the *guard*, so a
+        # pair-list slipped past it and dict.update applied it anyway.
+        check_properties(updates["properties"])
     rejected = server_managed.intersection(updates)
     if rejected:
         raise ValueError(f"server-managed fields are not patchable: {sorted(rejected)}")
@@ -530,7 +540,7 @@ class Graph:
 
         Re-pushing an auto-created placeholder resolves it ([5-A]: "merge 로 해소").
         """
-        _reject_reserved_on_create(properties)  # [23-B] core 강제 (RN3 부수건)
+        check_properties(properties)  # [23-B] core 강제 (RN3 부수건)
         self.history.touch_node(id)  # [M2e] before-image (absent → create, present → merge)
         existing = self.nodes.get(id)
         if existing is not None:
@@ -861,7 +871,7 @@ class Graph:
         Missing endpoints get a placeholder node ([5-A]) — AI pushes edges before
         nodes as a matter of course ([3-A]).
         """
-        _reject_reserved_on_create(properties)  # [23-B] core 강제 (RN3 부수건)
+        check_properties(properties)  # [23-B] core 강제 (RN3 부수건)
         for endpoint in (source, target):
             if endpoint not in self.nodes:
                 self._add_placeholder(endpoint, layer=layer, created_by=created_by)

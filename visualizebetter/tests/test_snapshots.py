@@ -801,7 +801,7 @@ def test_repeated_runs_are_idempotent(canonical, caplog):
         again = SnapshotStore(target)
 
     assert _snapshot_ids(again.db_path) == {"s1", "s2"}
-    assert "copy-forward:" not in caplog.text  # 2회차엔 복사 로그가 없다
+    assert "copied" not in caplog.text  # 2회차엔 복사 로그가 없다
 
 
 def test_target_content_is_never_replaced(canonical):
@@ -883,8 +883,12 @@ def test_breadcrumb_is_left_and_is_additive(canonical):
     assert note.exists()
     body = note.read_text(encoding="utf-8")
     assert str(target / DB_FILENAME) in body
-    assert "COPIED (not moved)" in body
-    assert "harmless" in body
+    assert "COPIED" in body
+    # ★ RN4 Y: 코드가 삭제를 권하는 문구는 어떤 경우에도 금지 — RN1/RN2 가
+    # 데이터를 파괴한 바로 그 조언을 글로 하는 것과 같다.
+    lowered = body.lower()
+    for advice in ("delete", "remove", "unused", "safe to"):
+        assert advice not in lowered, f"breadcrumb 이 정리를 권한다: {advice!r}"
 
 
 def test_copy_count_is_logged(canonical, caplog):
@@ -895,19 +899,47 @@ def test_copy_count_is_logged(canonical, caplog):
     with caplog.at_level(logging.WARNING, logger=snap_mod.log.name):
         SnapshotStore(target)
 
-    assert "copy-forward: 3 snapshot(s)" in caplog.text
+    assert "copied 3 snapshot(s)" in caplog.text
 
 
 # --- R: 파괴 부재의 정적 감사 + 실프로세스 동시성 ---
 
 
+# [23-C] RN4 EE(2): 파일을 지우거나·옮기거나·덮어쓰는 호출 이름. `str.replace` 와
+# 이름이 겹치는 `Path.replace` 때문에 문자열 검색은 오탐이 난다 — AST 로 "호출된
+# 이름"만 본다.
+_DESTRUCTIVE_CALLS = frozenset({
+    "unlink", "rename", "replace", "renames", "rmdir", "removedirs",
+    "remove", "truncate", "move", "rmtree", "write_bytes", "write_text",
+})
+
+
 def test_source_contains_no_destructive_file_calls():
     """R6 ★ 감사 — snapshots.py 에 사용자 데이터 파일을 지우거나 옮기는 호출이
     없음을 소스에서 직접 단언한다. RN1·RN2 의 blocker 는 둘 다 '추론 + 파괴'
-    구조에서 나왔으므로, 파괴 호출의 재도입 자체를 여기서 막는다."""
+    구조에서 나왔으므로, 파괴 호출의 재도입 자체를 여기서 막는다.
+
+    예외 하나: breadcrumb 은 legacy 디렉토리에 **새 파일**을 만든다(덮어쓰지
+    않는다 — 존재하면 즉시 반환). 그 한 곳만 허용하고 나머지는 전부 금지."""
+    import ast
+
     source = Path(snap_mod.__file__).read_text(encoding="utf-8")
-    banned = (".unlink(", ".rename(", ".replace(", "shutil.move", "shutil.rmtree", "os.remove")
-    offenders = [b for b in banned if b in source]
+    tree = ast.parse(source)
+    allowed_line = next(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_leave_breadcrumb"
+    )
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name in _DESTRUCTIVE_CALLS:
+            if name == "write_text" and node.lineno > allowed_line:
+                continue  # breadcrumb 작성 (새 파일만)
+            offenders.append(f"{name}() @ line {node.lineno}")
     assert offenders == [], f"파괴적 파일 호출이 재도입됐다: {offenders}"
 
 
@@ -1032,7 +1064,7 @@ def test_silently_dropped_rows_trigger_rollback(canonical, caplog):
     with caplog.at_level(logging.WARNING, logger=snap_mod.log.name):
         store = SnapshotStore(target)
 
-    assert "rolled back" in caplog.text
+    assert "skipped" in caplog.text
     assert _snapshot_ids(store.db_path) == set()      # 부분 상태가 남지 않았다
     assert _snapshot_ids(legacy_db) == {"s1"}         # legacy 는 온전
     assert not (legacy / "MIGRATED-TO-VISUALIZEBETTER.txt").exists()  # 거짓 안내 없음
@@ -1059,20 +1091,6 @@ def test_ledger_prevents_recopy_after_prune_and_user_delete(canonical):
 
     assert _snapshot_ids(second.db_path) == {"s1", "s3"}   # ★ 부활하지 않는다
     assert _snapshot_ids(legacy / snap_mod._LEGACY_DB_FILENAME) == {"s1", "s2", "s3"}
-
-
-def test_ledger_is_scoped_per_source(canonical, tmp_path):
-    """(8b) T — 원장 키가 (source_db, snapshot_id) 라 서로 다른 legacy 가
-    같은 id 를 써도 각자 복사된다."""
-    target, legacy = canonical
-    _store_db(legacy / snap_mod._LEGACY_DB_FILENAME, ["s1"])
-    SnapshotStore(target)
-
-    other = target / snap_mod._LEGACY_DB_FILENAME   # 같은 디렉토리의 구 파일명
-    _store_db(other, ["s9"])
-    store = SnapshotStore(target)
-
-    assert _snapshot_ids(store.db_path) == {"s1", "s9"}
 
 
 @pytest.mark.parametrize(
@@ -1227,3 +1245,237 @@ def test_a_non_sqlite_failure_still_cannot_prevent_startup(canonical, monkeypatc
     assert "copy-forward failed" in caplog.text
     assert store.db_path == target / DB_FILENAME
     assert (legacy / snap_mod._LEGACY_DB_FILENAME).exists()   # 파괴 0
+
+
+# --- [23-C] ★★★ RN4 X~FF — 기존 서브시스템과의 상호작용 결함 고정 ---
+
+
+def _store_db_kinds(path: Path, rows) -> None:
+    """(id, kind) 쌍으로 스토어를 만든다 — created_at 은 순서대로."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(snap_mod._SCHEMA)
+        for n, (sid, kind) in enumerate(rows):
+            con.execute(
+                "INSERT OR IGNORE INTO snapshot (id, name, description, created_at, kind,"
+                " node_count, edge_count, metadata, layers, version)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (sid, f"name-{sid}", "", f"2026-01-01T00:00:{n:02d}Z", kind, 0, 0, "{}", "[]", ""),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _kinds(path: Path) -> dict:
+    con = sqlite3.connect(path)
+    try:
+        return {r[0]: r[1] for r in con.execute("SELECT id, kind FROM snapshot")}
+    finally:
+        con.close()
+
+
+# --- X: rolling GC 상호작용 ---
+
+
+def test_migrated_autos_survive_prune_and_do_not_evict_user_autos(canonical, caplog):
+    """(X) ★ blocker — legacy auto 를 target 의 auto 풀에 부으면 prune 이 지우고
+    원장이 재복사를 막아 영구 손실. 더 나쁜 것은 병합 풀이 **사용자 자신의 auto**
+    를 evict 한다 (이관을 안 했으면 살아있었을 데이터)."""
+    target, legacy = canonical
+    _store_db_kinds(
+        legacy / snap_mod._LEGACY_DB_FILENAME,
+        [(f"L{i}", "auto") for i in range(25)] + [("Lm", "manual")],
+    )
+
+    with caplog.at_level(logging.WARNING, logger=snap_mod.log.name):
+        store = SnapshotStore(target)
+
+    kinds = _kinds(store.db_path)
+    migrated = {i for i in kinds if i.startswith("L")}
+    assert "Lm" in migrated                                  # manual 은 전부
+    assert len(migrated) == 1 + snap_mod.MAX_AUTO_SNAPSHOTS  # auto 는 최신 20건
+    assert all(kinds[i] == "manual" for i in migrated)       # ★ prune 대상 밖
+    assert "5 older auto snapshot(s) not copied" in caplog.text   # 무언의 절단 금지
+
+    # 사용자가 이후 자기 auto 를 20건 만든다 (실 prune API 사용)
+    graph = Graph(name="user")
+    for n in range(20):
+        graph.add_node(id=f"u{n}", label="U", type="class")
+        run(store.save_snapshot(graph, name=f"user-auto-{n}", kind=snap_mod.SNAPSHOT_KIND_AUTO))
+        run(store.prune_auto_snapshots())
+
+    after = _kinds(store.db_path)
+    user_autos = [i for i, k in after.items() if k == "auto"]
+    assert len(user_autos) == 20                       # ★ 사용자 auto 무손실
+    assert migrated <= set(after)                      # ★ 이관분도 전부 생존
+
+
+def test_migrated_snapshots_are_named_for_provenance(canonical):
+    """(X) kind 를 새로 만들지 않고 name 접두로 출처를 남긴다."""
+    target, legacy = canonical
+    _store_db_kinds(legacy / snap_mod._LEGACY_DB_FILENAME, [("a1", "auto"), ("m1", "manual")])
+
+    store = SnapshotStore(target)
+
+    con = sqlite3.connect(store.db_path)
+    try:
+        names = {r[0]: r[1] for r in con.execute("SELECT id, name FROM snapshot")}
+    finally:
+        con.close()
+    assert names["a1"].startswith(snap_mod._MIGRATED_NAME_PREFIX)
+    assert names["m1"] == "name-m1"   # manual 은 이름을 건드리지 않는다
+
+
+# --- Y: breadcrumb 이 살아있는 디렉토리에 삭제를 권하지 않는다 ---
+
+
+def test_no_breadcrumb_when_legacy_lives_in_the_data_dir(tmp_path):
+    """(Y) ★ 후보 #1 은 data_dir/mcpgraph.sqlite3 — RN2 를 거친 사용자의 실제
+    상태다. 그 디렉토리에 "unused; delete it" 노트를 쓰면, 방금 이관한 gold·원장·
+    serve.json 이 같이 들어있는 디렉토리를 지우라고 코드가 글로 지시하게 된다."""
+    d = tmp_path / "data"
+    _store_db(d / snap_mod._LEGACY_DB_FILENAME, ["s1"])
+
+    store = SnapshotStore(d)
+
+    assert _snapshot_ids(store.db_path) == {"s1"}      # 복사는 정상
+    assert not (d / "MIGRATED-TO-VISUALIZEBETTER.txt").exists()   # ★ 노트 없음
+
+
+# --- Z: 스냅샷 단위 트랜잭션 ---
+
+
+def test_one_bad_snapshot_does_not_hold_the_healthy_ones_hostage(canonical, caplog):
+    """(Z) ★ all-or-nothing 이면 오염 1건 때문에 정상 20건이 매 부팅 rollback 되어
+    영구히 도착하지 않는다 (340MB 스토어에선 부팅마다 2s 를 태우면서)."""
+    target, legacy = canonical
+    legacy_db = legacy / snap_mod._LEGACY_DB_FILENAME
+    legacy.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(legacy_db)
+    try:
+        con.executescript(snap_mod._SCHEMA.replace("label         TEXT NOT NULL", "label         TEXT"))
+        for n in range(20):  # 정상 20건
+            con.execute(
+                "INSERT INTO snapshot (id, name, description, created_at, kind, node_count,"
+                " edge_count, metadata, layers, version)"
+                f" VALUES ('ok{n}','n','','2026-01-01T00:00:{n:02d}Z','manual',1,0,'{{}}','[]','')"
+            )
+            con.execute(
+                'INSERT INTO node (snapshot_id, id, label, "type", properties, tags,'
+                f" created_at, updated_at) VALUES ('ok{n}','n1','L','class','{{}}','[]','z','z')"
+            )
+        con.execute(  # 오염 1건 — ★ 가장 먼저 처리되도록 created_at 을 앞에 둔다.
+            # 뒤에 두면 "첫 실패에서 전체 중단" 회귀를 테스트가 놓친다 (정상분이
+            # 이미 커밋된 뒤라 차이가 안 보인다).
+            "INSERT INTO snapshot (id, name, description, created_at, kind, node_count,"
+            " edge_count, metadata, layers, version)"
+            " VALUES ('bad','n','','2020-01-01T00:00:00Z','manual',1,0,'{}','[]','')"
+        )
+        con.execute(
+            'INSERT INTO node (snapshot_id, id, label, "type", properties, tags,'
+            " created_at, updated_at) VALUES ('bad','n1',NULL,'class','{}','[]','z','z')"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    with caplog.at_level(logging.WARNING, logger=snap_mod.log.name):
+        store = SnapshotStore(target)
+
+    arrived = _snapshot_ids(store.db_path)
+    assert arrived == {f"ok{n}" for n in range(20)}   # ★ 정상 20건 도착
+    assert "bad" not in arrived                        # 오염 1건만 skip
+    assert "snapshot bad skipped" in caplog.text
+
+    # 원장에 안 남아 다음 실행이 재시도한다 (그리고 다시 skip 하지만 정상분은 재복사 안 함)
+    con = sqlite3.connect(store.db_path)
+    try:
+        ledger = {r[0] for r in con.execute("SELECT snapshot_id FROM copied_snapshot")}
+    finally:
+        con.close()
+    assert "bad" not in ledger
+    assert ledger == {f"ok{n}" for n in range(20)}
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=snap_mod.log.name):
+        again = SnapshotStore(target)
+    assert _snapshot_ids(again.db_path) == arrived
+    assert "copied 20" not in caplog.text   # 전량 재복사(성능 회귀) 없음
+
+
+# --- BB: 원장 키 = snapshot_id 단독 ---
+
+
+def test_a_second_source_path_does_not_resurrect_a_deleted_snapshot(tmp_path, monkeypatch):
+    """(BB) ★ 원장을 (source_db, snapshot_id) 로 키잉하면, 같은 내용이 다른 경로로
+    보일 때(8.3 단축명·junction·두 번째 후보 경로) 새 source 로 취급돼 사용자가
+    지운 스냅샷이 부활한다 — T 가 막으려던 [5-E] 위반이 형태만 옮겨간 것.
+    snapshot_id 는 uuid4 라 전역 유일하므로 id 단독 키면 이 축이 원천 소멸한다."""
+    base = tmp_path / "base"
+    target = base / "visualizebetter"
+    legacy_a = base / "old-a"
+    legacy_b = base / "old-b"
+    monkeypatch.setattr(snap_mod, "_default_base_pair", lambda: (target, legacy_a))
+    _store_db(legacy_a / snap_mod._LEGACY_DB_FILENAME, ["s1", "s2"])
+
+    monkeypatch.setattr(
+        snap_mod, "_legacy_db_candidates",
+        lambda _d: [legacy_a / snap_mod._LEGACY_DB_FILENAME],
+    )
+    first = SnapshotStore(target)
+    assert _snapshot_ids(first.db_path) == {"s1", "s2"}
+
+    con = sqlite3.connect(first.db_path)      # 사용자가 s2 를 지운다
+    try:
+        con.execute("DELETE FROM snapshot WHERE id='s2'")
+        con.commit()
+    finally:
+        con.close()
+
+    # 같은 스토어가 다른 경로로 다시 후보에 오른다 (별칭/두 번째 후보 경로)
+    legacy_b.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(
+        legacy_a / snap_mod._LEGACY_DB_FILENAME, legacy_b / snap_mod._LEGACY_DB_FILENAME
+    )
+    monkeypatch.setattr(
+        snap_mod, "_legacy_db_candidates",
+        lambda _d: [legacy_b / snap_mod._LEGACY_DB_FILENAME],
+    )
+    second = SnapshotStore(target)
+
+    assert _snapshot_ids(second.db_path) == {"s1"}   # ★ 부활하지 않는다
+
+
+def test_ledger_primary_key_is_snapshot_id_alone(tmp_path):
+    """(BB) 스키마 계약 고정 — 별칭 축이 원천 소멸하려면 PK 가 id 단독이어야 한다."""
+    store = SnapshotStore(tmp_path / "d")
+    run(store.initialize())
+    con = sqlite3.connect(store.db_path)
+    try:
+        pk = [r[1] for r in con.execute('PRAGMA table_info("copied_snapshot")') if r[5]]
+    finally:
+        con.close()
+    assert pk == ["snapshot_id"]
+
+
+# --- FF: 무인자 배선 ---
+
+
+def test_default_wiring_uses_default_data_dir(tmp_path, monkeypatch):
+    """(FF) SnapshotStore() 무인자 경로 — stdio_proxy·cli 가 쓰는 배선인데 직접
+    검증이 0건이었다."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("LOCALAPPDATA", str(home))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+
+    expected = snap_mod.default_data_dir()
+    store = SnapshotStore()
+
+    assert store.data_dir == expected
+    assert store.db_path == expected / DB_FILENAME
+    assert store.data_dir.is_dir()
+    run(store.initialize())
+    assert store.db_path.exists()

@@ -140,12 +140,22 @@ CREATE INDEX IF NOT EXISTS idx_finding_node_node
 -- would re-copy pruned snapshots every boot and resurrect deleted ones ([5-E]
 -- makes a delete durable). This ledger records the copy, not the survival.
 CREATE TABLE IF NOT EXISTS copied_snapshot (
+    -- [23-C] RN4 BB: keyed by snapshot_id alone. Snapshot ids are uuid4, so the
+    -- id is globally unique; keying by (source_db, snapshot_id) made the same
+    -- store seen through an 8.3 short name / junction / second candidate path
+    -- count as a new source and resurrect snapshots the user had deleted ([5-E]).
+    -- source_db stays as information, not identity.
+    snapshot_id TEXT PRIMARY KEY,
     source_db   TEXT NOT NULL,
-    snapshot_id TEXT NOT NULL,
-    copied_at   TEXT NOT NULL,
-    PRIMARY KEY (source_db, snapshot_id)
+    copied_at   TEXT NOT NULL
 );
 """
+
+# [23-C] RN4 X — migrated auto snapshots land as manual (prune must not reach
+# them) and say so in their name rather than in a new `kind` value: kind is a
+# contract several tools/UI paths branch on, and widening it costs an audit of
+# all of them for no gain here.
+_MIGRATED_NAME_PREFIX = "migrated: "
 
 # [24-C] history columns added by ALTER — see _apply_schema.
 _FINDING_HISTORY_COLUMNS = ("superseded", "provenance")
@@ -189,6 +199,20 @@ def _legacy_db_candidates(data_dir: Path) -> list[Path]:
     return [p for p in candidates if p.exists()]
 
 
+def _history_column_alters(existing: set[str]) -> list[str]:
+    """[23-C] RN4 DD — the one place the [24-C] ALTERs are spelled out.
+
+    Both schema paths (sync copy-forward, async store) build their statements
+    from this, so neither can drift from the other. They diverged once already
+    and the copy path lost finding history in silence as a result.
+    """
+    return [
+        f"ALTER TABLE finding ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'"
+        for column in _FINDING_HISTORY_COLUMNS
+        if column not in existing
+    ]
+
+
 def _apply_schema(connection: sqlite3.Connection) -> None:
     """[23-C] RN3 V — the whole schema, in one place both paths call.
 
@@ -202,11 +226,8 @@ def _apply_schema(connection: sqlite3.Connection) -> None:
     """
     connection.executescript(_SCHEMA)
     columns = {row[1] for row in connection.execute('PRAGMA table_info("finding")')}
-    for column in _FINDING_HISTORY_COLUMNS:
-        if column not in columns:
-            connection.execute(
-                f"ALTER TABLE finding ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'"
-            )
+    for statement in _history_column_alters(columns):
+        connection.execute(statement)
 
 
 def _table_columns(connection: sqlite3.Connection, schema: str, table: str) -> list[str]:
@@ -228,46 +249,37 @@ def _required_columns(connection: sqlite3.Connection, schema: str, table: str) -
 
 
 def _copy_forward(legacy_db: Path, target_db: Path) -> int:
-    """[23-C] RN3 L/M/N/O + S/T/U/V/W — copy snapshots legacy → target.
+    """[23-C] RN3 L~R + S~W, RN4 X/Z/BB/CC — copy snapshots legacy → target.
 
-    RN1 and RN2 both tried to *move* the store, which forced them to answer "is
-    another process using this file?" first. That oracle was wrong every time it
-    was examined, and each wrong answer destroyed data because the action was
-    rename/unlink. RN3 removes the question: nothing is ever moved or deleted,
-    so concurrency is SQLite's problem and it already solves it.
+    Nothing is ever moved or deleted, so concurrency is SQLite's problem and it
+    already solves it. The invariant is **content** ([23-C] W): committed legacy
+    content is never removed by any path here. Legacy is attached read-write on
+    purpose — that is what lets SQLite roll back a hot journal.
 
-    The invariant is **content**, not bytes ([23-C] W): *committed legacy content
-    is never removed by any path here*. Legacy is attached read-write on purpose
-    — that is what lets SQLite roll back a hot journal, and rolling back does
-    rewrite legacy's bytes. Opening read-only instead would leave every
-    crash-interrupted store permanently uncopied, which is the worse failure.
+    Two policies keep the copy from being destructive by a longer route:
 
-    Correctness of "copied" is enforced three ways ([23-C] S), because
-    ``INSERT OR IGNORE`` silently skips NOT NULL / CHECK violations too — not
-    just duplicate keys. Trusting it alone let a narrower legacy schema drop
-    every child row while the copy still reported success:
-      1. refuse the whole copy unless legacy carries every column target
-         requires;
-      2. exclude already-copied snapshots with an anti-join, so OR IGNORE is
-         left doing only what it is safe for (absorbing PK collisions between
-         concurrent copiers);
-      3. re-count every copied table against legacy before committing, and roll
-         back on any mismatch.
+    * ``kind`` ([23-C] RN4 X). Copying an auto snapshot as ``auto`` drops it into
+      the target's rolling-GC pool, where ``prune_auto_snapshots`` deletes it and
+      the ledger then refuses to bring it back — and worse, the merged pool
+      evicts the *user's own* auto snapshots, destroying data that would have
+      survived had we never migrated. Migrated snapshots therefore land as
+      ``manual`` (prune never touches manual, [5-E]) with a ``migrated:`` name
+      prefix for provenance. Only the newest ``MAX_AUTO_SNAPSHOTS`` autos are
+      taken; the rest are reported by count, never silently dropped — legacy
+      keeps them, so the access path remains.
+    * Granularity ([23-C] RN4 Z). One transaction per snapshot, one ledger row
+      per snapshot. A single corrupt page or one NOT NULL violation used to roll
+      back an entire store forever — 20 healthy snapshots held hostage by one
+      bad row, re-attempted (and re-failed) on every boot. Now the bad snapshot
+      is skipped and left out of the ledger so a later run can retry it, while
+      its healthy neighbours arrive.
 
-    "Already copied" is tracked in a ledger ([23-C] T) rather than inferred from
-    target's snapshot table: auto-snapshot pruning and user deletes remove rows
-    from that table, so inferring would re-copy pruned snapshots on every boot
-    and resurrect snapshots the user deleted ([5-E] says a delete is durable).
-
-    Returns the number of snapshots copied; 0 on any problem, having changed
-    nothing.
+    Returns the number of snapshots actually committed ([23-C] RN4 CC).
     """
     source_key = os.path.normcase(os.path.abspath(legacy_db))
     connection = None
     try:
         connection = sqlite3.connect(target_db, timeout=30.0)
-        # Foreign keys stay OFF for the copy: rows arrive parent-first
-        # (_COPY_TABLES order), and OR IGNORE does not absorb FK violations.
         _apply_schema(connection)
         connection.commit()
 
@@ -277,22 +289,9 @@ def _copy_forward(legacy_db: Path, target_db: Path) -> int:
             log.warning("copy-forward skipped: cannot open legacy store %s (%s)", legacy_db, exc)
             return 0
 
-        # Everything below runs on SQL sets — no snapshot id ever crosses into
-        # Python ([23-C] U). That removes both the 32766-placeholder ceiling and
-        # the crash a NULL id used to cause, and a NULL id simply never matches
-        # the anti-join, so a corrupt row is skipped instead of bricking start-up.
-        pending = (
-            'SELECT id FROM legacy.snapshot WHERE id NOT IN'
-            ' (SELECT snapshot_id FROM main.copied_snapshot WHERE source_db = ?)'
-        )
-        (count,) = connection.execute(
-            f"SELECT count(*) FROM ({pending})", (source_key,)
-        ).fetchone()
-        if not count:
-            return 0
-
-        # S(1): a legacy store missing a column target requires cannot be copied
-        # correctly at all — stop before writing anything.
+        # S(1): a store-wide structural mismatch is still all-or-nothing — if
+        # legacy cannot supply a column target requires, no snapshot from it can
+        # be copied correctly, so stop before touching anything.
         for table in _COPY_TABLES:
             source_columns = set(_table_columns(connection, "legacy", table))
             if not source_columns:
@@ -309,59 +308,41 @@ def _copy_forward(legacy_db: Path, target_db: Path) -> int:
                 )
                 return 0
 
-        log.warning(
-            "copy-forward: %d snapshot(s) from %s -> %s", count, legacy_db, target_db
-        )
-        connection.execute("BEGIN")
-        for table in _COPY_TABLES:
-            shared = [
+        pending = _pending_snapshots(connection)
+        if not pending:
+            return 0
+
+        shared_columns = {
+            table: [
                 c for c in _table_columns(connection, "legacy", table)
                 if c in _table_columns(connection, "main", table)
             ]
-            names = ",".join(f'"{c}"' for c in shared)
-            key = "id" if table == "snapshot" else "snapshot_id"
-            connection.execute(
-                f'INSERT OR IGNORE INTO main."{table}" ({names})'
-                f' SELECT {names} FROM legacy."{table}"'
-                f' WHERE "{key}" IN ({pending})',
-                (source_key,),
+            for table in _COPY_TABLES
+        }
+
+        copied = 0
+        failed = 0
+        for snapshot_id, kind in pending:
+            if _copy_one_snapshot(connection, snapshot_id, kind, shared_columns, source_key):
+                copied += 1
+            else:
+                failed += 1
+        if copied:
+            log.warning(
+                "copy-forward: copied %d snapshot(s) from %s -> %s", copied, legacy_db, target_db
             )
-
-        # S(3): "we copied it" must mean the rows are actually there.
-        for table in _COPY_TABLES:
-            key = "id" if table == "snapshot" else "snapshot_id"
-            (want,) = connection.execute(
-                f'SELECT count(*) FROM legacy."{table}" WHERE "{key}" IN ({pending})',
-                (source_key,),
-            ).fetchone()
-            (got,) = connection.execute(
-                f'SELECT count(*) FROM main."{table}" WHERE "{key}" IN ({pending})',
-                (source_key,),
-            ).fetchone()
-            if want != got:
-                connection.rollback()
-                log.warning(
-                    "copy-forward rolled back: %s expected %d row(s), found %d"
-                    " — legacy %s is untouched and will be retried",
-                    table, want, got, legacy_db,
-                )
-                return 0
-
-        connection.execute(
-            "INSERT OR IGNORE INTO main.copied_snapshot (source_db, snapshot_id, copied_at)"
-            f" SELECT ?, id, ? FROM ({pending})",
-            (source_key, _now(), source_key),
-        )
-        connection.commit()
-        return count
+        if failed:
+            log.warning(
+                "copy-forward: skipped %d unreadable snapshot(s) in %s"
+                " — they stay in the legacy store and will be retried next run",
+                failed, legacy_db,
+            )
+        return copied
     except Exception as exc:  # noqa: BLE001
-        # [23-C] U — migration is a convenience; it must never be the reason the
-        # app will not start. Nothing here deletes anything, so "failed" only
-        # ever means "not yet".
+        # [23-C] U — migration is a convenience; it must never be why the app
+        # will not start. Nothing here deletes anything, so "failed" only ever
+        # means "not yet".
         log.warning("copy-forward failed (%s); both stores left untouched", exc)
-        if connection is not None:
-            with contextlib.suppress(sqlite3.Error):
-                connection.rollback()
         return 0
     finally:
         if connection is not None:
@@ -371,25 +352,130 @@ def _copy_forward(legacy_db: Path, target_db: Path) -> int:
                 connection.close()
 
 
-def _leave_breadcrumb(legacy_db: Path, target_db: Path) -> None:
-    """[23-C] RN3 Q — tell a human where their old store was copied to.
+def _pending_snapshots(connection: sqlite3.Connection) -> list[tuple[str, str]]:
+    """(id, kind) of legacy snapshots not yet in the ledger, oldest-first.
 
-    Additive only: a new file next to the legacy database. Nothing another
-    process owns is touched (notably never ``serve.json``), and the note says
-    outright that deleting it is harmless. Written only after a copy that passed
-    verification, so it never claims more than happened.
+    [23-C] RN4 X: manual snapshots all qualify; only the newest
+    ``MAX_AUTO_SNAPSHOTS`` autos do, because that is the most the target would
+    have kept anyway. Whatever is left behind is counted and logged, never
+    dropped in silence — and legacy still holds it.
+
+    [23-C] RN4 BB: the ledger is keyed by ``snapshot_id`` alone. Keying it by
+    (source_db, snapshot_id) meant the same store reached through an 8.3 short
+    name, a junction, or the second candidate path counted as a *new* source and
+    resurrected snapshots the user had deleted — exactly the [5-E] violation the
+    ledger exists to prevent, wearing a different hat. Snapshot ids are uuid4, so
+    the id alone is globally unique and the alias axis simply disappears.
     """
+    rows = connection.execute(
+        "SELECT id, kind FROM legacy.snapshot"
+        " WHERE id IS NOT NULL"
+        "   AND id NOT IN (SELECT snapshot_id FROM main.copied_snapshot)"
+        " ORDER BY created_at ASC, rowid ASC"
+    ).fetchall()
+    manual = [(i, k) for i, k in rows if k != SNAPSHOT_KIND_AUTO]
+    autos = [(i, k) for i, k in rows if k == SNAPSHOT_KIND_AUTO]
+    skipped = max(0, len(autos) - MAX_AUTO_SNAPSHOTS)
+    if skipped:
+        log.warning(
+            "copy-forward: %d older auto snapshot(s) not copied (newest %d kept);"
+            " they remain in the legacy store",
+            skipped, MAX_AUTO_SNAPSHOTS,
+        )
+    return manual + autos[skipped:]
+
+
+def _copy_one_snapshot(
+    connection: sqlite3.Connection,
+    snapshot_id: str,
+    kind: str,
+    shared_columns: dict[str, list[str]],
+    source_key: str,
+) -> bool:
+    """Copy exactly one snapshot in its own transaction ([23-C] RN4 Z).
+
+    Returns True when the snapshot is committed and recorded. On any problem the
+    transaction is rolled back and no ledger row is written, so the snapshot is
+    retried on a later run instead of being lost — and its neighbours are
+    unaffected.
+    """
+    try:
+        connection.execute("BEGIN")
+        for table in _COPY_TABLES:
+            columns = shared_columns[table]
+            names = ",".join(f'"{c}"' for c in columns)
+            key = "id" if table == "snapshot" else "snapshot_id"
+            connection.execute(
+                f'INSERT OR IGNORE INTO main."{table}" ({names})'
+                f' SELECT {names} FROM legacy."{table}" WHERE "{key}" = ?',
+                (snapshot_id,),
+            )
+
+        # S(3), now per snapshot: "we copied it" has to mean the rows are there.
+        for table in _COPY_TABLES:
+            key = "id" if table == "snapshot" else "snapshot_id"
+            (want,) = connection.execute(
+                f'SELECT count(*) FROM legacy."{table}" WHERE "{key}" = ?', (snapshot_id,)
+            ).fetchone()
+            (got,) = connection.execute(
+                f'SELECT count(*) FROM main."{table}" WHERE "{key}" = ?', (snapshot_id,)
+            ).fetchone()
+            if want != got:
+                connection.rollback()
+                log.warning(
+                    "copy-forward: snapshot %s skipped (%s expected %d row(s), found %d)",
+                    snapshot_id, table, want, got,
+                )
+                return False
+
+        if kind == SNAPSHOT_KIND_AUTO:
+            # X: land as manual so rolling GC cannot delete it, and say where it
+            # came from in the name.
+            connection.execute(
+                "UPDATE main.snapshot SET kind = ?, name = ? || name WHERE id = ?",
+                (SNAPSHOT_KIND_MANUAL, _MIGRATED_NAME_PREFIX, snapshot_id),
+            )
+        connection.execute(
+            "INSERT OR IGNORE INTO main.copied_snapshot (snapshot_id, source_db, copied_at)"
+            " VALUES (?, ?, ?)",
+            (snapshot_id, source_key, _now()),
+        )
+        connection.commit()
+        return True
+    except Exception as exc:  # noqa: BLE001 — one bad snapshot must not stop the rest
+        with contextlib.suppress(sqlite3.Error):
+            connection.rollback()
+        log.warning("copy-forward: snapshot %s skipped (%s)", snapshot_id, exc)
+        return False
+
+
+def _leave_breadcrumb(legacy_db: Path, target_db: Path) -> None:
+    """[23-C] Q + RN4 Y — leave a signpost next to a legacy store, when useful.
+
+    Not written when the legacy database sits in the data directory we are using
+    (the normal state for anyone who came through the rename): a note in *that*
+    directory would be describing the live store — the freshly copied gold, the
+    ledger and serve.json are all right there.
+
+    The wording states facts and never suggests deleting anything. Advice to
+    remove a directory is exactly how RN1/RN2 destroyed data; a note that says it
+    in prose is the same failure with extra steps, so no code path here proposes
+    cleanup.
+    """
+    if _same_path(legacy_db.parent, target_db.parent):
+        return
     note = legacy_db.parent / "MIGRATED-TO-VISUALIZEBETTER.txt"
     if note.exists():
         return
     try:
         note.write_text(
             "This directory holds a pre-2026-07-28 store from when the project\n"
-            "was named 'mcpgraph'. Its snapshots were COPIED (not moved) to:\n\n"
+            "was named 'mcpgraph'.\n\n"
+            "Its snapshots were COPIED to:\n\n"
             f"    {target_db}\n\n"
-            "Nothing here was deleted. This directory is now unused; keep it as a\n"
-            "backup or delete it once you have confirmed the new store looks right.\n"
-            "Deleting this note is harmless — it is only a signpost.\n",
+            "The original store here is intact and unchanged. Both copies now\n"
+            "exist. What happens to this directory from here is entirely your\n"
+            "call. This note is only a signpost.\n",
             encoding="utf-8",
         )
     except OSError:
@@ -462,38 +548,36 @@ class SnapshotStore:
         copy, never a deleted store, so no fail-closed handling is needed.
         """
         for legacy_db in _legacy_db_candidates(self.data_dir):
-            if _same_path(legacy_db, self.db_path):
-                continue
-            if _copy_forward(legacy_db, self.db_path):
-                _leave_breadcrumb(legacy_db, self.db_path)
+            # [23-C] RN4 EE: "start-up cannot fail here" is a structural
+            # guarantee, not a promise that every callee remembers to keep. One
+            # unreadable candidate must not stop the next one, and nothing in
+            # migration is worth refusing to start the app for.
+            try:
+                if _same_path(legacy_db, self.db_path):
+                    continue
+                if _copy_forward(legacy_db, self.db_path):
+                    _leave_breadcrumb(legacy_db, self.db_path)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("copy-forward skipped for %s (%s)", legacy_db, exc)
 
     @staticmethod
     async def _ensure_schema(db: aiosqlite.Connection) -> None:
-        """Idempotent DDL — every entry point runs it, so no call order matters."""
+        """Idempotent DDL — every entry point runs it, so no call order matters.
+
+        [23-C] RN4 DD: the schema is whatever ``_apply_schema`` says it is. This
+        used to re-implement the DDL+ALTER sequence alongside the copy path, so
+        the two could drift — which is how the copy path silently lost finding
+        history once already.
+        """
         await db.execute("PRAGMA foreign_keys = ON")
         await db.executescript(_SCHEMA)
-        await SnapshotStore._migrate_finding_history(db)
-
-    @staticmethod
-    async def _migrate_finding_history(db: aiosqlite.Connection) -> None:
-        """Add [24-C]'s history columns to a `finding` table that predates them.
-
-        CREATE TABLE IF NOT EXISTS leaves an existing table exactly as it was, so
-        a database written before TASK L has no superseded/provenance columns and
-        every save would fail against it. The data directory outlives any one
-        version ([11]), so the upgrade has to happen here rather than by asking
-        the user to delete their snapshots — which are the gold this project
-        exists to keep.
-        """
-        cursor = await db.execute("PRAGMA table_info(finding)")
+        cursor = await db.execute('PRAGMA table_info("finding")')
         columns = {row[1] for row in await cursor.fetchall()}
         await cursor.close()
-        for column in _FINDING_HISTORY_COLUMNS:
-            if column not in columns:
-                await db.execute(
-                    f"ALTER TABLE finding ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'"
-                )
+        for statement in _history_column_alters(columns):
+            await db.execute(statement)
         await db.commit()
+
 
     async def initialize(self) -> None:
         async with aiosqlite.connect(self.db_path) as db:

@@ -575,3 +575,36 @@ def test_push_batch_accepts_valid_weight_and_ttl(mcp, graph):
         edges=[{"source": "a", "target": "b", "relation": "r", "weight": 2.5}],
     )
     assert result["added_nodes"] == 2 and result["added_edges"] == 1 and not result["errors"]
+
+
+# --- [23-C] RN4 AA — push_batch 의 항목별 errors[] 계약이 깨지지 않는다 ---
+
+
+def test_push_batch_reports_bad_properties_per_item_without_dropping_the_rest(mcp, graph):
+    """비-dict properties 항목은 그 항목만 errors[] 로 보고되고, 뒤 항목은
+    정상 처리돼야 한다. 비문자열 키가 startswith 에서 AttributeError 를 내던
+    시절엔 그 예외가 항목 루프를 탈출해 뒤 항목이 조용히 유실됐다."""
+    result = call(
+        mcp,
+        "push_batch",
+        nodes=[
+            {"id": "good1", "label": "G1", "type": "class"},
+            {"id": "bad_list", "label": "B", "type": "class",
+             "properties": [["_citations", "FORGED"]]},
+            {"id": "bad_key", "label": "B", "type": "class", "properties": {1: "x"}},
+            {"id": "good2", "label": "G2", "type": "class"},
+        ],
+    )
+
+    assert result["added_nodes"] == 2                 # ★ 뒤 항목이 살아있다
+    assert "good1" in graph.nodes and "good2" in graph.nodes
+    assert "bad_list" not in graph.nodes and "bad_key" not in graph.nodes
+    indexes = {e["index"] for e in result["errors"]}
+    assert indexes == {1, 2}                          # 실패한 항목만 보고된다
+    assert all(e["kind"] == "node" for e in result["errors"])
+
+
+def test_push_node_rejects_pair_list_properties(mcp):
+    with pytest.raises(ToolError, match="must be an object"):
+        call(mcp, "push_node", id="x", label="X", type="class",
+             properties=[["_citations", "FORGED"]])

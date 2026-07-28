@@ -9,6 +9,8 @@ import pytest
 
 from visualizebetter.graph.core import (
     CITATIONS_PROPERTY,
+    PROVENANCE_PROPERTY,
+    SUPERSEDED_PROPERTY,
     PLACEHOLDER_PROPERTY,
     PLACEHOLDER_TYPE,
     Graph,
@@ -577,3 +579,72 @@ def test_update_still_allows_ordinary_nested_properties():
     g.add_node(id="n", label="N", type="class", properties={"a": 1})
     g.update_node("n", {"set": {"properties": {"b": 2}}})
     assert g.get_node("n").properties == {"a": 1, "b": 2}
+
+
+# --- [23-C] RN4 AA — properties 는 타입부터 검증한다 ---
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        [["_citations", "FORGED"]],          # 쌍 리스트 — dict.update 가 받아준다
+        [("_citations", "FORGED")],          # 튜플 리스트
+        (("_citations", "FORGED"),),         # 튜플의 튜플
+        "not a mapping",
+        42,
+    ],
+)
+def test_non_dict_properties_are_rejected_on_node_update(forged):
+    """★ 게이트 A 우회 — isinstance(x, dict) 를 *가드* 로 쓰면 쌍 리스트가 그대로
+    통과하고 dict.update 가 적용해버린다. 타입을 먼저 검증한다."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class")
+    g.cite("n", "https://example.test/real", "real evidence")
+
+    with pytest.raises(ValueError):
+        g.update_node("n", {"set": {"properties": forged}})
+
+    citations = g.get_node("n").properties[CITATIONS_PROPERTY]
+    assert len(citations) == 1 and citations[0]["url"] == "https://example.test/real"
+
+
+@pytest.mark.parametrize("forged", [[["_citations", "F"]], "str", 7])
+def test_non_dict_properties_are_rejected_on_edge_update(forged):
+    g = Graph()
+    g.add_node(id="a", label="A", type="class")
+    g.add_node(id="b", label="B", type="class")
+    g.add_edge(source="a", target="b", relation="calls")
+    with pytest.raises(ValueError):
+        g.update_edge("a", "b", "calls", "", {"set": {"properties": forged}})
+
+
+@pytest.mark.parametrize("forged", [[["_citations", "F"]], "str", 7])
+def test_non_dict_properties_are_rejected_on_create(forged):
+    g = Graph()
+    with pytest.raises(ValueError):
+        g.add_node(id="n", label="N", type="class", properties=forged)
+    g.add_node(id="a", label="A", type="class")
+    g.add_node(id="b", label="B", type="class")
+    with pytest.raises(ValueError):
+        g.add_edge(source="a", target="b", relation="calls", properties=forged)
+
+
+def test_non_string_property_keys_are_rejected_not_crashed():
+    """비문자열 키가 startswith 에서 AttributeError 를 내면 항목별 오류 처리를
+    탈출해 배치의 뒤 항목을 조용히 유실시킨다 — 거부로 수렴시킨다."""
+    g = Graph()
+    with pytest.raises(ValueError, match="must be strings"):
+        g.add_node(id="n", label="N", type="class", properties={1: "x"})
+
+
+def test_history_paths_still_work_after_the_type_check():
+    """회귀 — cite()·supersede·correction 은 그대로 동작해야 한다."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class", properties={"ok": 1})
+    g.cite("n", "https://example.test/a", "A")
+    g.update_node("n", {"set": {"label": "N2"}}, reason="supersede")
+    g.update_node("n", {"set": {"label": "N3"}}, reason="correction")
+    node = g.get_node("n")
+    assert node.properties[CITATIONS_PROPERTY][0]["url"] == "https://example.test/a"
+    assert node.properties[SUPERSEDED_PROPERTY][0]["prev"]["label"] == "N"
+    assert node.properties[PROVENANCE_PROPERTY][0]["action"] == "correction"
