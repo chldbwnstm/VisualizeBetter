@@ -5,11 +5,14 @@ event publication ([8-C]), edge 4-tuple identity ([4-B]), placeholder
 auto-creation ([5-A]).
 """
 
+import json
+
 import pytest
 
 from visualizebetter.graph.core import (
     CITATIONS_PROPERTY,
     MAX_FINDING_BODY_CHARS,
+    MAX_PROVENANCE_ENTRIES,
     MAX_SUPERSEDED_ENTRIES,
     PROVENANCE_PROPERTY,
     SUPERSEDED_PROPERTY,
@@ -842,3 +845,189 @@ def test_falsy_patches_raise_valueerror_in_all_three_updaters(patch):
         g.update_edge("a", "b", "calls", "", patch)
     with pytest.raises(ValueError):
         g.update_finding(finding.finding_id, patch)
+
+
+# --- [23-C] ★★★★★★ RN7 SS/WW/XX/YY — 값 타입 계약과 이력 안전망 ---
+
+
+def _capture_events(g):
+    """★ RN7 YY: publish 는 handler(event) 로 **1인자**를 넘긴다. 2인자 람다를
+    쓰면 이벤트가 실제로 발행될 때 핸들러가 TypeError 를 내고 리스트는 영원히
+    비어, `assert events == []` 가 절대 실패할 수 없는 죽은 단언이 된다."""
+    seen = []
+    g.events.subscribe(lambda event: seen.append(event.op))
+    return seen
+
+
+def test_event_capture_actually_captures():
+    """YY — 아래 '이벤트 0건' 단언들이 죽은 단언이 아님을 먼저 증명한다."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class")
+    seen = _capture_events(g)
+    g.update_node("n", {"set": {"label": "N2"}})
+    assert seen == ["node.update"]
+
+
+_TYPE_VIOLATIONS = [
+    ("type", {}), ("type", []), ("type", 7), ("type", None), ("type", True),
+    ("label", {}), ("label", ["a"]), ("label", 7), ("label", None),
+    ("layer", 7), ("layer", {}), ("layer", []),
+    ("ttl", True), ("ttl", "60"), ("ttl", {}), ("ttl", None),
+    ("parent_id", 7), ("parent_id", []),
+    ("properties", "x"), ("properties", 7),
+    ("tags", "a"), ("tags", 7),
+]
+
+
+@pytest.mark.parametrize("reason", [None, "supersede", "correction"])
+@pytest.mark.parametrize(("field_name", "value"), _TYPE_VIOLATIONS)
+def test_wrong_value_type_is_refused_without_touching_anything(field_name, value, reason):
+    """(SS) ★ blocker — validate_patch 가 값의 **타입**을 안 봐서 _apply_patch 가
+    실제로 변조한 **뒤에** 인덱스가 raise 했다. 호출자는 실패를 통보받는데 노드는
+    오염된 채 남고, by_type 의 모든 버킷에서 사라져 복구조차 불가능했다."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class", properties={"keep": 1}, tags=["t"])
+    before = g.get_node("n").to_dict()
+    buckets_before = {k: set(v) for k, v in g.indices.by_type.items()}
+    seen = _capture_events(g)
+
+    with pytest.raises(ValueError):
+        g.update_node("n", {"set": {field_name: value}}, reason=reason)
+
+    assert g.get_node("n").to_dict() == before
+    assert {k: set(v) for k, v in g.indices.by_type.items()} == buckets_before
+    assert seen == []
+
+
+def test_wrong_value_type_is_refused_on_edges_and_findings():
+    """(SS) 같은 계약이 edge·finding 에도 적용된다."""
+    g = Graph()
+    g.add_node(id="a", label="A", type="class")
+    g.add_node(id="b", label="B", type="class")
+    g.add_edge(source="a", target="b", relation="calls")
+    finding = g.add_finding(title="t")
+
+    with pytest.raises(ValueError):
+        g.update_edge("a", "b", "calls", "", {"set": {"weight": {}}})
+    with pytest.raises(ValueError):
+        g.update_edge("a", "b", "calls", "", {"set": {"directed": "yes"}})
+    with pytest.raises(ValueError):
+        g.update_finding(finding.finding_id, {"set": {"title": 7}})
+    with pytest.raises(ValueError):
+        g.update_finding(finding.finding_id, {"set": {"confidence": "high"}})
+
+    assert g.edges[("a", "b", "calls", "")].weight == 1.0
+    assert g.get_finding(finding.finding_id).title == "t"
+
+
+def test_float_field_accepts_int_but_not_bool():
+    """(SS) float 는 int 를 받되 bool 은 거부한다 — bool 이 int 서브클래스라
+    명시 배제하지 않으면 플래그가 수치 필드에 조용히 들어간다."""
+    g = Graph()
+    g.add_node(id="a", label="A", type="class")
+    g.add_node(id="b", label="B", type="class")
+    g.add_edge(source="a", target="b", relation="calls")
+
+    g.update_edge("a", "b", "calls", "", {"set": {"weight": 3}})
+    assert g.edges[("a", "b", "calls", "")].weight == 3
+    with pytest.raises(ValueError):
+        g.update_edge("a", "b", "calls", "", {"set": {"weight": True}})
+
+
+def test_every_declared_field_type_is_covered():
+    """(SS) 새 필드가 생겼을 때 조용한 구멍이 되지 않게 — 선언 타입이 매핑에
+    없으면 통과가 아니라 **오류**여야 한다."""
+    from dataclasses import fields as dc_fields
+
+    from visualizebetter.graph.core import _FIELD_TYPES, Edge, Finding, Node
+
+    for cls in (Node, Edge, Finding):
+        for f in dc_fields(cls):
+            assert f.type in _FIELD_TYPES, (
+                f"{cls.__name__}.{f.name} 의 선언 타입 {f.type!r} 이 _FIELD_TYPES 에 없다"
+            )
+
+
+def test_corruption_scenario_cannot_even_start():
+    """(SS) ★ 복구 불가 시나리오가 애초에 성립하지 않음을 단언한다."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class")
+
+    with pytest.raises(ValueError):
+        g.update_node("n", {"set": {"type": {}}}, reason="supersede")
+
+    # 오염이 없으므로 후속 동작이 전부 정상이다
+    g.update_node("n", {"set": {"type": "service"}})
+    assert g.indices.by_type["service"] == {"n"}
+    g.add_node(id="n", label="N", type="class")          # upsert
+    g.delete_node("n")
+    assert "n" not in g.nodes
+
+
+# --- WW: 보존할 것이 없으면 이력도 남기지 않는다 ---
+
+
+@pytest.mark.parametrize("patch", [{}, {"remove": ["nope"]}, {"remove": ()}])
+def test_no_op_supersede_cannot_evict_real_history(patch):
+    """(WW) ★ 승인되는 patch 로도 LL 의 피해가 도달했다 — 빈 patch 나 없는 키
+    remove 는 오타보다 흔한 LLM 실수인데, 무조건 append 가 {'prev': {}} 로 10칸을
+    채워 진짜 supersession 을 밀어냈다."""
+    g = Graph()
+    g.add_node(id="n", label="ORIGINAL", type="class")
+    g.update_node("n", {"set": {"label": "V2"}}, reason="supersede")
+
+    for _ in range(MAX_SUPERSEDED_ENTRIES + 2):
+        g.update_node("n", patch, reason="supersede")
+
+    history = g.get_node("n").properties[SUPERSEDED_PROPERTY]
+    assert len(history) == 1
+    assert history[0]["prev"]["label"] == "ORIGINAL"
+
+
+def test_empty_remove_tuple_is_still_accepted():
+    """(WW) 빈 patch 를 거부하지는 않는다 — 문서화된 허용 동작 회귀."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class")
+    g.update_node("n", {"remove": ()})
+    g.update_node("n", {})
+    assert g.get_node("n").label == "N"
+
+
+# --- XX: _provenance 캡 ---
+
+
+def test_provenance_is_bounded():
+    """(XX) correction 반복이 properties 를 무한 성장시켰다 — 2000회에 160KB,
+    마지막 WS 페이로드도 160KB, 총 7.81s(매회 전체 로그 deepcopy 라 O(n²))."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class")
+    for i in range(200):
+        g.update_node("n", {"set": {"label": f"v{i}"}}, reason="correction")
+
+    log = g.get_node("n").properties[PROVENANCE_PROPERTY]
+    assert len(log) <= MAX_PROVENANCE_ENTRIES
+    assert len(json.dumps(g.get_node("n").properties)) < 32_000
+
+
+# --- YY: 거부 시 undo/redo 불변 ---
+
+
+def test_rejected_patch_leaves_undo_and_redo_untouched():
+    """(YY) LL 의 4축 중 undo/redo 축. 거부된 호출이 스택 깊이를 바꾸거나 redo 를
+    소거하면 사용자의 되돌리기 경로가 실패 호출로 망가진다."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class")
+    g.update_node("n", {"set": {"label": "V2"}})
+    g.undo()
+    assert g.history.can_redo()
+
+    depth = len(g.history.undo_stack)
+    seen = _capture_events(g)
+    for patch in ({"set": {"type": {}}}, {"set": {"labell": "x"}}, {"sett": {}}):
+        with pytest.raises(ValueError):
+            g.update_node("n", patch, reason="supersede")
+
+    assert len(g.history.undo_stack) == depth   # undo 깊이 불변
+    assert g.history.can_redo()           # redo 보존
+    assert g.get_node("n").label == "N"    # undo 결과 유지
+    assert seen == []

@@ -1715,17 +1715,18 @@ def test_expired_deadline_defers_the_remaining_snapshots(canonical):
         legacy_db, target / DB_FILENAME, deadline=time.monotonic() - 1
     )
 
-    # RN6 MM 이후로는 단계 경계에서 더 일찍 보류될 수 있다 — 그때는 pending 을
-    # 세기 전이라 -1(미집계)이다. 어느 쪽이든 '이번엔 못 함, 다음에 재개' 다.
+    # [23-C] RN7 VV: 만료된 deadline 이어도 **정확히 1건**은 커밋된다(진행 바닥).
+    # 이게 없으면 '여러 부팅에 걸쳐 완료' 에 종료 보장이 없다 — 아무것도 안 하고
+    # 보류만 반복하는 부팅이 가능해진다.
+    assert outcome.copied == 1
     assert outcome.deferred != 0
-    assert outcome.copied == 0
-    assert _snapshot_ids(target / DB_FILENAME) == set()   # 아무것도 안 들어갔고
+    assert len(_snapshot_ids(target / DB_FILENAME)) == 1
     assert _snapshot_ids(legacy_db) == {f"s{i}" for i in range(4)}   # legacy 온전
 
     # 예산이 있는 다음 실행이 정확히 이어받는다 (additive + 원장)
     resumed = snap_mod._copy_forward(legacy_db, target / DB_FILENAME)
     assert resumed.deferred == 0
-    assert resumed.copied == 4
+    assert resumed.copied == 3      # 남은 것만
     assert _snapshot_ids(target / DB_FILENAME) == {f"s{i}" for i in range(4)}
 
 
@@ -1827,3 +1828,136 @@ def test_measured_worst_case_stays_under_the_proxy_budget(canonical):
         f"실측 {elapsed:.1f}s 가 proxy 예산 {stdio_proxy.LAUNCH_TIMEOUT_S}s 를 넘는다"
     )
     print(f"\n[MM] 락 홀더 상태 실측 최악: {elapsed:.2f}s")
+
+
+# --- [23-C] ★★★★★★ RN7 TT/UU/VV — 안전망·시간예산·종료보장 ---
+
+
+def test_auto_snapshotter_survives_a_failing_tick(store):
+    """(TT) ★ blocker — 틱 몸통에 가드가 없어 어떤 저장 실패든(오염 값·디스크
+    꽉 참·권한·락) 태스크를 죽였다. 주기 스냅샷과 파괴적 작업 직전 훅이 조용히
+    영구 정지 = 이 프로젝트의 핵심 안전망이 예외 하나로 사라지는 구조였다."""
+    graph = Graph(name="t")
+    snapshotter = snap_mod.AutoSnapshotter(graph, store, interval_seconds=0.01)
+    calls = []
+
+    async def flaky():
+        calls.append(len(calls))
+        if len(calls) == 1:
+            raise RuntimeError("disk full")
+        return None
+
+    snapshotter.snapshot_if_dirty = flaky
+
+    async def go():
+        snapshotter.start()
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if len(calls) >= 3:
+                break
+        await snapshotter.stop()
+
+    run(go())
+    assert len(calls) >= 3, "실패한 틱 이후 루프가 죽었다 — 안전망 정지"
+
+
+def test_auto_snapshotter_stop_still_cancels():
+    """(TT) CancelledError 는 잡지 않는다 — 삼키면 stop() 이 무력해진다."""
+    graph = Graph(name="t")
+    store_dir = None
+
+    async def go():
+        snapshotter = snap_mod.AutoSnapshotter(graph, SnapshotStore(store_dir), interval_seconds=0.01)
+        snapshotter.start()
+        await asyncio.sleep(0.05)
+        await snapshotter.stop()
+        return snapshotter.running
+
+    import tempfile
+    store_dir = Path(tempfile.mkdtemp())
+    assert run(go()) is False
+
+
+def test_abort_path_does_not_pay_for_a_detach_it_never_attached(canonical, monkeypatch):
+    """(UU1) abort 경로는 ATTACH 를 하지도 않았는데 finally 의 무조건 DETACH 가
+    락된 target 에서 full busy timeout×1.5 를 태웠다 — 후보당 최대 절감 항목이고,
+    2후보 총합을 16.3s → 10.04s 로 줄인 단일 변경이다.
+
+    ★ 첫 시도에서 이 테스트는 스스로를 무력화했었다: 패치 안에서 sqlite3.connect
+    를 다시 부르는 람다라 무한 재귀 → except 로 abort → DETACH 없음 → 뮤테이션이
+    있으나 없으나 초록. 진짜 connect 를 먼저 잡아둔다."""
+    target, legacy = canonical
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / snap_mod._LEGACY_DB_FILENAME).write_bytes(b"not a database")
+
+    executed = []
+    real_connect = sqlite3.connect
+
+    class _Spy(sqlite3.Connection):
+        def execute(self, sql, *args):
+            executed.append(sql.strip().split()[0].upper())
+            return super().execute(sql, *args)
+
+    def spying_connect(*args, **kwargs):
+        kwargs["factory"] = _Spy
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(snap_mod.sqlite3, "connect", spying_connect)
+    SnapshotStore(target)
+    monkeypatch.undo()
+
+    assert "ATTACH" in executed, "테스트 전제가 깨졌다 — ATTACH 를 시도조차 안 했다"
+    assert "DETACH" not in executed, "ATTACH 실패 경로에서 DETACH 를 시도했다"
+
+
+def test_every_boot_commits_at_least_one_snapshot(canonical):
+    """(VV) ★ deadline 검사가 첫 스냅샷보다 앞이라, pending 열거만 하고 한 건도
+    시도하지 않는 부팅이 가능했다(3부팅 연속 copied=0 재현) — II 가 약속한
+    '여러 부팅에 걸쳐 완료' 에 종료 보장이 없었다."""
+    target, legacy = canonical
+    legacy_db = legacy / snap_mod._LEGACY_DB_FILENAME
+    wanted = {f"m{i}" for i in range(5)}
+    _store_db_kinds(legacy_db, [(f"m{i}", "manual") for i in range(5)])
+    target.mkdir(parents=True, exist_ok=True)
+    target_db = target / DB_FILENAME
+
+    progress = []
+    for _ in range(10):
+        # 이미 만료된 deadline — 그래도 부팅당 최소 1건은 커밋돼야 한다
+        outcome = snap_mod._copy_forward(legacy_db, target_db, deadline=time.monotonic() - 1)
+        progress.append(outcome.copied)
+        if _snapshot_ids(target_db) == wanted:
+            break
+
+    assert all(c >= 1 for c in progress), f"진행 없는 부팅이 있었다: {progress}"
+    assert _snapshot_ids(target_db) == wanted        # 반복 부팅으로 완료
+    assert _snapshot_ids(legacy_db) == wanted        # legacy 온전
+
+
+def test_two_candidate_total_time_stays_under_the_proxy_budget(tmp_path, monkeypatch):
+    """(UU2) 실측은 **총합**으로 보고한다 — 후보당 비용을 낮추면 후보2가 추가로
+    시작하므로 후보당 수치만으로는 wall-clock 을 말할 수 없다."""
+    from visualizebetter import stdio_proxy
+
+    base = tmp_path / "b"
+    target = base / "visualizebetter"
+    legacy = base / "mcpgraph"
+    monkeypatch.setattr(snap_mod, "_default_base_pair", lambda: (target, legacy))
+    _store_db_kinds(legacy / snap_mod._LEGACY_DB_FILENAME, [("a", "manual")])
+    target.mkdir(parents=True, exist_ok=True)
+    _store_db_kinds(target / snap_mod._LEGACY_DB_FILENAME, [("b", "manual")])  # 후보 2개
+    target_db = target / DB_FILENAME
+    _store_db(target_db, [])
+
+    holder = sqlite3.connect(target_db, isolation_level=None)
+    try:
+        holder.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        SnapshotStore(target)
+        elapsed = time.monotonic() - started
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert elapsed < stdio_proxy.LAUNCH_TIMEOUT_S
+    print(f"\n[UU] 후보 2개 + 락 홀더 총합 실측: {elapsed:.2f}s")

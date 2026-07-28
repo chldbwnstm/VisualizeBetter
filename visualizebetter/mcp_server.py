@@ -878,10 +878,19 @@ def _register_write(
         target: str,
         relation: str,
         key: str = "",
-        patch: dict[str, Any] | None = None,
+        *,
+        patch: dict[str, Any],
         reason: UpdateReason = None,
     ) -> dict[str, Any]:
-        """엣지를 부분 갱신한다. patch/reason 규약은 update_node 와 같다."""
+        """엣지를 부분 갱신한다. patch/reason 규약은 update_node 와 같다.
+
+        [23-C] RN7 ZZ(1): ``patch`` is required, as [5-A] declares it. It had
+        drifted to ``| None = None``, which made this the one updater that
+        accepted a missing patch — and the falsy-to-``{}`` degradation that used
+        to hide behind it reported ok:True while changing nothing but
+        ``updated_at``, publishing an edge.update for an edit that never
+        happened. Keyword-only because ``key`` carries a default.
+        """
         _reject_reserved_properties(_patch_properties(patch))
         try:
             edge = graph.update_edge(source, target, relation, key, patch, reason=reason)

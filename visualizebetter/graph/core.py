@@ -12,7 +12,7 @@ import json
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any
 
@@ -51,6 +51,17 @@ VALID_REASONS = frozenset({REASON_CORRECTION, REASON_SUPERSEDE})
 # [24-C] node/edge 이력 상한. These live in `properties`, which carries no size
 # invariant in M1 ([23-B] bounds findings only), so the cap is by count alone.
 MAX_SUPERSEDED_ENTRIES = 10
+
+MAX_PROVENANCE_ENTRIES = 50
+"""[23-C] RN7 XX — cap on a node/edge ``_provenance`` log.
+
+``_superseded`` was capped from the start but this was not, so
+``reason="correction"`` repeated 2000 times grew properties to 160KB, made the
+final node.update WS payload 160KB, and took 7.81s in total — the whole log is
+deep-copied on every write, so the cost is quadratic. A provenance entry is small
+(action + timestamp + author, ~100B) unlike a superseded ``prev`` value, so the
+cap is looser than 10 while still bounded: 50 x ~100B ~ 5KB.
+"""
 
 # [24-C] finding 이력 상한 — count alone does not bound a finding's size: a
 # superseded body may be MAX_FINDING_BODY_CHARS, so 10 of them would build a
@@ -301,6 +312,78 @@ def _check_finding_size(
             )
 
 
+_FIELD_TYPES: dict[str, tuple[type, ...]] = {
+    "str": (str,),
+    "str | None": (str, type(None)),
+    "int": (int,),
+    "float": (int, float),
+    "bool": (bool,),
+    "list[str]": (list, tuple),
+    "list[dict[str, Any]]": (list, tuple),
+    "dict[str, Any]": (dict,),
+    "dict[str, Any] | None": (dict, type(None)),
+    "dict[str, float] | None": (dict, type(None)),
+}
+"""[5-A]/[23-B] RN7 SS — declared field type → what a patch may set it to.
+
+Keyed by the annotation string because ``from __future__ import annotations``
+makes every field's ``.type`` a string. Deliberately explicit rather than
+inferred: an annotation this table does not know about raises instead of being
+waved through, so a field added later cannot become a silent hole (that is what
+``test_every_declared_field_type_is_covered`` pins down).
+"""
+
+
+def _accepts(annotation: str, value: Any) -> bool:
+    """True if ``value`` is assignable to a field declared as ``annotation``."""
+    allowed = _FIELD_TYPES[annotation]
+    # bool is a subclass of int, so an int field would silently accept True.
+    # A flag arriving where a count belongs is a caller mistake, not a coercion.
+    if bool not in allowed and isinstance(value, bool):
+        return False
+    return isinstance(value, allowed)
+
+
+def check_field_types(target: Node | Edge | Finding, updates: dict[str, Any]) -> None:
+    """[23-C] RN7 SS — a patch may not put the wrong *type* into a known field.
+
+    ``validate_patch`` checked which fields could be written, never what could go
+    into them, so the rejection happened later — inside or after ``_apply_patch``
+    — and by then the damage was done. ``{"set": {"type": {}}}`` passed every
+    check, ``setattr`` applied it, and the index then raised
+    ``TypeError: unhashable type: 'dict'``: the caller saw a failure while the
+    node kept ``type == {}``, vanished from every ``by_type`` bucket, and could
+    no longer be updated, deleted, undone or snapshotted — the store's own
+    ``save_snapshot`` began failing with a binding error, which (with the
+    unguarded auto-snapshot loop) stopped the safety net entirely.
+
+    Fields that never reach an index were worse, not better: ``label``/``layer``
+    took a dict *successfully* and published a node.update, and only the next
+    snapshot failed. The user saw "edit succeeded" and lost every later
+    auto-snapshot.
+
+    The creation path was already type-checked by the MCP signature
+    (``type: str``); the update path took ``patch: dict[str, Any]`` and checked
+    nothing — exactly the "guard one door, leave the other open" shape [23-B]
+    warns about.
+    """
+    declared = {f.name: f.type for f in fields(target)}
+    for name, value in updates.items():
+        annotation = declared.get(name)
+        if annotation is None:
+            continue  # unknown fields are rejected by validate_patch itself
+        if annotation not in _FIELD_TYPES:
+            raise ValueError(
+                f"field {name!r} has an unmapped declared type {annotation!r};"
+                " extend _FIELD_TYPES ([23-C] RN7 SS)"
+            )
+        if not _accepts(annotation, value):
+            raise ValueError(
+                f"field {name!r} expects {annotation}, got {type(value).__name__}"
+                " ([5-A])"
+            )
+
+
 def validate_patch(
     target: Node | Edge | Finding, patch: dict[str, Any], server_managed: frozenset[str]
 ) -> None:
@@ -352,6 +435,7 @@ def validate_patch(
     unknown = {k for k in updates if not hasattr(target, k)}
     if unknown:
         raise ValueError(f"unknown fields: {sorted(unknown)}")
+    check_field_types(target, updates)  # [23-C] RN7 SS
 
     if removals:
         if not hasattr(target, "properties"):
@@ -766,13 +850,22 @@ class Graph:
 
         if reason == REASON_SUPERSEDE:
             # Snapshot before _apply_patch runs — afterwards the old value is gone.
+            previous = _previous_values(target, patch)
+            if not previous:
+                # [23-C] RN7 WW — nothing was going to change, so there is no
+                # prior value to preserve. Appending {'prev': {}} anyway let a
+                # no-op call ({} or a remove of an absent key, both ordinary LLM
+                # slips) push real supersessions out through the FIFO cap —
+                # [24-C]'s promise destroyed by calls that changed nothing.
+                return patch
             archive = target.properties.setdefault(SUPERSEDED_PROPERTY, [])
-            archive.append(_history_entry(_previous_values(target, patch), by))
+            archive.append(_history_entry(previous, by))
             _trim_by_count(archive, MAX_SUPERSEDED_ENTRIES)
             extra[SUPERSEDED_PROPERTY] = copy.deepcopy(archive)
         else:  # REASON_CORRECTION — [24-B] 틀린 값은 버린다.
             log = target.properties.setdefault(PROVENANCE_PROPERTY, [])
             log.append(_provenance_entry(REASON_CORRECTION, by))
+            _trim_by_count(log, MAX_PROVENANCE_ENTRIES)  # [23-C] RN7 XX
             extra[PROVENANCE_PROPERTY] = copy.deepcopy(log)
 
         merged_properties = {**((patch.get("set") or {}).get("properties") or {}), **extra}

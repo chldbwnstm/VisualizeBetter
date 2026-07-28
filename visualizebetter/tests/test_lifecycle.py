@@ -83,10 +83,13 @@ def test_supersede_archives_only_the_fields_the_patch_touches(graph):
     )
 
     entries = graph.get_node("app.World").properties[SUPERSEDED_PROPERTY]
-    # The first supersede had no prior `size` to archive, so it recorded nothing
-    # for it; the second archived the value the first one set.
-    assert entries[0]["prev"] == {}
-    assert entries[1]["prev"] == {"properties": {"size": 64}}
+    # [23-C] RN7 WW: the first supersede had no prior `size`, so there was
+    # nothing to preserve and **no entry is recorded** — an archive of
+    # {'prev': {}} preserves nothing while still consuming one of the ten FIFO
+    # slots, which is how no-op calls used to evict real supersessions. Only the
+    # second one archived a value.
+    assert len(entries) == 1
+    assert entries[0]["prev"] == {"properties": {"size": 64}}
 
 
 def test_repeated_supersession_stacks_history_oldest_first(graph):
@@ -120,7 +123,10 @@ def test_a_later_change_cannot_rewrite_already_archived_history(graph):
     graph.get_node("app.World").properties["flags"].append("c")
 
     entries = graph.get_node("app.World").properties[SUPERSEDED_PROPERTY]
-    assert entries[1]["prev"] == {"properties": {"flags": ["a"]}}
+    # [23-C] RN7 WW: the first supersede archived nothing (no prior `flags`), so
+    # the surviving entry is the second one — the deep-copy guarantee it checks
+    # is unchanged.
+    assert entries[-1]["prev"] == {"properties": {"flags": ["a"]}}
 
 
 def test_supersede_archives_a_removed_property(graph):

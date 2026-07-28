@@ -219,18 +219,33 @@ _MIGRATION_LOG_NAME = "migration.log"
 # locked target could stall start-up for 84s (two candidates: ~168s) — past the
 # proxy's 25s and the Tauri shell's 40s, and the Tauri path has no retry.
 #
-# ★ What the deadline actually is (RN6 MM — the earlier "10s wall clock" claim
-# was not what the code did). ``_COPY_DEADLINE_S`` is checked at stage
-# boundaries, not preemptively: a statement already waiting on a lock runs to its
-# own timeout first. SQLite's busy handler also overshoots its nominal timeout by
-# roughly 1.5x (measured: a 4.0s setting took 6.00s). So the real bound is
+# ★ What the deadline actually is (RN6 MM / RN7 UU — the earlier "10s wall clock"
+# claim was not what the code did, and the fix after it was still stated
+# per-candidate, which is not a wall clock either). ``_COPY_DEADLINE_S`` is
+# checked at stage boundaries, never preemptively: a statement already waiting on
+# a lock runs to its own timeout first. Two further facts the formula has to
+# carry:
 #
-#     worst case ≈ candidates × (stages that can block × _COPY_LOCK_TIMEOUT_S × 1.5)
+#   · SQLite's busy handler overshoots, and the factor is not constant —
+#     measured 1.0s→1.80x, 2.0s→1.60x, 4.0s→1.49x. Count *blocking statements
+#     between checks*, not stages.
+#   · ``_record_migration`` runs outside the deadline by design (it is HH's
+#     honesty surface, so it must run even when the copy gave up). Its cost is
+#     real and belongs in the total.
+#   · [23-C] RN7 VV adds a floor: every boot commits at least one snapshot before
+#     the budget can bite, so one snapshot's cost is always included.
 #
-# With per-statement 2.0s and boundary checks after connect / schema / ATTACH /
-# the S(1) PRAGMA loop / each snapshot / DETACH / reporting, a fully locked target
-# yields ~8s per candidate. That stays under the proxy's 25s and the Tauri
-# shell's 40s, which is the property that matters:
+#     worst ≈ Σ(candidates started before the deadline)
+#                 [blocking statements × _COPY_LOCK_TIMEOUT_S × ~1.6]
+#             + candidates × _REPORT_LOCK_TIMEOUT_S × ~1.8
+#
+# ★ Measured **total** (not per candidate), fully locked target:
+#     one candidate  … 8.15s      two candidates … 10.04s
+# Lowering the per-candidate cost lets a second candidate start, so a per-
+# candidate number cannot describe start-up; only the total can. Guarding the
+# unconditional DETACH behind an "did we actually ATTACH" flag ([23-C] RN7 UU)
+# is what brought the two-candidate total from 16.3s down to 10.04s.
+#
 #     migration  <  proxy LAUNCH_TIMEOUT_S 25s  <  Tauri wait_for_serve 40s
 # Raising any one of these without the others reintroduces a start-up hang.
 _COPY_LOCK_TIMEOUT_S = 2.0
@@ -401,7 +416,10 @@ def _record_migration(data_dir: Path, target_db: Path, outcome: _MigrationOutcom
 
 
 def _copy_forward(
-    legacy_db: Path, target_db: Path, deadline: float | None = None
+    legacy_db: Path,
+    target_db: Path,
+    deadline: float | None = None,
+    progress: list | None = None,
 ) -> _MigrationOutcome:
     """[23-C] RN3 L~R + S~W, RN4 X/Z/BB/CC — copy snapshots legacy → target.
 
@@ -435,10 +453,26 @@ def _copy_forward(
     source_key = os.path.normcase(os.path.abspath(legacy_db))
     outcome = _MigrationOutcome(source_db=source_key)
     connection = None
+    attached = False
+    if progress is None:
+        # [23-C] RN7 VV — a direct caller gets the same floor as a boot does;
+        # without one the deadline would never bite for them at all.
+        progress = [False]
 
     def out_of_time() -> bool:
-        """[23-C] RN6 MM — checked at every stage boundary, not just per snapshot."""
-        return deadline is not None and time.monotonic() > deadline
+        """[23-C] RN6 MM + RN7 VV — the time budget, with a progress floor.
+
+        MM added checks at every stage boundary so a locked target cannot burn
+        the whole start-up. VV requires the opposite guarantee: every boot must
+        commit at least one snapshot, or "it completes across restarts" has no
+        termination argument — boots that enumerate and defer make no progress
+        forever. Both hold if the budget only bites *after* this boot has
+        actually moved: the floor costs one snapshot's worth of time, which the
+        worst-case formula below accounts for.
+        """
+        if deadline is None or time.monotonic() <= deadline:
+            return False
+        return progress[0]
 
     try:
         connection = sqlite3.connect(target_db, timeout=_COPY_LOCK_TIMEOUT_S)
@@ -461,6 +495,7 @@ def _copy_forward(
 
         try:
             connection.execute("ATTACH DATABASE ? AS legacy", (str(legacy_db),))
+            attached = True
         except sqlite3.Error as exc:
             log.warning("copy-forward skipped: cannot open legacy store %s (%s)", legacy_db, exc)
             outcome.aborted = "cannot-open-legacy"
@@ -516,6 +551,11 @@ def _copy_forward(
 
         processed = 0
         for snapshot_id, kind in pending:
+            # [23-C] RN7 VV — checked *after* the first attempt, so every boot
+            # commits at least one snapshot. Checking first allowed boots that
+            # enumerated the pending set and then deferred without trying
+            # anything (reproduced three boots running), which leaves II's "it
+            # completes across restarts" with no termination guarantee at all.
             if out_of_time():
                 # [23-C] RN5 II: out of *time* for this boot — never out of the
                 # work. Checked only between snapshots, so a transaction in
@@ -535,6 +575,8 @@ def _copy_forward(
             processed += 1
             if _copy_one_snapshot(connection, snapshot_id, kind, shared_columns, source_key):
                 outcome.copied += 1
+                if progress is not None:
+                    progress[0] = True   # [23-C] RN7 VV — the floor is satisfied
             else:
                 outcome.failed += 1
         copied, failed = outcome.copied, outcome.failed
@@ -558,8 +600,13 @@ def _copy_forward(
         return outcome
     finally:
         if connection is not None:
-            with contextlib.suppress(sqlite3.Error):
-                connection.execute("DETACH DATABASE legacy")
+            # [23-C] RN7 UU(1) — only detach what was attached. An abort path
+            # never ran ATTACH, yet the unconditional DETACH still paid a full
+            # busy timeout (x1.5) against a locked target: the single largest
+            # slice of the measured worst case.
+            if attached:
+                with contextlib.suppress(sqlite3.Error):
+                    connection.execute("DETACH DATABASE legacy")
             with contextlib.suppress(sqlite3.Error):
                 connection.close()
 
@@ -585,7 +632,11 @@ def _pending_snapshots(connection: sqlite3.Connection) -> tuple[list[tuple[str, 
     only older ones pending, "newest 2 overall" resolves to two rows already in
     the ledger, the budget buys nothing and the pending ones are refused forever.
     Stability comes from the budget being durable, not from where the ranking is
-    drawn.)
+    drawn. The same shape bites harder with more than one candidate, because the
+    ledger is global while selection is per candidate: once candidate 1 has taken
+    the newest rows, candidate 2's newest are already in the ledger and its
+    intersection is empty — two overlapping stores, and half the snapshots never
+    arrive.)
 
     [23-C] RN4 BB: the ledger is keyed by ``snapshot_id`` alone. Snapshot ids are
     uuid4, so a store reached through an 8.3 short name, a junction or the second
@@ -806,6 +857,10 @@ class SnapshotStore:
         copy, never a deleted store, so no fail-closed handling is needed.
         """
         deadline = time.monotonic() + _COPY_DEADLINE_S
+        # [23-C] RN7 VV — one shared flag for the whole boot: the time budget
+        # starts biting only once *something* has been committed, so a boot can
+        # never end with zero progress while work remains.
+        progress = [False]
         for legacy_db in _legacy_db_candidates(self.data_dir):
             # [23-C] RN4 EE: "start-up cannot fail here" is a structural
             # guarantee, not a promise that every callee remembers to keep. One
@@ -814,7 +869,7 @@ class SnapshotStore:
             try:
                 if _same_path(legacy_db, self.db_path):
                     continue
-                if time.monotonic() > deadline:
+                if progress[0] and time.monotonic() > deadline:
                     log.warning(
                         "copy-forward: %s deferred (time budget reached before it started)",
                         legacy_db,
@@ -827,7 +882,7 @@ class SnapshotStore:
                         ),
                     )
                     continue
-                outcome = _copy_forward(legacy_db, self.db_path, deadline)
+                outcome = _copy_forward(legacy_db, self.db_path, deadline, progress)
                 _record_migration(self.data_dir, self.db_path, outcome)
                 if outcome.copied:
                     _leave_breadcrumb(legacy_db, self.db_path)
@@ -1184,9 +1239,25 @@ class AutoSnapshotter:
             await task
 
     async def _run(self) -> None:
+        """[23-C] TT — one failing tick must not end the safety net.
+
+        This loop had no guard, so any save failure — a corrupt value the store
+        could not bind, a full disk, a permission error, a lock — killed the task
+        and silently stopped both the periodic snapshots and the
+        before-destructive-operation hook. The one mechanism protecting the
+        user's gold disappeared on a single exception, with nothing to say so.
+
+        ``CancelledError`` is deliberately not caught: ``stop()`` ends this task
+        by cancelling it, and swallowing that would make the loop unstoppable.
+        """
         while True:
             await asyncio.sleep(self.interval_seconds)
-            await self.snapshot_if_dirty()
+            try:
+                await self.snapshot_if_dirty()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("auto snapshot tick failed: %s", exc)
 
     async def snapshot_if_dirty(self) -> dict[str, Any] | None:
         """One periodic tick: save only when the graph changed ([23-C])."""
