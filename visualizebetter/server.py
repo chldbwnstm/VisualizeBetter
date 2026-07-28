@@ -25,6 +25,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
@@ -123,6 +124,11 @@ class WebSocketConnection:
 
     async def send(self, text: str) -> None:
         await self.socket.send_text(text)
+
+
+_N = chr(10)
+_NN = _N * 2
+"""Newlines for the plain-text bundle-missing page (kept out of the f-string)."""
 
 
 def create_app(
@@ -309,9 +315,39 @@ def create_app(
     app.mount(MCP_PATH, mcp_app)
 
     dist = frontend_dist()
-    if serve_static and dist.is_dir():
-        # Mounted last: / would otherwise shadow the routes above.
-        app.mount("/", StaticFiles(directory=str(dist), html=True), name="spa")
+    if serve_static:
+        if dist.is_dir():
+            # Mounted last: / would otherwise shadow the routes above.
+            app.mount("/", StaticFiles(directory=str(dist), html=True), name="spa")
+        else:
+            # The SPA is built, not committed (frontend/dist is gitignored), so a
+            # fresh clone has no bundle. Without this the browser opened straight
+            # onto a bare 404 with nothing to act on — the API was up and only the
+            # static mount was missing, which is exactly the thing a 404 cannot
+            # say. 503 rather than 200: the server genuinely is not ready to serve
+            # the app yet, and a monitor should be able to tell.
+            logger.warning(
+                "frontend bundle not found at %s - serving build instructions"
+                " instead. Run `npm ci && npm run build` in frontend/.",
+                dist,
+            )
+
+            @app.get("/{path:path}", response_class=PlainTextResponse)
+            async def _frontend_missing(path: str) -> PlainTextResponse:
+                """Explain the one missing build step instead of 404-ing."""
+                return PlainTextResponse(
+                    "VisualizeBetter: the frontend bundle is missing." + _NN
+                    + "Expected it at: " + str(dist) + _NN
+                    + "The SPA is built from source and is not committed, so a"
+                    " fresh clone has to build it once:" + _NN
+                    + "    cd frontend" + _N
+                    + "    npm ci" + _N
+                    + "    npm run build" + _NN
+                    + "Then restart `visualizebetter serve`." + _NN
+                    + "The MCP endpoint and the JSON/WebSocket API are already"
+                    " running; only the browser UI needs this bundle." + _N,
+                    status_code=503,
+                )
 
     return app
 

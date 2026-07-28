@@ -80,6 +80,48 @@ backend pytest 806 / frontend vitest 288 / Playwright E2E 21. Run with
 
 ---
 
+## Quick start
+
+The SPA is built from source and is not committed, so a fresh clone needs one
+build step before the browser UI works.
+
+**Prerequisites**
+
+| | |
+|---|---|
+| Python | 3.11 or newer |
+| [uv](https://docs.astral.sh/uv/) | any recent version — installs the Python deps |
+| Node.js | 22 (what CI uses) |
+
+```bash
+git clone https://github.com/chldbwnstm/VisualizeBetter.git
+cd VisualizeBetter
+
+# 1. build the frontend bundle (once, and again after frontend changes)
+cd frontend
+npm ci
+npm run build
+cd ..
+
+# 2. run the server — opens the browser automatically
+uv run visualizebetter serve --port 8765
+```
+
+Skipping step 1 is not fatal: the server still starts and the MCP/JSON/WebSocket
+API works, but the browser gets a 503 telling you which build command is missing.
+
+**Register it with an AI client** (Claude Desktop, Claude Code, Cursor):
+
+```jsonc
+{
+  "mcpServers": {
+    "visualizebetter": { "command": "visualizebetter", "args": ["mcp-stdio"] }
+  }
+}
+```
+
+---
+
 ## Why build this
 
 ### 1. The "gold" an AI finds is thrown away unless it's recorded where you can see it

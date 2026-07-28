@@ -1,32 +1,23 @@
-# React + TypeScript + Vite
+# VisualizeBetter frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+The React + TypeScript + Vite single-page app served by `visualizebetter serve`.
+It is built from source and **not committed** — `frontend/dist/` is gitignored, so
+a fresh clone has to build it once before the browser UI works.
 
-Currently, two official plugins are available:
+Requires Node.js 22 (the version CI uses).
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+npm ci             # install exactly what package-lock.json pins
+npm run build      # tsc -b && vite build  ->  frontend/dist/
+npm test           # vitest run
+npm run lint       # oxlint
+npm run dev        # Vite dev server with HMR, for frontend work only
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+`npm run dev` serves the UI on Vite's own port and expects `visualizebetter serve`
+to be running separately for the API and the WebSocket feed. For anything other
+than frontend development, prefer `npm run build` plus `uv run visualizebetter
+serve`, which serves the built bundle and the API from one origin.
+
+Playwright end-to-end and performance specs live in `e2e/` and `perf/`; see
+`../docs/benchmarks.md` for how the 100K performance numbers were measured.

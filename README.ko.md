@@ -78,6 +78,48 @@ Claude Desktop 은 `visualizebetter mcp-stdio` 로 연결.
 
 ---
 
+## 빠른 시작
+
+SPA 는 소스에서 빌드하며 저장소에 커밋하지 않는다. 그래서 갓 클론한 상태에서는
+브라우저 UI 를 보기 전에 빌드 한 번이 필요하다.
+
+**전제 조건**
+
+| | |
+|---|---|
+| Python | 3.11 이상 |
+| [uv](https://docs.astral.sh/uv/) | 최신 버전 — 파이썬 의존성을 설치한다 |
+| Node.js | 22 (CI 가 쓰는 버전) |
+
+```bash
+git clone https://github.com/chldbwnstm/VisualizeBetter.git
+cd VisualizeBetter
+
+# 1. 프론트엔드 번들 빌드 (최초 1회, 이후 프론트 변경 시마다)
+cd frontend
+npm ci
+npm run build
+cd ..
+
+# 2. 서버 실행 — 브라우저가 자동으로 열린다
+uv run visualizebetter serve --port 8765
+```
+
+1번을 건너뛰어도 치명적이지는 않다. 서버는 뜨고 MCP/JSON/WebSocket API 도 동작하며,
+브라우저에는 어떤 빌드 명령이 빠졌는지 알려주는 503 이 표시된다.
+
+**AI 클라이언트에 등록** (Claude Desktop, Claude Code, Cursor):
+
+```jsonc
+{
+  "mcpServers": {
+    "visualizebetter": { "command": "visualizebetter", "args": ["mcp-stdio"] }
+  }
+}
+```
+
+---
+
 ## 왜 만드는가
 
 ### 1. AI가 찾은 "gold"는, 한눈에 보이게 기록되지 않으면 버려진다

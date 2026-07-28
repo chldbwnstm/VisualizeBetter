@@ -12,7 +12,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from visualizebetter.graph.core import Graph
-from visualizebetter.server import DEFAULT_PORT, MCP_PATH, create_app, is_loopback
+from visualizebetter.server import (
+    DEFAULT_PORT,
+    MCP_PATH,
+    create_app,
+    frontend_dist,
+    is_loopback,
+)
 
 ORIGIN = f"http://localhost:{DEFAULT_PORT}"
 HOST = f"localhost:{DEFAULT_PORT}"
@@ -545,3 +551,49 @@ def test_a_refused_value_leaves_graph_json_serving(client, graph, what, call):
     body = response.json()
     assert [n["id"] for n in body["nodes"]] == ["a"]
     json.dumps(body, ensure_ascii=False, allow_nan=False)  # wire 로 나갈 수 있다
+
+
+# --- PUB1 P3 — a fresh clone has no SPA bundle ---
+
+
+def test_a_missing_frontend_bundle_explains_itself(tmp_path):
+    """(PUB1 P3) frontend/dist 는 gitignore 되므로 **신규 클론에는 번들이 없다**.
+    이전에는 브라우저가 맨 404 로 열렸다 — API 는 멀쩡히 떠 있고 정적 마운트만
+    없는 상태인데, 404 는 그 사실을 말할 수 없는 응답이다.
+
+    200 이 아니라 503 인 이유: 서버가 실제로 아직 앱을 서빙할 준비가 안 됐고,
+    모니터가 그걸 구분할 수 있어야 한다."""
+    dist = frontend_dist()
+    moved = dist.with_name("dist.test-moved")
+    had_dist = dist.is_dir()
+    if had_dist:
+        dist.rename(moved)
+    try:
+        app = create_app(graph=Graph(), data_dir=tmp_path / "data")
+        with TestClient(app, base_url=f"http://{HOST}") as client:
+            for path in ("/", "/settings", "/anything/deep"):
+                response = client.get(path, headers=HEADERS)
+                assert response.status_code == 503, path
+                body = response.text
+                assert "npm run build" in body
+                assert "frontend" in body
+                assert str(dist) in body
+            # API 는 계속 살아 있다 — 번들만 없다는 사실이 응답과 일치해야 한다
+            assert client.get("/graph.json", headers=HEADERS).status_code == 200
+    finally:
+        if had_dist:
+            moved.rename(dist)
+    assert dist.is_dir() == had_dist
+
+
+def test_the_built_bundle_still_takes_precedence(tmp_path, graph):
+    """(PUB1 P3) 회귀 — 번들이 있으면 안내가 아니라 SPA 가 서빙된다.
+
+    공용 client 픽스처는 serve_static=False 라 이 축을 볼 수 없다."""
+    if not frontend_dist().is_dir():
+        pytest.skip("이 체크아웃에는 빌드된 번들이 없다")
+    app = create_app(graph=graph, data_dir=tmp_path / "data")
+    with TestClient(app, base_url=f"http://{HOST}") as client:
+        response = client.get("/", headers=HEADERS)
+        assert response.status_code == 200
+        assert "npm run build" not in response.text
