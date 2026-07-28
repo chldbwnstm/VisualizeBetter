@@ -437,3 +437,118 @@ def test_legacy_mcpgraph_export_envelope_still_imports(tmp_path):
     assert "n1" in g.nodes and "n2" in g.nodes
     (finding,) = g.findings.values()
     assert finding.title == "carried gold"
+
+
+# --- [13-B] CH1(5) — 거부 ⇒ 무변경이 사실이어야 한다 ---
+
+
+_PARTIAL_PAYLOADS = [
+    pytest.param(
+        {"nodes": [{"id": "ok1", "label": "A", "type": "t"}, {"label": "B", "type": "t"}]},
+        "missing 'id'",
+        id="node-missing-id",
+    ),
+    pytest.param(
+        {
+            "nodes": [{"id": "ok1", "label": "A", "type": "t"}],
+            "edges": [{"source": "ok1", "target": "ok1", "relation": "r"}, {"source": "ok1"}],
+        },
+        "missing",
+        id="edge-missing-relation",
+    ),
+    pytest.param(
+        {
+            "nodes": [{"id": "ok1", "label": "A", "type": "t"}],
+            "findings": [{"title": "good"}, {"body": "no title"}],
+        },
+        "missing 'title'",
+        id="finding-missing-title",
+    ),
+    pytest.param(
+        {"nodes": [{"id": "ok1", "label": "A", "type": "t"}, {"id": "bad", "type": {}}]},
+        "",
+        id="node-bad-value-type",
+    ),
+    pytest.param(
+        {
+            "nodes": [{"id": "ok1", "label": "A", "type": "t"}],
+            "edges": [{"source": "ok1", "target": "ok1", "relation": "r", "weight": {}}],
+        },
+        "",
+        id="edge-bad-value-type",
+    ),
+    pytest.param(
+        {
+            "nodes": [{"id": "ok1", "label": "A", "type": "t"}],
+            "findings": [{"title": "x", "node_ids": 5}],
+        },
+        "",
+        id="finding-bad-value-type",
+    ),
+]
+
+
+@pytest.mark.parametrize(("payload", "_match"), _PARTIAL_PAYLOADS)
+def test_a_rejected_import_applies_nothing(payload, _match):
+    """(CH1-5) ★ 필수 키·값 타입 검사가 적용 루프 **안**에 있어, 40번째 노드에
+    id 가 없으면 39개가 들어간 뒤 실패가 보고됐다. 호출자는 '아무 일도 없었다'는
+    응답을 받는데 그래프는 이미 움직였고, merge=True 면 그 39개가 이벤트까지
+    발행하고 undo 커맨드에 합류해 되돌릴 방법이 없었다."""
+    from visualizebetter.mcp_server import import_payload
+
+    graph = Graph()
+    good = Graph()
+    # 전제: 같은 payload 의 성한 부분은 정상적으로 들어간다 — 거부가 '원래 아무것도
+    # 안 들어가는 payload' 때문이 아님을 먼저 증명한다
+    import_payload(good, {"nodes": payload["nodes"][:1]}, merge=True)
+    assert good.nodes, "성한 부분조차 들어가지 않았다 — 죽은 단언"
+
+    with pytest.raises((ToolError, ValueError)):
+        import_payload(graph, payload, merge=True)
+
+    assert graph.nodes == {}
+    assert graph.edges == {}
+    assert graph.findings == {}
+    assert not graph.dirty
+    assert not graph.history.can_undo()
+
+
+def test_a_rejected_merge_import_leaves_the_existing_graph_intact():
+    """(CH1-5) 살아 있는 그래프 위 merge 에서도 같다 — 부분 적용은 기존 상태와
+    섞여 되돌릴 수 없는 혼합물이 된다."""
+    from visualizebetter.mcp_server import import_payload
+
+    graph = Graph()
+    graph.add_node(id="existing", label="E", type="t")
+    before = graph.get_node("existing").to_dict()
+
+    payload = {
+        "nodes": [
+            {"id": "new1", "label": "N1", "type": "t"},
+            {"id": "new2", "label": "N2", "type": "t"},
+            {"label": "nameless", "type": "t"},
+        ]
+    }
+    with pytest.raises(ToolError):
+        import_payload(graph, payload, merge=True)
+
+    assert list(graph.nodes) == ["existing"]
+    assert graph.get_node("existing").to_dict() == before
+
+
+def test_a_valid_import_still_works():
+    """(CH1-5) 회귀 — 사전 검사가 정상 payload 를 막지 않는다."""
+    from visualizebetter.mcp_server import import_payload
+
+    graph = Graph()
+    result = import_payload(
+        graph,
+        {
+            "nodes": [{"id": "a", "label": "A", "type": "t"}, {"id": "b", "label": "B", "type": "t"}],
+            "edges": [{"source": "a", "target": "b", "relation": "calls"}],
+            "findings": [{"title": "F", "node_ids": ["a"]}],
+        },
+        merge=True,
+    )
+    assert result == {"added_nodes": 2, "added_edges": 1}
+    assert len(graph.findings) == 1

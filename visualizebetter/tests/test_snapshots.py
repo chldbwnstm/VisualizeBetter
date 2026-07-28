@@ -25,7 +25,9 @@ from visualizebetter.graph.core import (
     SUPERSEDED_PROPERTY,
     Graph,
 )
-from visualizebetter.graph.snapshots import DB_FILENAME, SnapshotStore
+import aiosqlite
+
+from visualizebetter.graph.snapshots import AutoSnapshotter, DB_FILENAME, SnapshotStore
 
 
 @pytest.fixture
@@ -1961,3 +1963,123 @@ def test_two_candidate_total_time_stays_under_the_proxy_budget(tmp_path, monkeyp
 
     assert elapsed < stdio_proxy.LAUNCH_TIMEOUT_S
     print(f"\n[UU] 후보 2개 + 락 홀더 총합 실측: {elapsed:.2f}s")
+
+
+# --- [13-B] CH1(3) — save_snapshot 원자성 ---
+
+
+async def _snapshot_row(store, snapshot_id):
+    async with aiosqlite.connect(store.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT node_count, edge_count FROM snapshot WHERE id = ?", (snapshot_id,)
+        )
+        return await cur.fetchone()
+
+
+def test_snapshot_is_one_consistent_capture(store):
+    """(CH1-3) ★ 그래프를 6번 따로 읽어(size / 카운트 / node / edge / finding /
+    finding_node) 그 사이 await 마다 변경이 끼어들 수 있었다. 결과는 **존재한 적
+    없는 상태** — 카운트는 A 시점, 노드 행은 B 시점, finding_node 는 노드 패스가
+    보지 못한 노드를 가리켰다."""
+    graph = Graph()
+    graph.add_node(id="a", label="A", type="class")
+    graph.add_node(id="b", label="B", type="class")
+    graph.add_edge(source="a", target="b", relation="calls")
+    graph.add_finding(title="F", node_ids=["a", "b"])
+
+    original = store._ensure_schema
+    raced = []
+
+    async def mutate_mid_save(db):
+        await original(db)
+        graph.delete_node("b", cascade=True)
+        graph.add_node(id="c", label="C", type="class")
+        raced.append(True)
+
+    store._ensure_schema = mutate_mid_save
+    try:
+        result = run(store.save_snapshot(graph, name="race"))
+    finally:
+        store._ensure_schema = original
+
+    assert raced, "저장 도중 변경이 실제로 일어나지 않았다 — 죽은 단언"
+    assert "c" in graph.nodes and "b" not in graph.nodes  # 라이브 그래프는 움직였다
+
+    loaded = run(store.load_snapshot(result["snapshot_id"]))
+    assert set(loaded.nodes) == {"a", "b"}  # 캡처 시점 그대로
+    assert set(loaded.edges) == {("a", "b", "calls", "")}
+    finding = next(iter(loaded.findings.values()))
+    assert all(node_id in loaded.nodes for node_id in finding.node_ids)
+
+    row = run(_snapshot_row(store, result["snapshot_id"]))
+    assert row["node_count"] == len(loaded.nodes)  # 카운트와 행이 같은 시점
+    assert row["edge_count"] == len(loaded.edges)
+
+
+def test_mutations_during_a_save_stay_dirty(store):
+    """(CH1-3) 무조건 clear_dirty 는 저장 **도중** 들어온 변경까지 '디스크에 있다'
+    고 선언했다. 자동 스냅샷은 `if graph.dirty` 로만 돌므로 그 변경들은 무관한
+    다음 편집이 플래그를 다시 세울 때까지 한 번도 저장되지 않는다."""
+    graph = Graph()
+    graph.add_node(id="a", label="A", type="class")
+
+    original = store._ensure_schema
+    raced = []
+
+    async def mutate_mid_save(db):
+        await original(db)
+        graph.add_node(id="late", label="Late", type="class")
+        raced.append(True)
+
+    store._ensure_schema = mutate_mid_save
+    try:
+        run(store.save_snapshot(graph, name="race"))
+    finally:
+        store._ensure_schema = original
+
+    assert raced, "저장 도중 변경이 실제로 일어나지 않았다 — 죽은 단언"
+    assert graph.dirty, "저장 뒤 들어온 변경이 clean 으로 표시됐다"
+
+    run(store.save_snapshot(graph, name="quiet"))  # 반대 축: 조용하면 clear 된다
+    assert not graph.dirty
+
+
+def test_shutdown_saves_the_last_edits(store):
+    """(CH1-3) `stop()` 은 티커를 취소할 뿐이라, 마지막 틱 이후의 편집이 **정상
+    종료**에서 통째로 사라졌다 — 사용자가 유일하게 안전하다고 믿는 경로다.
+    server.py lifespan 의 finally 가 하는 일을 그대로 재현한다."""
+
+    async def scenario():
+        await store.initialize()
+        graph = Graph()
+        snapshotter = AutoSnapshotter(graph, store, interval_seconds=3600)
+        snapshotter.start()
+        graph.add_node(id="late", label="Late", type="class")
+        assert graph.dirty
+        assert await store.list_snapshots() == []  # 전제: 틱은 아직 안 돌았다
+
+        await snapshotter.stop()
+        assert await store.list_snapshots() == [], "stop() 자체가 저장하지는 않는다"
+        await snapshotter.snapshot_if_dirty()  # lifespan finally
+
+        assert not graph.dirty
+        snapshots = await store.list_snapshots()
+        assert len(snapshots) == 1
+        return await store.load_snapshot(snapshots[0]["id"])
+
+    loaded = run(scenario())
+    assert "late" in loaded.nodes
+
+
+def test_lifespan_finally_runs_the_final_save():
+    """(CH1-3) 위 시나리오가 실제 서버 종료 경로에 배선돼 있는지 — 소스를 단언해
+    테스트가 재현만 하고 배선은 빠지는 상황을 막는다."""
+    import inspect
+
+    from visualizebetter import server
+
+    source = inspect.getsource(server.create_app)
+    stop_at = source.index("await snapshotter.stop()")
+    unsubscribe_at = source.index("hub.unsubscribe()", stop_at)
+    assert "snapshot_if_dirty()" in source[stop_at:unsubscribe_at]

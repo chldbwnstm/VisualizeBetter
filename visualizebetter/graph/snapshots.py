@@ -920,14 +920,30 @@ class SnapshotStore:
         description: str = "",
         kind: str = SNAPSHOT_KIND_MANUAL,
     ) -> dict[str, Any]:
-        """[5-E] save_snapshot → { snapshot_id, size }.
+        """[5-E] save_snapshot -> { snapshot_id, size }.
 
-        ``name`` is stored as a value only — it never reaches the filesystem.
-        Clears the dirty flag on success ([23-C]).
+        ``name`` is stored as a value only - it never reaches the filesystem.
+
+        [13-B] CH1(3): every row is built from **one** ``_snapshot_payload``
+        capture. Previously the graph was read six separate times - once for
+        ``size``, once for the counts, then once per ``executemany`` - with
+        ``await`` points in between, so any mutation landing mid-save produced a
+        snapshot that never existed: counts from one instant, node rows from a
+        second, finding rows from a third, and ``finding_node`` rows pointing at
+        nodes the node pass had not seen. ``_snapshot_payload`` goes through
+        ``asdict``, so the capture is a deep copy and stays true no matter what
+        happens to the live graph afterwards.
+
+        The dirty flag is likewise cleared only if the graph has not moved since
+        the capture ([23-C]) - an unconditional clear told the autosnapshotter
+        that changes made *during* the save were already on disk, and they were
+        silently skipped until some later edit happened to set the flag again.
         """
         snapshot_id = str(uuid.uuid4())
+        token = graph.dirty_token
         payload = _snapshot_payload(graph)
         size = len(_dumps(payload).encode("utf-8"))
+        nodes, edges, findings = payload["nodes"], payload["edges"], payload["findings"]
 
         async with aiosqlite.connect(self.db_path) as db:
             await self._ensure_schema(db)
@@ -941,11 +957,11 @@ class SnapshotStore:
                     description,
                     _now(),
                     kind,
-                    len(graph.nodes),
-                    len(graph.edges),
-                    _dumps(graph.metadata),
-                    _dumps(graph.layers),
-                    graph.version,
+                    len(nodes),
+                    len(edges),
+                    _dumps(payload["metadata"]),
+                    _dumps(payload["layers"]),
+                    payload["version"],
                 ),
             )
             await db.executemany(
@@ -956,21 +972,21 @@ class SnapshotStore:
                 [
                     (
                         snapshot_id,
-                        node.id,
-                        node.label,
-                        node.type,
-                        _dumps(node.properties),
-                        node.parent_id,
-                        _dump_optional(node.style_hint),
-                        _dump_optional(node.position_hint),
-                        node.layer,
-                        node.ttl,
-                        _dumps(node.tags),
-                        node.created_at,
-                        node.updated_at,
-                        node.created_by,
+                        node["id"],
+                        node["label"],
+                        node["type"],
+                        _dumps(node["properties"]),
+                        node["parent_id"],
+                        _dump_optional(node["style_hint"]),
+                        _dump_optional(node["position_hint"]),
+                        node["layer"],
+                        node["ttl"],
+                        _dumps(node["tags"]),
+                        node["created_at"],
+                        node["updated_at"],
+                        node["created_by"],
                     )
-                    for node in graph.nodes.values()
+                    for node in nodes
                 ],
             )
             await db.executemany(
@@ -981,21 +997,21 @@ class SnapshotStore:
                 [
                     (
                         snapshot_id,
-                        edge.source,
-                        edge.target,
-                        edge.relation,
-                        edge.key,
-                        int(edge.directed),
-                        _dumps(edge.properties),
-                        edge.weight,
-                        edge.layer,
-                        _dump_optional(edge.style_hint),
-                        edge.ttl,
-                        _dumps(edge.tags),
-                        edge.created_at,
-                        edge.created_by,
+                        edge["source"],
+                        edge["target"],
+                        edge["relation"],
+                        edge["key"],
+                        int(edge["directed"]),
+                        _dumps(edge["properties"]),
+                        edge["weight"],
+                        edge["layer"],
+                        _dump_optional(edge["style_hint"]),
+                        edge["ttl"],
+                        _dumps(edge["tags"]),
+                        edge["created_at"],
+                        edge["created_by"],
                     )
-                    for edge in graph.edges.values()
+                    for edge in edges
                 ],
             )
             await db.executemany(
@@ -1006,34 +1022,34 @@ class SnapshotStore:
                 [
                     (
                         snapshot_id,
-                        finding.finding_id,
-                        finding.title,
-                        finding.body,
-                        finding.confidence,
-                        _dumps(finding.evidence),
-                        finding.layer,
-                        _dumps(finding.tags),
-                        finding.created_by,
-                        finding.created_at,
-                        finding.updated_at,
-                        _dumps(finding._superseded),
-                        _dumps(finding._provenance),
+                        finding["finding_id"],
+                        finding["title"],
+                        finding["body"],
+                        finding["confidence"],
+                        _dumps(finding["evidence"]),
+                        finding["layer"],
+                        _dumps(finding["tags"]),
+                        finding["created_by"],
+                        finding["created_at"],
+                        finding["updated_at"],
+                        _dumps(finding["_superseded"]),
+                        _dumps(finding["_provenance"]),
                     )
-                    for finding in graph.findings.values()
+                    for finding in findings
                 ],
             )
             await db.executemany(
                 "INSERT INTO finding_node (snapshot_id, finding_id, node_id, ordinal)"
                 " VALUES (?, ?, ?, ?)",
                 [
-                    (snapshot_id, finding.finding_id, node_id, ordinal)
-                    for finding in graph.findings.values()
-                    for ordinal, node_id in enumerate(finding.node_ids)
+                    (snapshot_id, finding["finding_id"], node_id, ordinal)
+                    for finding in findings
+                    for ordinal, node_id in enumerate(finding["node_ids"])
                 ],
             )
             await db.commit()
 
-        graph.clear_dirty()  # [23-C]
+        graph.clear_dirty(token)  # [23-C] only if nothing changed mid-save
         return {"snapshot_id": snapshot_id, "size": size}
 
     async def load_snapshot(self, snapshot_id: str) -> Graph:

@@ -27,14 +27,18 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from visualizebetter.filter import FilterError, compile_filter
 from visualizebetter.graph.core import (
+    _check_finding_size,
+    check_new_record,
     check_properties,
     MAX_FINDING_BODY_CHARS,
     MAX_FINDING_EVIDENCE,
     MAX_FINDING_NODE_IDS,
     MAX_FINDING_TAGS,
     MAX_FINDING_TITLE_CHARS,
+    Edge,
     Finding,
     Graph,
+    Node,
     is_reserved_property,
 )
 from visualizebetter.graph.snapshots import AutoSnapshotter, SnapshotStore
@@ -1219,46 +1223,99 @@ def _resolve_import_path(root: Path, path: str) -> Path:
     return target
 
 
+def _import_kwargs(
+    specs: list[dict[str, Any]],
+    allowed: tuple[str, ...],
+    required: tuple[str, ...],
+    what: str,
+    section: str,
+) -> list[dict[str, Any]]:
+    """[13-B] CH1(5) — project each spec onto its allowed fields, requiring keys.
+
+    Separated from application so the whole payload can be judged before any of
+    it lands. The missing-key checks used to sit inside the apply loop, so a
+    payload whose 40th node lacked ``id`` imported 39 nodes and *then* reported
+    failure — the caller was told nothing happened while the graph had already
+    moved, and on ``merge=True`` those 39 had published events and joined the
+    undo command, so there was no way back short of undo-guessing.
+    """
+    out = []
+    for spec in specs:
+        kwargs = {k: spec[k] for k in allowed if k in spec}
+        for key in required:
+            if key not in kwargs:
+                raise ToolError(f"imported {what} is missing {key!r} ({section}).")
+        out.append(kwargs)
+    return out
+
+
 def _apply_import(target: Graph, payload: dict[str, Any]) -> dict[str, Any]:
     """Apply nodes → edges → findings onto ``target`` through the WRITE validation
-    ([5-E]/[11]). Reserved keys are rejected up front (fail-closed, atomic) so a
-    forged '_' key applies nothing. Idempotent by identity; counts newly created."""
-    node_specs = _import_specs(payload, "nodes")
-    edge_specs = _import_specs(payload, "edges")
-    finding_specs = _import_specs(payload, "findings")
+    ([5-E]/[11]). Idempotent by identity; counts newly created.
 
-    # Pre-pass: refuse a reserved-key forgery before touching the graph ([23-B]).
-    for spec in node_specs:
-        _reject_reserved_properties(spec.get("properties"))
-    for spec in edge_specs:
-        _reject_reserved_properties(spec.get("properties"))
+    [13-B] CH1(5): the whole payload is validated before the first write, so
+    "rejected ⇒ nothing changed" is a fact rather than a docstring claim. The
+    pre-pass covers every axis the apply loop can raise on — shape, required
+    keys, reserved-key forgery ([23-B]), the CH1(1) value contract, and the
+    finding size invariants — because a check that runs only inside the loop
+    turns a bad payload into a *partial* import, which is worse than either
+    outcome the caller can reason about.
+    """
+    node_kwargs = _import_kwargs(
+        _import_specs(payload, "nodes"), _IMPORT_NODE_FIELDS, ("id",), "node", "[4-A]"
+    )
+    edge_kwargs = _import_kwargs(
+        _import_specs(payload, "edges"),
+        _IMPORT_EDGE_FIELDS,
+        ("source", "target", "relation"),
+        "edge",
+        "[4-B]",
+    )
+    finding_kwargs = _import_kwargs(
+        _import_specs(payload, "findings"),
+        _IMPORT_FINDING_FIELDS,
+        ("title",),
+        "finding",
+        "[23-B]",
+    )
+
+    for kwargs in node_kwargs:
+        _reject_reserved_properties(kwargs.get("properties"))
+        check_new_record(Node, kwargs)
+    for kwargs in edge_kwargs:
+        _reject_reserved_properties(kwargs.get("properties"))
+        check_new_record(Edge, kwargs)
+    for kwargs in finding_kwargs:
+        check_new_record(Finding, kwargs)
+        _check_finding_size(
+            kwargs["title"],
+            kwargs.get("body", ""),
+            kwargs.get("node_ids", ()),
+            kwargs.get("evidence", ()),
+            kwargs.get("tags", ()),
+        )
 
     added_nodes = 0
-    for spec in node_specs:
-        kwargs = {k: spec[k] for k in _IMPORT_NODE_FIELDS if k in spec}
-        if "id" not in kwargs:
-            raise ToolError("imported node is missing 'id' ([4-A]).")
+    for kwargs in node_kwargs:
         is_new = kwargs["id"] not in target.nodes
         target.add_node(**{**kwargs, "layer": _resolve_layer(kwargs.get("layer"))})
         if is_new:
             added_nodes += 1
 
     added_edges = 0
-    for spec in edge_specs:
-        kwargs = {k: spec[k] for k in _IMPORT_EDGE_FIELDS if k in spec}
-        for required in ("source", "target", "relation"):
-            if required not in kwargs:
-                raise ToolError(f"imported edge is missing {required!r} ([4-B]).")
-        identity = (kwargs["source"], kwargs["target"], kwargs["relation"], kwargs.get("key", ""))
+    for kwargs in edge_kwargs:
+        identity = (
+            kwargs["source"],
+            kwargs["target"],
+            kwargs["relation"],
+            kwargs.get("key", ""),
+        )
         is_new = identity not in target.edges
         target.add_edge(**{**kwargs, "layer": _resolve_layer(kwargs.get("layer"))})
         if is_new:
             added_edges += 1
 
-    for spec in finding_specs:
-        kwargs = {k: spec[k] for k in _IMPORT_FINDING_FIELDS if k in spec}
-        if "title" not in kwargs:
-            raise ToolError("imported finding is missing 'title' ([23-B]).")
+    for kwargs in finding_kwargs:
         target.add_finding(**kwargs)
 
     return {"added_nodes": added_nodes, "added_edges": added_edges}

@@ -4,6 +4,14 @@ Minimal set required by Graph Core today: ``adjacency`` (node id -> edge keys
 touching it, both directions) backs delete_node's cascade rule ([5-A]), and
 ``by_type`` backs type lookups. by_layer and the wider index set land with the
 tasks that need them.
+
+★ Assumption these structures rest on ([13-B] CH1(4)): every key written here —
+node id, node ``type``, edge endpoints — is a hashable ``str``. Nothing in this
+module checks that, because the check belongs where records are created: core's
+``check_new_record``/``check_field_types`` refuse a non-str before anything
+reaches an index. When that contract was missing, a ``dict`` type reached
+``by_type`` and raised mid-write, leaving the record committed but unindexed.
+Callers must not bypass those two.
 """
 
 from __future__ import annotations

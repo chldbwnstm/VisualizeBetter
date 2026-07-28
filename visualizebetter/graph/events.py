@@ -21,6 +21,10 @@ Coalescing into graph.batch and the seq-based resync procedure belong to the hub
 
 from __future__ import annotations
 
+import logging
+
+log = logging.getLogger(__name__)
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -72,8 +76,24 @@ class EventBus:
         return unsubscribe
 
     def publish(self, op: str, data: dict[str, Any]) -> Event:
+        """[8-C] Fan an event out to every subscriber, isolating each one.
+
+        [13-B] CH1(2): a raising handler used to take the rest of the fan-out
+        with it *and* propagate into the mutation that published the event — by
+        which point the graph had already changed and the seq was already spent.
+        The caller was told the operation failed while it had in fact succeeded,
+        and the event never reached the wire (M1 has no resync trigger, so the
+        client never learns it missed one). ``_send_all`` already isolates per
+        connection for the same reason; the layer above it did not.
+
+        Nothing after a committed mutation may turn that mutation into a
+        reported failure.
+        """
         self._seq += 1
         event = Event(op=op, data=data, seq=self._seq)
         for handler in list(self._handlers):
-            handler(event)
+            try:
+                handler(event)
+            except Exception:  # noqa: BLE001
+                log.exception("event subscriber failed for %s (seq=%s)", op, event.seq)
         return event

@@ -233,12 +233,31 @@ class WSHub:
             self._unsubscribe = None
 
     def _on_event(self, event: Event) -> None:
-        """EventBus handler — synchronous, so it queues rather than sends."""
-        if event.op in _COALESCED_OPS:
-            self._add_to_batch(event)
-        else:
-            self._close_batch()
-            self._outbox.append((event.seq, event.op, event.data))
+        """EventBus handler — synchronous, so it queues rather than sends.
+
+        [13-B] CH1(2): wire encoding can fail here (model_validate on the
+        batch models), and the two possible failures were both wrong. Before,
+        the exception travelled back through publish into the mutation that
+        raised it, so a committed graph change was reported to the caller as an
+        error. With publish isolating its subscribers that stops — but then
+        the event is merely *dropped*, and M1 clients have no way to notice a
+        missing seq, so they render a graph the server no longer has.
+
+        A message we cannot encode is exactly the situation resync exists for:
+        drop the half-built batch and tell every client that what it holds is
+        stale, the same signal a snapshot load sends ([8-C]). Costly and rare,
+        but it converges — silence does not.
+        """
+        try:
+            if event.op in _COALESCED_OPS:
+                self._add_to_batch(event)
+            else:
+                self._close_batch()
+                self._outbox.append((event.seq, event.op, event.data))
+        except Exception:  # noqa: BLE001
+            logger.exception("cannot encode %s (seq=%s); forcing a client resync", event.op, event.seq)
+            self._batch = None
+            self._outbox.append((event.seq, "snapshot.load", {"snapshot_id": ""}))
 
     def _add_to_batch(self, event: Event) -> None:
         if self._batch is None:

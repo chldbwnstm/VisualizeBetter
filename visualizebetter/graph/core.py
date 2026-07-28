@@ -52,6 +52,21 @@ VALID_REASONS = frozenset({REASON_CORRECTION, REASON_SUPERSEDE})
 # invariant in M1 ([23-B] bounds findings only), so the cap is by count alone.
 MAX_SUPERSEDED_ENTRIES = 10
 
+MAX_CITATIONS_ENTRIES = 100
+"""[13-B] CH1(4) — cap on a node's ``_citations`` array.
+
+The third reserved array was the only uncapped one (``_superseded`` 10,
+``_provenance`` 50), and it grows through the same quadratic path XX was fixed
+for: ``cite()`` appends, then publishes the *whole* list in the patch, while
+``history.touch_node`` deep-copies the entire node per call. Measured: 200 cites
+= 21KB properties / 2.1MB of batch payload; 2000 cites = 215KB / **214MB**.
+
+100 rather than 50: an entry is small (url + title + ts) and evidence lists are
+legitimately longer than change logs — a node can reasonably carry dozens of
+sources. What must stay bounded is the wire payload, which grows linearly with
+this number, so it is capped rather than left open. Oldest evicted first.
+"""
+
 MAX_PROVENANCE_ENTRIES = 50
 """[23-C] RN7 XX — cap on a node/edge ``_provenance`` log.
 
@@ -299,13 +314,21 @@ def _check_finding_size(
 
     Bounding on the way in is what lets get_finding hand gold back whole.
     """
-    for name, value, cap in (
-        ("title", title, MAX_FINDING_TITLE_CHARS),
-        ("body", body, MAX_FINDING_BODY_CHARS),
-        ("node_ids", node_ids, MAX_FINDING_NODE_IDS),
-        ("evidence", evidence, MAX_FINDING_EVIDENCE),
-        ("tags", tags, MAX_FINDING_TAGS),
+    for name, value, cap, expected in (
+        ("title", title, MAX_FINDING_TITLE_CHARS, (str,)),
+        ("body", body, MAX_FINDING_BODY_CHARS, (str,)),
+        ("node_ids", node_ids, MAX_FINDING_NODE_IDS, (list, tuple)),
+        ("evidence", evidence, MAX_FINDING_EVIDENCE, (list, tuple)),
+        ("tags", tags, MAX_FINDING_TAGS, (list, tuple)),
     ):
+        # [13-B] CH1(2): type before len(). A dict title has len 1 and sailed
+        # under the cap; an int node_ids raised TypeError, which never became a
+        # ToolError because only ValueError is translated.
+        if not isinstance(value, expected):
+            raise ValueError(
+                f"finding {name} must be {' or '.join(e.__name__ for e in expected)},"
+                f" got {type(value).__name__} ([23-B])"
+            )
         if len(value) > cap:
             raise ValueError(
                 f"finding {name} exceeds the limit: {len(value)} > {cap}"
@@ -342,6 +365,39 @@ def _accepts(annotation: str, value: Any) -> bool:
     if bool not in allowed and isinstance(value, bool):
         return False
     return isinstance(value, allowed)
+
+
+def check_new_record(cls: type, values: dict[str, Any]) -> None:
+    """[13-B] CH1(1) — the *creation* path gets the same value contract as update.
+
+    RN7 closed the update door with ``check_field_types`` but left this one open,
+    on the assumption that the MCP signature (``type: str``) already типed it.
+    That holds for ``push_node``/``push_edge`` only: ``push_batch`` takes raw
+    dicts (its bounds model allows extras and checks ttl alone) and
+    ``import_graph``/``import_from_file`` hand arbitrary JSON straight to
+    ``add_*``. So the same ``{"type": {}}`` that update refuses walked in through
+    import — and the asymmetry was visible to a caller as "the first push is
+    accepted, the second (a merge) is refused".
+
+    [23-B] put the reserved-key and size rules in core for exactly this reason:
+    guarding MCP alone leaves import, snapshot load and adapters outside. The
+    value contract had not followed them down yet.
+    """
+    declared = {f.name: f.type for f in fields(cls)}
+    for name, value in values.items():
+        annotation = declared.get(name)
+        if annotation is None:
+            continue
+        if annotation not in _FIELD_TYPES:
+            raise ValueError(
+                f"field {name!r} has an unmapped declared type {annotation!r};"
+                " extend _FIELD_TYPES ([23-C] RN7 SS)"
+            )
+        if not _accepts(annotation, value):
+            raise ValueError(
+                f"field {name!r} expects {annotation}, got {type(value).__name__}"
+                " ([5-A])"
+            )
 
 
 def check_field_types(target: Node | Edge | Finding, updates: dict[str, Any]) -> None:
@@ -610,6 +666,7 @@ class Graph:
         # [4-C] snapshot version — populated by the snapshot layer ([5-E], TASK 4).
         self.version: str = ""
         self.dirty: bool = False
+        self._mutations: int = 0  # [13-B] CH1(3) - dirty-flag epoch, see clear_dirty
         self.events = EventBus()
         self.indices = Indices()
         # [M2e] undo/redo command history — owned by Graph Core, the single owner
@@ -641,6 +698,7 @@ class Graph:
         self.version = other.version
         self.indices = other.indices
         self.dirty = False
+        self._mutations = other._mutations
         # [M2e D-6] a full replace invalidates the undo/redo history — its images
         # point at records this graph no longer holds (snapshot load / replace import).
         self.history.clear()
@@ -649,9 +707,27 @@ class Graph:
 
     def _touch(self) -> None:
         self.dirty = True
+        self._mutations += 1
 
-    def clear_dirty(self) -> None:
-        """Cleared when a snapshot is written ([23-C])."""
+    @property
+    def dirty_token(self) -> int:
+        """[13-B] CH1(3) - opaque epoch a writer captures before a long save."""
+        return self._mutations
+
+    def clear_dirty(self, token: int | None = None) -> None:
+        """Cleared when a snapshot is written ([23-C]).
+
+        [13-B] CH1(3): ``save_snapshot`` awaits, so the graph can be mutated
+        between the payload capture and the commit. Clearing unconditionally
+        declared those mutations persisted when the written snapshot predates
+        them, and the autosnapshotter - which only fires ``if graph.dirty`` -
+        then skipped them until an unrelated later edit re-raised the flag.
+        Passing the token captured before the save makes the clear conditional;
+        ``None`` keeps the unconditional behaviour for callers that replace the
+        whole graph.
+        """
+        if token is not None and token != self._mutations:
+            return
         self.dirty = False
 
     # --- [M2e] undo / redo ---
@@ -705,6 +781,11 @@ class Graph:
         Re-pushing an auto-created placeholder resolves it ([5-A]: "merge 로 해소").
         """
         check_properties(properties)  # [23-B] core 강제 (RN3 부수건)
+        check_new_record(Node, {  # [13-B] CH1(1) — same contract as update
+            "id": id, "label": label, "type": type, "parent_id": parent_id,
+            "style_hint": style_hint, "position_hint": position_hint,
+            "layer": layer, "ttl": ttl, "tags": tags or [], "created_by": created_by,
+        })
         self.history.touch_node(id)  # [M2e] before-image (absent → create, present → merge)
         existing = self.nodes.get(id)
         if existing is not None:
@@ -737,8 +818,19 @@ class Graph:
             updated_at=now,
             created_by=created_by,
         )
+        # [13-B] CH1(3) — structural guarantee, not just a type check. The dict
+        # write used to land first, so an index failure left a record that was
+        # present but invisible: by_type had no bucket for it, and from then on
+        # get_graph_summary, list_nodes(sort_by), delete_node, save_snapshot,
+        # clear_all and undo all raised — the store could not even be snapshotted
+        # again. "Committed but unindexed" has to be unreachable, or the next
+        # type hole reproduces the same corruption.
         self.nodes[id] = node
-        self.indices.add_node(node)
+        try:
+            self.indices.add_node(node)
+        except Exception:
+            del self.nodes[id]
+            raise
         self._track_layer(layer)
         self._touch()
         self.events.publish(NODE_ADD, node.to_dict())
@@ -916,6 +1008,7 @@ class Graph:
         self.history.touch_node(node_id)  # [M2e] before the _citations append
         citations = node.properties.setdefault(CITATIONS_PROPERTY, [])
         citations.append({"url": source_url, "title": source_title, "ts": _now()})
+        _trim_by_count(citations, MAX_CITATIONS_ENTRIES)  # [13-B] CH1(4)
         node.updated_at = _now()
         self._touch()
         # Copied, so a later cite() cannot mutate an already-published payload.
@@ -1050,6 +1143,18 @@ class Graph:
         nodes as a matter of course ([3-A]).
         """
         check_properties(properties)  # [23-B] core 강제 (RN3 부수건)
+        check_new_record(Edge, {  # [13-B] CH1(1) — same contract as update
+            "source": source, "target": target, "relation": relation, "key": key,
+            "directed": directed, "weight": weight, "layer": layer,
+            "style_hint": style_hint, "ttl": ttl, "tags": tags or [],
+            "created_by": created_by,
+        })
+        check_new_record(Edge, {  # [13-B] CH1(1)
+            "source": source, "target": target, "relation": relation, "key": key,
+            "directed": directed, "weight": weight, "layer": layer,
+            "style_hint": style_hint, "ttl": ttl, "tags": tags or [],
+            "created_by": created_by,
+        })
         for endpoint in (source, target):
             if endpoint not in self.nodes:
                 self._add_placeholder(endpoint, layer=layer, created_by=created_by)
@@ -1089,8 +1194,12 @@ class Graph:
             created_at=_now(),
             created_by=created_by,
         )
-        self.edges[identity] = edge
-        self.indices.add_edge(identity, edge)
+        self.edges[identity] = edge  # [13-B] CH1(3) — same rollback as add_node
+        try:
+            self.indices.add_edge(identity, edge)
+        except Exception:
+            del self.edges[identity]
+            raise
         self._track_layer(layer)
         self._touch()
         self.events.publish(EDGE_ADD, edge.to_dict())
@@ -1190,6 +1299,10 @@ class Graph:
         Raises ValueError if a [23-B] size invariant is exceeded.
         """
         _check_finding_size(title, body, node_ids, evidence, tags)
+        check_new_record(Finding, {  # [13-B] CH1(1)
+            "title": title, "body": body, "confidence": confidence,
+            "layer": layer, "created_by": created_by,
+        })
         now = _now()
         finding = Finding(
             finding_id=str(uuid.uuid4()),

@@ -749,3 +749,61 @@ def test_filter_set_error_defaults_to_none_when_absent():
         }
     )
     assert decoded.data.error is None
+
+
+# --- [13-B] CH1(2) — 인코딩 실패는 침묵이 아니라 resync 로 ---
+
+
+def test_an_unencodable_event_forces_a_resync_instead_of_vanishing(graph, hub, conn):
+    """(CH1-2) ★ 배치 인코딩(`model_validate`)이 실패하면 두 결과 다 틀렸다.
+    격리 전에는 예외가 publish 를 타고 **이미 커밋된 뮤테이션**의 호출자에게
+    올라가 성공을 실패로 보고했고, 격리만 하면 이벤트가 조용히 사라져 M1 클라는
+    (누락 seq 를 알 방법이 없으므로) 서버에 없는 그래프를 계속 그린다.
+
+    인코딩 못 하는 메시지 = resync 가 존재하는 바로 그 상황이다."""
+    graph.add_node(id="a", label="A", type="class")
+    run(hub.flush())
+    assert conn.ops, "정상 이벤트가 애초에 전달되지 않았다 — 죽은 단언"
+    conn.sent.clear()
+
+    broken = []
+    original = hub._add_to_batch
+
+    def explode(event):
+        broken.append(event.seq)
+        raise ValidationError.from_exception_data("GraphBatchData", [])
+
+    hub._add_to_batch = explode
+    try:
+        node = graph.update_node("a", {"set": {"label": "B"}})  # 뮤테이션은 성공해야 한다
+    finally:
+        hub._add_to_batch = original
+
+    assert broken, "인코딩 실패 경로에 도달하지 않았다 — 죽은 단언"
+    assert node.label == "B"                      # 커밋된 변경이 실패로 뒤집히지 않는다
+    assert graph.get_node("a").label == "B"
+
+    run(hub.flush())
+    assert conn.ops == ["snapshot.load"]          # 침묵이 아니라 resync
+    assert conn.messages[0]["data"]["snapshot_id"] == ""
+
+
+def test_a_failed_encode_drops_the_half_built_batch(graph, hub, conn):
+    """(CH1-2) 절반만 채워진 배치를 그대로 보내면 클라가 '일부만 반영된 상태'를
+    정상으로 믿는다. resync 로 승격하면서 열린 배치는 버린다."""
+    graph.add_node(id="a", label="A", type="class")   # 배치가 열린다
+    assert hub.pending == 1
+
+    original = hub._add_to_batch
+
+    def explode(event):
+        raise ValidationError.from_exception_data("GraphBatchData", [])
+
+    hub._add_to_batch = explode
+    try:
+        graph.add_node(id="b", label="B", type="class")
+    finally:
+        hub._add_to_batch = original
+
+    run(hub.flush())
+    assert conn.ops == ["snapshot.load"]

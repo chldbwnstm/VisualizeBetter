@@ -184,6 +184,15 @@ def create_app(
                 with contextlib.suppress(asyncio.CancelledError):
                     await flusher
                 await snapshotter.stop()
+                # [13-B] CH1(3) — stop() only cancels the ticker. Without a
+                # final save, every edit since the last tick died with the
+                # process on an *orderly* shutdown, which is the one case the
+                # user expects to be safe. Best-effort: a failure here must not
+                # replace the real shutdown path with an exception.
+                try:
+                    await snapshotter.snapshot_if_dirty()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning('final snapshot on shutdown failed: %s', exc)
                 hub.unsubscribe()
 
     app = FastAPI(title="visualizebetter", lifespan=lifespan)

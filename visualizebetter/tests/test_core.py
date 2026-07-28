@@ -11,6 +11,7 @@ import pytest
 
 from visualizebetter.graph.core import (
     CITATIONS_PROPERTY,
+    MAX_CITATIONS_ENTRIES,
     MAX_FINDING_BODY_CHARS,
     MAX_PROVENANCE_ENTRIES,
     MAX_SUPERSEDED_ENTRIES,
@@ -1031,3 +1032,155 @@ def test_rejected_patch_leaves_undo_and_redo_untouched():
     assert g.history.can_redo()           # redo 보존
     assert g.get_node("n").label == "N"    # undo 결과 유지
     assert seen == []
+
+
+# --- [13-B] CH1 — 코어 무결성: 생성 경로 계약 / 이벤트 격리 / _citations 캡 ---
+
+
+def _capture_events(g):
+    """publish 는 handler(event) 로 1인자를 넘긴다 (RN7 YY 의 죽은 단언 참조)."""
+    seen = []
+    g.events.subscribe(lambda event: seen.append(event.op))
+    return seen
+
+
+_CREATE_VIOLATIONS = [
+    ("type", {}), ("type", []), ("type", 7), ("type", True),
+    ("label", {}), ("label", ["a"]), ("label", 7),
+    ("id", 7), ("id", None), ("id", ["n"]),
+    ("layer", 7), ("layer", []),
+    ("ttl", True), ("ttl", "60"), ("ttl", {}),
+    ("parent_id", 7), ("parent_id", []),
+    ("tags", "a"), ("tags", 7),
+]
+
+
+@pytest.mark.parametrize(("field_name", "value"), _CREATE_VIOLATIONS)
+def test_creation_path_refuses_the_same_values_update_refuses(field_name, value):
+    """(CH1-1) ★ blocker — RN7 SS 는 update 만 닫았다. 같은 `{"type": {}}` 가
+    add_node 로는 통과해 인덱스에서 TypeError 를 내고, 그 시점엔 dict 에 이미
+    들어가 있어 SS 가 막으려던 복구 불가 상태가 그대로 재현됐다."""
+    base = {"id": "n", "label": "N", "type": "class"}
+    good = Graph()
+    good.add_node(**base)  # 전제: 같은 인자 집합이 정상값으로는 통과한다
+
+    g = Graph()
+    with pytest.raises(ValueError):
+        g.add_node(**{**base, field_name: value})
+    assert g.nodes == {}
+    assert dict(g.indices.by_type) == {}
+
+
+def test_creation_path_refuses_bad_edges_and_findings():
+    """(CH1-1) 같은 계약이 세 생성문 전부에 걸린다."""
+    g = Graph()
+    g.add_node(id="a", label="A", type="class")
+    g.add_node(id="b", label="B", type="class")
+
+    for bad in ({"relation": {}}, {"weight": {}}, {"directed": "yes"}, {"key": 7}):
+        with pytest.raises(ValueError):
+            g.add_edge(**{"source": "a", "target": "b", "relation": "calls", **bad})
+    assert g.edges == {}
+
+    for bad in ({"title": {}}, {"node_ids": 5}, {"evidence": "x"}, {"confidence": "high"}):
+        kwargs = {"title": "t", **bad}
+        with pytest.raises(ValueError):
+            g.add_finding(**kwargs)
+    assert g.findings == {}
+
+
+def test_finding_size_check_types_before_len():
+    """(CH1-1) `_check_finding_size` 가 len() 을 먼저 불러, dict title 은 len 1 로
+    상한 아래를 통과하고 int node_ids 는 TypeError(→ ToolError 로 번역되지 않는
+    부류)를 냈다. 타입을 먼저 본다."""
+    g = Graph()
+    with pytest.raises(ValueError, match="must be str"):
+        g.add_finding(title={"a": 1})
+    with pytest.raises(ValueError, match="must be list or tuple"):
+        g.add_finding(title="t", node_ids=5)
+
+
+def test_index_never_disagrees_with_the_record_dict():
+    """(CH1-1) 구조 보장 — 인덱싱이 실패하면 dict 등록도 되돌린다. 둘이 갈리면
+    노드는 조회되는데 어떤 필터에도 안 잡히는 유령이 된다."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class")
+    before_nodes, before_edges = dict(g.nodes), dict(g.edges)
+
+    class Unhashable(str):
+        __hash__ = None  # type: ignore[assignment]
+
+    # 계약 검사를 통과하는(str 서브클래스) 값으로 인덱싱만 실패시킨다
+    with pytest.raises(TypeError):
+        g.add_node(id="ghost", label="G", type=Unhashable("weird"))
+    assert g.nodes == before_nodes
+    with pytest.raises(TypeError):
+        g.add_edge(source="n", target="n", relation=Unhashable("self"))
+    assert g.edges == before_edges
+
+
+def test_a_raising_subscriber_cannot_undo_a_committed_mutation():
+    """(CH1-2) ★ 구독자 하나가 raise 하면 (a) 뒤 구독자들이 이벤트를 못 받고
+    (b) 예외가 뮤테이션 호출자에게 전파돼 **이미 커밋된 변경**이 실패로 보고됐다.
+    seq 는 이미 소모됐고 M1 에 resync 트리거가 없어 클라는 유실을 모른다."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class")
+
+    delivered = []
+    g.events.subscribe(lambda event: delivered.append(("first", event.op)))
+    g.update_node("n", {"set": {"label": "V1"}})
+    assert delivered == [("first", "node.update")]  # 전제: 팬아웃이 실제로 돈다
+
+    def boom(event):
+        raise RuntimeError("subscriber exploded")
+
+    g.events.subscribe(boom)
+    g.events.subscribe(lambda event: delivered.append(("third", event.op)))
+
+    assert g.update_node("n", {"set": {"label": "V2"}}).label == "V2"
+    assert g.get_node("n").label == "V2"
+    assert ("third", "node.update") in delivered  # 뒤 구독자까지 도달했다
+
+
+def test_citations_are_bounded():
+    """(CH1-4) 세 예약 배열 중 _citations 만 무캡이었다. cite() 는 append 후
+    **리스트 전체**를 patch 로 발행하고 touch_node 는 매번 노드를 deepcopy 하므로
+    XX 가 고친 것과 같은 O(n²) 경로다 (실측 2000건 = properties 215KB /
+    배치 페이로드 214MB)."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class")
+    for i in range(MAX_CITATIONS_ENTRIES + 40):
+        g.cite("n", f"https://example.test/{i}", "src")
+
+    citations = g.get_node("n").properties[CITATIONS_PROPERTY]
+    assert len(citations) == MAX_CITATIONS_ENTRIES
+    assert citations[-1]["url"].endswith(str(MAX_CITATIONS_ENTRIES + 39))  # FIFO
+
+
+def test_rejected_creation_leaves_every_downstream_surface_working():
+    """(CH1 완료검증) ★ 오염 시나리오가 **애초에 성립하지 않음**을 단언한다 —
+    거부 이후 요약·정렬·삭제·clear·undo 가 전부 정상 동작해야 한다."""
+    g = Graph()
+    g.add_node(id="keep", label="Keep", type="class")
+    seen = _capture_events(g)
+    g.update_node("keep", {"set": {"label": "Kept"}})
+    assert seen == ["node.update"]  # 전제: 이벤트 캡처가 살아 있다
+    seen.clear()
+
+    for bad in ({"id": "x", "label": "X", "type": {}}, {"id": 7, "label": "X", "type": "t"}):
+        with pytest.raises(ValueError):
+            g.add_node(**bad)
+    with pytest.raises(ValueError):
+        g.add_edge(source="keep", target="keep", relation={})
+    with pytest.raises(ValueError):
+        g.add_finding(title={"a": 1})
+
+    assert seen == []  # 거부는 이벤트를 발행하지 않는다
+    assert list(g.nodes) == ["keep"]
+    assert g.indices.by_type["class"] == {"keep"}
+    assert sorted(n.label for n in g.nodes.values()) == ["Kept"]
+    g.undo()
+    assert g.get_node("keep").label == "Keep"
+    assert g.delete_node("keep")["ok"]
+    g.clear_all()
+    assert g.nodes == {}
