@@ -619,3 +619,24 @@ def test_the_built_bundle_still_takes_precedence(tmp_path, graph, monkeypatch):
         assert "id=root" in response.text
 
 
+
+
+def test_the_repository_bundle_survives_this_module(request):
+    """(PUB1b [1]) ★ 소스 단언의 짝 — 실행 **후**에도 저장소의 번들이 제자리인지.
+
+    소스 검사는 `.rename(` 이라는 철자를 막을 뿐이고, 실제 트리를 옮기는 방법은
+    그 하나가 아니다(shutil.move, os.replace, Path.replace…). 이 가드는 방법이
+    아니라 결과를 본다: 이 모듈이 끝난 뒤 frontend/dist 가 있었으면 그대로
+    있고, dist.test-moved 같은 잔재가 생기지 않았을 것.
+
+    가드가 필요한 이유가 곧 실패 모드다 — 번들이 옮겨진 채 남으면 앱은 조용히
+    503 안내 페이지만 서빙하고, 다음 사람은 그게 테스트 잔재인 줄 모른다."""
+    dist = frontend_dist()
+    stray = dist.with_name("dist.test-moved")
+    assert not stray.exists(), (
+        f"{stray} 가 남아 있다 — 테스트가 저장소의 실제 번들을 옮겼고 복원하지"
+        " 못했다. 지금 앱은 빌드 안내 페이지만 서빙한다: 그 디렉토리를 dist 로"
+        " 되돌려라."
+    )
+    # 번들이 원래 없는 환경(CI backend job)에서는 없는 것이 정상이다.
+    assert dist.is_dir() or not stray.exists()
