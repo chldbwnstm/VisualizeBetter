@@ -13,7 +13,7 @@ __pycache__/
 node_modules/
 frontend/dist/
 
-# PyInstaller sidecar build artifacts ([8-F]) — the exe is produced in CI, not committed
+# PyInstaller sidecar build artifacts — the exe is produced in CI, not committed
 /build/
 /dist/
 
@@ -21,6 +21,11 @@ frontend/dist/
 *.sqlite
 *.sqlite3
 *.db
+
+# Server discovery file — written by `serve` and contains the auth token in
+# plain text. Running with `--data-dir .` puts it inside the checkout, where an
+# untracked, unignored file gets swept up by `git add -A`.
+serve.json
 
 # Editors / OS
 .vscode/
@@ -32,10 +37,10 @@ Thumbs.db
 frontend/test-results/
 frontend/playwright-report/
 
-# 설계 정본 (내부 문서) — 공개 배포물 아님
+# Internal design document — not part of the published tree
 VISUALIZEBETTER_PROJECT_PLAN.txt
 
-# 내부 작업 산출물 — 공개 배포물 아님
+# Internal working notes — not part of the published tree
 reports/
 CLAUDE.md
 PROGRESS.md
