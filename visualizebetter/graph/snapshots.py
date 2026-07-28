@@ -46,7 +46,7 @@ DB_FILENAME = "visualizebetter.sqlite3"
 # Pre-rename identities (the project was "mcpgraph" until 2026-07-28). Existing
 # users carry a populated store under the old names; a fresh default dir would
 # silently orphan every snapshot, so both are migrated once, best-effort.
-# Hardened per [23-C] ★ (Fable 확정): canonical-pair trigger, adoption,
+# Hardened by a confirmed design decision: canonical-pair trigger, adoption,
 # recover-then-migrate, live-serve guard, race-safe fallbacks, warning logs.
 _LEGACY_DIR_NAME = "mcpgraph"
 _LEGACY_DB_FILENAME = "mcpgraph.sqlite3"

@@ -15,7 +15,7 @@
 
 **[English](./README.md)** | 한국어
 
-<img src="./docs/screenshot-self-visualization.png" alt="VisualizeBetter가 자기 자신의 저장소를 시각화한 화면 — 왼쪽 개요 클러스터, 가운데 fcose 상세 뷰, 오른쪽 인스펙터와 findings 패널" width="100%" />
+<img src="./docs/screenshot-self-visualization.ko.png" alt="VisualizeBetter가 자기 자신의 저장소를 시각화한 화면 — 왼쪽 개요 클러스터, 가운데 fcose 상세 뷰, 오른쪽 인스펙터와 findings 패널" width="100%" />
 
 *VisualizeBetter가 자기 자신의 저장소를 라이브로 시각화한 화면 — 개요의
 backend/frontend/test 클러스터, fcose 상세 뷰, 노드 인스펙터, 그리고 findings
