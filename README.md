@@ -379,6 +379,7 @@ Claude: save_snapshot("project-structure-v1")   ← the next session loads this 
 - [docs/handoff.md](./docs/handoff.md) — session handoff protocol + system prompt
   snippet + implemented tool reference
 - [docs/filter-dsl.md](./docs/filter-dsl.md) — filter DSL grammar, semantics, and safety
+- [KNOWN_ISSUES.md](./KNOWN_ISSUES.md) — open limitations, with workarounds
   caps (canonical)
 
 ## License

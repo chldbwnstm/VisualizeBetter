@@ -358,6 +358,7 @@ Claude: save_snapshot("프로젝트-구조-v1")   ← 다음 세션이 이걸 �
 - [docs/handoff.md](./docs/handoff.md) — 세션 핸드오프 프로토콜 + 시스템 프롬프트
   스니펫 + 구현된 도구 레퍼런스
 - [docs/filter-dsl.md](./docs/filter-dsl.md) — 필터 DSL 문법·의미론·안전 상한 정본
+- [KNOWN_ISSUES.md](./KNOWN_ISSUES.md) — 알려진 제약과 우회 방법 (영문)
 
 ## 라이선스
 
