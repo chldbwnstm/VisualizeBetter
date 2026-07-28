@@ -22,8 +22,6 @@ import logging
 import os
 import sqlite3
 import sys
-import urllib.error
-import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
@@ -46,7 +44,6 @@ _DB_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 # [8-D] discovery file name. Duplicated from server.PORT_FILE_NAME on purpose:
 # server.py imports this module, so importing it back would be a cycle.
 _PORT_FILE_NAME = "serve.json"
-_HEALTH_TIMEOUT_S = 1.0
 
 log = logging.getLogger(__name__)
 
@@ -166,28 +163,97 @@ def _same_path(a: Path | str, b: Path | str) -> bool:
         return False
 
 
-def _legacy_serve_alive(legacy: Path) -> bool:
-    """[23-C] d — does ``legacy/serve.json`` point at a serve that answers now?
+def _pid_alive(pid: int) -> bool:
+    """[23-C] h — is this pid a running process? No network, no I/O wait.
 
-    Same verdict as stdio_proxy.is_serve_healthy (GET /graph.json → 200), but
-    reimplemented on urllib because server/stdio_proxy import this module — an
-    import back would be a cycle. A dead or garbled advertisement is "not alive":
-    only an actually-answering old serve defers migration.
+    RN1 asked an HTTP probe instead, which opened three failure axes at once: it
+    raced the response TTFB (a 100K graph dump is slower than any sane timeout),
+    it inherited HTTP_PROXY from the environment, and urllib followed redirects
+    (re-sending the Bearer token). A pid check has none of them.
+
+    Windows note (measured, CPython 3.13): ``os.kill(pid, 0)`` does **not** raise
+    for a process that has already exited while a handle to it remains, so it
+    cannot prove death — and under a "rename only when death is proven" policy an
+    undetectable death defers migration forever. Win32 is asked directly instead.
     """
-    try:
-        info = json.loads((legacy / _PORT_FILE_NAME).read_text(encoding="utf-8"))
-        url = info["url"]
-    except (OSError, ValueError, KeyError, TypeError):
+    if pid <= 0:
         return False
-    headers = {}
-    if isinstance(info, dict) and info.get("token"):
-        headers["Authorization"] = f"Bearer {info['token']}"
-    request = urllib.request.Request(f"{url}/graph.json", headers=headers)
+    if sys.platform == "win32":
+        return _win_pid_alive(pid)
     try:
-        with urllib.request.urlopen(request, timeout=_HEALTH_TIMEOUT_S) as response:
-            return response.status == 200
-    except (urllib.error.URLError, OSError, ValueError):
+        os.kill(pid, 0)
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return False
+    return True
+
+
+def _win_pid_alive(pid: int) -> bool:
+    """Win32 liveness: OpenProcess + WaitForSingleObject (see _pid_alive)."""
+    import ctypes
+    from ctypes import wintypes
+
+    SYNCHRONIZE = 0x00100000
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    WAIT_TIMEOUT = 0x00000102
+    ERROR_ACCESS_DENIED = 5
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        handle = kernel32.OpenProcess(
+            SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            # Present but not openable → alive. Anything else → gone.
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        try:
+            # Un-signaled means the process object has not exited.
+            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 — liveness must never break start-up
+        log.warning("win32 liveness check failed for pid %s; treating as alive", pid)
+        return True  # fail-closed: unproven death defers the rename
+
+
+def _serve_alive_in(data_dir: Path) -> bool:
+    """[23-C] h/i — is a serve running *for this directory*?
+
+    Reads ``serve.json`` and checks its pid. The policy is "rename only when
+    death is proven", so an advertisement we cannot parse (missing pid, garbled
+    JSON, not a dict) counts as dead — but every step is guarded, because RN1
+    let a ``ValueError`` from a malformed url escape and crash serve/CLI/proxy at
+    start-up (regression: before RN1 nothing here read serve.json at all).
+
+    Proving death also cleans up: the stale advertisement is removed so later
+    runs need not re-examine it.
+    """
+    port_file = data_dir / _PORT_FILE_NAME
+    try:
+        info = json.loads(port_file.read_text(encoding="utf-8"))
+        pid = int(info["pid"]) if isinstance(info, dict) else 0
+    except Exception:  # noqa: BLE001 — any unreadable file means "not proven alive"
+        pid = 0
+
+    if pid > 0 and _pid_alive(pid):
+        return True
+
+    if port_file.exists():
+        try:
+            port_file.unlink()
+            log.warning("removed stale serve advertisement %s", port_file)
+        except OSError:
+            pass
+    return False
 
 
 def default_data_dir() -> Path:
@@ -212,10 +278,8 @@ def _migrate_legacy_dir(target: Path, legacy: Path) -> Path:
     """
     if not legacy.exists():
         return target
-    if _legacy_serve_alive(legacy):
-        log.warning(
-            "data-dir migration deferred: a live serve still answers for %s", legacy
-        )
+    if _serve_alive_in(legacy):
+        log.warning("data-dir migration deferred: a serve is running for %s", legacy)
         return target
     if target.exists():
         return target
@@ -233,17 +297,27 @@ def _migrate_legacy_dir(target: Path, legacy: Path) -> Path:
 
 
 def _recover_sqlite_sidecars(db_file: Path) -> bool:
-    """[23-C] c — make ``db_file`` clean; True iff no sidecars remain.
+    """[23-C] c/j — make ``db_file`` clean; True iff no sidecars remain.
 
     A hot rollback journal must be replayed under the database's original
     filename — renaming the pair and hoping is the corruption vector SQLite's
     docs warn about. Opening the database and reading once makes SQLite itself
-    perform the rollback. A sidecar that survives a *successful* open is by
-    definition cold (invalid header — SQLite ignored it), so it is deleted.
-    Any failure leaves everything in place and reports not-clean.
+    perform the rollback. Any failure leaves everything in place and reports
+    not-clean.
+
+    [23-C] j hardening:
+    - A missing ``db_file`` returns False immediately. ``sqlite3.connect``
+      *creates* the file, so probing a vanished source used to leave a 0-byte
+      database behind and then report it clean.
+    - Only ``-journal`` is deleted after a successful open. A ``-wal``/``-shm``
+      pair can belong to another live connection, and unlinking those on POSIX
+      (where an open file survives its name) is itself a corruption vector — so
+      their survival means not-clean and the caller declines the rename.
     """
-    sidecars = [db_file.parent / (db_file.name + s) for s in _DB_SIDECAR_SUFFIXES]
-    if not any(path.exists() for path in sidecars):
+    if not db_file.exists():
+        return False
+    sidecars = {s: db_file.parent / (db_file.name + s) for s in _DB_SIDECAR_SUFFIXES}
+    if not any(path.exists() for path in sidecars.values()):
         return True
     try:
         connection = sqlite3.connect(db_file, timeout=1.0)
@@ -254,14 +328,48 @@ def _recover_sqlite_sidecars(db_file: Path) -> bool:
     except sqlite3.Error:
         log.warning("sqlite recovery open failed for %s; not migrating it", db_file)
         return False
-    for path in sidecars:
-        if path.exists():
-            try:
-                path.unlink()
-                log.warning("removed cold sqlite sidecar %s", path)
-            except OSError:
-                return False
+
+    journal = sidecars["-journal"]
+    if journal.exists():
+        # It survived a successful open, so SQLite judged it cold (invalid header).
+        try:
+            journal.unlink()
+            log.warning("removed cold sqlite sidecar %s", journal)
+        except OSError:
+            return False
+    for suffix in ("-wal", "-shm"):
+        if sidecars[suffix].exists():
+            log.warning(
+                "%s remains after recovery open; not migrating %s (fail-closed)",
+                sidecars[suffix], db_file,
+            )
+            return False
     return True
+
+
+def _is_empty_store(db_file: Path) -> bool:
+    """[23-C] g — does ``db_file`` hold no snapshots at all?
+
+    A store is "empty" only when we can read it and see zero rows. Every failure
+    mode — locked by another process, corrupt, no ``snapshot`` table yet, an
+    unexpected schema — answers *not* empty, because the cost of the two mistakes
+    is not symmetric: wrongly calling a real store empty would let adoption
+    delete it, while wrongly calling an empty one populated merely postpones
+    healing to the next run. Read-only (``mode=ro``), so probing never creates
+    or upgrades anything.
+    """
+    if not db_file.exists():
+        return False
+    try:
+        uri = f"file:{db_file.as_posix()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=1.0)
+        try:
+            row = connection.execute("SELECT count(*) FROM snapshot").fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return False
+    return bool(row) and row[0] == 0
 
 
 def _prepare_data_dir(path: Path) -> Path:
@@ -313,72 +421,85 @@ class SnapshotStore:
         self.db_path = self._locate_db()
 
     def _locate_db(self) -> Path:
-        """[23-C] b/c/d/e/f — find, and if needed adopt, the store's DB file.
+        """[23-C] b/c/e/f + g/i — find, and if needed adopt, the store's DB file.
+
+        ``g`` is what makes this converge. RN1 treated "the target DB file
+        exists" as proof that migration had happened, but a deferred or failed
+        run still creates one: serve's lifespan calls ``initialize()`` before
+        uvicorn binds the socket, so even a run that dies on a port clash leaves
+        an empty database behind — and that empty file then blocked adoption
+        forever. Eligibility is therefore "absent **or empty**", so over-deferring
+        is safe: the next run heals the split instead of cementing it.
 
         Adoption sources, in order: the old filename in this directory (a dir
         that was itself migrated), then — only when this directory *is* the
-        canonical new default — the old default directory (a store stranded by
-        a pre-created target). Every rename is preceded by sidecar recovery
-        (c) and guarded by the live-serve check (d).
+        canonical new default — the old default directory (a store stranded by a
+        pre-created target). Every rename is preceded by sidecar recovery (c) and
+        guarded (i) by a pid check on the serve.json of the directory the rename
+        touches, not just the canonical legacy one.
         """
         db = self.data_dir / DB_FILENAME
         target_default, legacy_default = _default_base_pair()
         canonical = _same_path(self.data_dir, target_default)
         same_dir_old = self.data_dir / _LEGACY_DB_FILENAME
+        cross_old = legacy_default / _LEGACY_DB_FILENAME
 
-        if db.exists():
-            # f: split-store detection — a new store already exists but an old
-            # one is still around. We keep using the new one; say so loudly.
-            if same_dir_old.exists():
-                log.warning(
-                    "split store detected: %s and %s both exist; using %s",
-                    db, same_dir_old, db.name,
-                )
-            elif canonical and (legacy_default / _LEGACY_DB_FILENAME).exists():
-                log.warning(
-                    "split store detected: %s and %s both exist; using %s",
-                    db, legacy_default / _LEGACY_DB_FILENAME, db.name,
-                )
+        db_usable = db.exists() and not _is_empty_store(db)
+        if db_usable:
+            # f: split-store detection — this store has content but an old one is
+            # still around. We keep using this one; say so loudly.
+            for other in (same_dir_old, cross_old if canonical else None):
+                if other is not None and other.exists():
+                    log.warning(
+                        "split store detected: %s and %s both exist; using %s",
+                        db, other, db.name,
+                    )
+                    break
             return db
 
-        source = same_dir_old
-        if not source.exists() and canonical:
-            # b: adopt across directories — target was pre-created (empty), the
-            # legacy default still holds the store.
-            if _legacy_serve_alive(legacy_default):
-                log.warning(
-                    "db adoption deferred: a live serve still answers for %s",
-                    legacy_default,
-                )
-                return db
-            cross = legacy_default / _LEGACY_DB_FILENAME
-            if cross.exists():
-                source = cross
-        if not source.exists():
+        source = same_dir_old if same_dir_old.exists() else None
+        if source is None and canonical and cross_old.exists():
+            # b/g: adopt across directories — target was pre-created or left
+            # empty by a deferred run, the legacy default still holds the store.
+            source = cross_old
+        if source is None:
             return db
 
-        # d: an old serve using this very directory (race fallback landed us in
-        # the legacy dir) must not have its DB renamed out from under it.
-        if _same_path(self.data_dir, legacy_default) and _legacy_serve_alive(
-            legacy_default
-        ):
-            log.warning("using legacy store in place (live serve): %s", source)
-            return source
+        # i: whoever owns the directory we are about to write in must be dead.
+        # Not canonical-only: an arbitrary --data-dir can have its own serve.
+        for guarded in {source.parent, self.data_dir}:
+            if _serve_alive_in(guarded):
+                log.warning(
+                    "db adoption deferred: a serve is running for %s", guarded
+                )
+                return source if _same_path(source.parent, self.data_dir) else db
 
-        # c: recover under the original name before any rename.
+        # c/j: recover under the original name before any rename.
         if not _recover_sqlite_sidecars(source):
             if _same_path(source.parent, self.data_dir):
                 log.warning("db adoption blocked by sidecars; using %s in place", source)
                 return source
             log.warning("cross-dir db adoption skipped (sidecars remain): %s", source)
             return db
+
+        # g: an empty target file is debris from a deferred run — replace it.
+        if db.exists():
+            try:
+                db.unlink()
+                log.warning("replaced empty store %s with %s", db, source)
+            except OSError:
+                log.warning("could not remove empty store %s; leaving it in place", db)
+                return db
         try:
             source.rename(db)
         except OSError:
-            # e: re-check which side exists instead of assuming.
-            if source.exists() and _same_path(source.parent, self.data_dir):
-                log.warning("db adoption rename failed; using %s in place", source)
-                return source
+            # e: re-check which side exists instead of assuming either one.
+            if source.exists():
+                if _same_path(source.parent, self.data_dir):
+                    log.warning("db adoption rename failed; using %s in place", source)
+                    return source
+                log.warning("cross-dir db adoption rename failed; using %s", db)
+                return db
             log.warning("db adoption rename failed and source is gone; using %s", db)
             return db
         log.warning("snapshot store adopted: %s -> %s", source, db)

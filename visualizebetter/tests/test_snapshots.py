@@ -506,7 +506,13 @@ _json_values = st.one_of(
     st.integers(min_value=-(10**9), max_value=10**9),
     st.text(max_size=12),
 )
-_properties = st.dictionaries(_ids, _json_values, max_size=4)
+# 예약키(`_` 접두)는 제외한다: MCP 경계가 생성 시 이를 거부하므로([23-B]) 스냅샷
+# 라운드트립 불변식이 다뤄야 할 입력이 아니다. 제외하지 않으면 생성기가
+# {"_citations": None} 같은 상태를 만들어 cite() 가 그 위에서 터진다 — 그건 이
+# 테스트의 관심사가 아니라 core 생성 경로의 별도 이슈다.
+_properties = st.dictionaries(
+    _ids.filter(lambda k: not k.startswith("_")), _json_values, max_size=4
+)
 _tags = st.lists(st.text(min_size=1, max_size=8), max_size=3)
 
 
@@ -644,10 +650,12 @@ def test_store_prefers_existing_new_db_over_legacy(tmp_path):
 # --- [23-C] ★ 이관 하드닝 (Fable 확정 설계 a~f) — 적대 시나리오 고정 ---
 
 
-import http.server
 import logging
+import os
 import shutil
-import threading
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 from visualizebetter.graph import snapshots as snap_mod
@@ -670,26 +678,48 @@ def _real_sqlite(path: Path, marker: str = "gold") -> None:
     con.close()
 
 
-class _Serve200(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802 — http.server naming
-        body = b"{}"
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+def _store_db(path: Path, snapshots: int = 1) -> None:
+    """실제 스토어 모양 — [23-C] g 의 "빈 스토어" 판정 대상인 snapshot 테이블."""
+    con = sqlite3.connect(path)
+    con.executescript(snap_mod._SCHEMA)
+    for i in range(snapshots):
+        con.execute(
+            "INSERT INTO snapshot (id, name, description, created_at, kind,"
+            " node_count, edge_count, metadata, layers, version)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (f"s{i}", f"snap{i}", "", "2026-01-01T00:00:00Z", "manual", 0, 0, "{}", "[]", ""),
+        )
+    con.commit()
+    con.close()
 
-    def log_message(self, *args):  # silence test output
-        pass
+
+def _advertise(data_dir: Path, pid: int, **extra) -> Path:
+    """[8-D] serve.json 을 쓴다 — RN2 의 liveness 는 이 pid 만 본다."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    port_file = data_dir / snap_mod._PORT_FILE_NAME
+    payload = {"pid": pid, "port": 8765, "url": "http://127.0.0.1:8765", "token": None}
+    payload.update(extra)
+    port_file.write_text(json.dumps(payload), encoding="utf-8")
+    return port_file
 
 
 @pytest.fixture
-def live_serve():
-    server = http.server.HTTPServer(("127.0.0.1", 0), _Serve200)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{server.server_address[1]}"
-    server.shutdown()
-    thread.join(timeout=5)
+def live_pid():
+    """진짜 살아있는 프로세스의 pid (테스트 종료 시 정리)."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    time.sleep(0.3)
+    yield child.pid
+    child.kill()
+    child.wait(timeout=10)
+
+
+@pytest.fixture
+def dead_pid():
+    """확실히 종료된 프로세스의 pid — RN1 이 Windows 에서 살아있다고 오판하던 값."""
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=10)
+    time.sleep(0.2)
+    return child.pid
 
 
 def test_precreated_empty_target_adopts_legacy_db(canonical):
@@ -792,39 +822,288 @@ def test_race_loser_fallback_returns_target_when_legacy_vanished(tmp_path, monke
     assert snap_mod._migrate_legacy_dir(target, legacy) == target
 
 
-def test_live_legacy_serve_defers_all_migration(canonical, live_serve, caplog):
-    """(5) 살아있는 구 serve: dir·file 이관 전부 보류 + 경고 (d) — 결함 #2 재현.
-    serve 가 죽으면 다음 실행이 정상 이관한다."""
+def test_live_legacy_serve_defers_all_migration(canonical, live_pid, caplog):
+    """(5) 살아있는 구 serve: dir·file 이관 전부 보류 + 경고 (d/h) — 결함 #2 재현.
+    RN2: HTTP 프로브가 아니라 serve.json 의 pid 존재로 판정한다."""
     target, legacy = canonical
     legacy.mkdir(parents=True)
     _real_sqlite(legacy / snap_mod._LEGACY_DB_FILENAME)
-    (legacy / snap_mod._PORT_FILE_NAME).write_text(
-        json.dumps({"url": live_serve, "token": None}), encoding="utf-8"
-    )
+    _advertise(legacy, live_pid)
 
     with caplog.at_level(logging.WARNING, logger=snap_mod.log.name):
         store = SnapshotStore(target)
 
     assert legacy.exists()  # dir 이관 보류
     assert (legacy / snap_mod._LEGACY_DB_FILENAME).exists()  # DB 입양도 보류
+    assert (legacy / snap_mod._PORT_FILE_NAME).exists()  # 살아있으면 삭제하지 않는다
     assert store.db_path == target / DB_FILENAME
     assert not store.db_path.exists()
     assert "deferred" in caplog.text
 
 
-def test_dead_legacy_serve_json_does_not_block_migration(canonical):
-    """(5b) 죽은 serve 의 잔존 serve.json 은 이관을 막지 않는다 — 보류는 실제로
-    응답하는 프로세스에만 적용된다 (d)."""
+def test_dead_legacy_serve_json_does_not_block_migration(canonical, dead_pid):
+    """(5b) 죽은 serve 의 잔존 serve.json 은 이관을 막지 않고, stale 광고는 삭제된다.
+
+    ★ RN1 회귀 지점: Windows 에서 os.kill(pid,0) 은 종료된 pid 에도 예외를 던지지
+    않아 이 케이스를 영원히 alive 로 오판했다 (사망 증명 불가 → 보류 영구화)."""
     target, legacy = canonical
     legacy.mkdir(parents=True)
     _real_sqlite(legacy / snap_mod._LEGACY_DB_FILENAME)
-    # 닫힌 포트를 가리키는 낡은 advertisement
-    (legacy / snap_mod._PORT_FILE_NAME).write_text(
-        json.dumps({"url": "http://127.0.0.1:9", "token": None}), encoding="utf-8"
-    )
+    _advertise(legacy, dead_pid)
 
     store = SnapshotStore(target)
 
     assert not legacy.exists()
     assert store.db_path == target / DB_FILENAME
     assert store.db_path.exists()
+
+
+# --- [23-C] ★ RN2 2차 하드닝 (g~k) — 4렌즈 적대 검증이 확정한 결함 고정 ---
+
+
+def test_blocker_chain_deferred_run_leaves_empty_db_then_next_run_adopts(canonical, live_pid):
+    """(k1) ★ blocker end-to-end — RN1 이 놓친 체인 전체.
+
+    run1: 구 serve 가 살아있어 이관 보류 → 그럼에도 serve lifespan 의
+    initialize() 가 target 에 빈 DB 를 만든다 (uvicorn 은 bind 전에 lifespan 을
+    돌리므로 포트 충돌로 기동 실패해도 생성됨).
+    run2: 구 serve 사망 → RN1 이라면 `if db.exists()` 가 입양을 영구 차단했다.
+    RN2 (g) 는 "빈 스토어"도 입양 자격으로 보므로 legacy 데이터가 복원된다."""
+    target, legacy = canonical
+    legacy.mkdir(parents=True)
+    _store_db(legacy / snap_mod._LEGACY_DB_FILENAME, snapshots=3)  # 사용자의 gold
+    port_file = _advertise(legacy, live_pid)
+
+    # --- run 1: 보류 + lifespan initialize() 의 빈 DB 생성 ---
+    run1 = SnapshotStore(target)
+    assert run1.db_path == target / DB_FILENAME
+    run(run1.initialize())
+    assert run1.db_path.exists()  # 빈 DB 잔해가 생겼다
+    assert snap_mod._is_empty_store(run1.db_path)
+    assert (legacy / snap_mod._LEGACY_DB_FILENAME).exists()  # gold 는 아직 legacy 에
+
+    # --- run 2: 구 serve 사망 후 ---
+    port_file.unlink()  # serve 종료 시 광고 제거
+    run2 = SnapshotStore(target)
+
+    assert run2.db_path == target / DB_FILENAME
+    con = sqlite3.connect(run2.db_path)
+    try:
+        assert con.execute("SELECT count(*) FROM snapshot").fetchone()[0] == 3
+    finally:
+        con.close()
+    assert not (legacy / snap_mod._LEGACY_DB_FILENAME).exists()
+
+
+def test_empty_store_is_adoptable_but_populated_store_is_not(canonical):
+    """(k2) g 의 판정 경계 — 빈 스토어는 입양 대상, 내용이 있으면 보존된다."""
+    target, legacy = canonical
+    legacy.mkdir(parents=True)
+    _store_db(legacy / snap_mod._LEGACY_DB_FILENAME, snapshots=2)
+    target.mkdir(parents=True)
+    _store_db(target / DB_FILENAME, snapshots=0)  # 빈 잔해
+
+    store = SnapshotStore(target)
+    con = sqlite3.connect(store.db_path)
+    try:
+        assert con.execute("SELECT count(*) FROM snapshot").fetchone()[0] == 2
+    finally:
+        con.close()
+
+
+def test_populated_target_never_swallows_a_legacy_store(tmp_path, monkeypatch):
+    """(k2b) 반대 방향 — target 이 이미 채워져 있으면 legacy 를 삼키지 않는다."""
+    target = tmp_path / "visualizebetter"
+    legacy = tmp_path / "mcpgraph"
+    monkeypatch.setattr(snap_mod, "_default_base_pair", lambda: (target, legacy))
+    legacy.mkdir()
+    _store_db(legacy / snap_mod._LEGACY_DB_FILENAME, snapshots=1)
+    target.mkdir()
+    _store_db(target / DB_FILENAME, snapshots=5)
+
+    store = SnapshotStore(target)
+
+    con = sqlite3.connect(store.db_path)
+    try:
+        assert con.execute("SELECT count(*) FROM snapshot").fetchone()[0] == 5
+    finally:
+        con.close()
+    assert (legacy / snap_mod._LEGACY_DB_FILENAME).exists()  # 남의 것은 안 건드린다
+
+
+def test_unreadable_store_counts_as_populated(tmp_path):
+    """(k2c) g 는 fail-closed — 판정 실패(손상/스키마 없음)는 '비어있지 않음'.
+    반대로 판정하면 진짜 스토어를 입양이 지워버릴 수 있다."""
+    corrupt = tmp_path / "corrupt.sqlite3"
+    corrupt.write_bytes(b"not a database at all")
+    assert snap_mod._is_empty_store(corrupt) is False
+
+    no_schema = tmp_path / "noschema.sqlite3"
+    _real_sqlite(no_schema)  # 유효 DB 지만 snapshot 테이블 없음
+    assert snap_mod._is_empty_store(no_schema) is False
+
+    assert snap_mod._is_empty_store(tmp_path / "missing.sqlite3") is False
+
+
+def test_pid_liveness_alive_dead_and_stale_cleanup(tmp_path, live_pid, dead_pid):
+    """(k3) h — pid 존재로만 판정하고, 사망 확인 시 stale 광고를 제거한다."""
+    assert snap_mod._pid_alive(live_pid) is True
+    assert snap_mod._pid_alive(dead_pid) is False   # ★ os.kill 이 못 잡던 케이스
+    assert snap_mod._pid_alive(0) is False
+    assert snap_mod._pid_alive(-1) is False
+    assert snap_mod._pid_alive(os.getpid()) is True
+
+    alive_dir = tmp_path / "alive"
+    _advertise(alive_dir, live_pid)
+    assert snap_mod._serve_alive_in(alive_dir) is True
+    assert (alive_dir / snap_mod._PORT_FILE_NAME).exists()  # 살아있으면 보존
+
+    dead_dir = tmp_path / "dead"
+    port_file = _advertise(dead_dir, dead_pid)
+    assert snap_mod._serve_alive_in(dead_dir) is False
+    assert not port_file.exists()  # 사망 증명 → stale 광고 삭제
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 liveness 분기")
+def test_win32_liveness_branch(live_pid, dead_pid):
+    """(k3b) Windows 전용 — OpenProcess/WaitForSingleObject 매핑 실측 고정.
+    권한 거부(System, pid 4)는 'alive' 로 판정해야 한다 (존재하지만 못 엶)."""
+    assert snap_mod._win_pid_alive(live_pid) is True
+    assert snap_mod._win_pid_alive(dead_pid) is False
+    assert snap_mod._win_pid_alive(999_999) is False
+    assert snap_mod._win_pid_alive(4) is True
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"url": null, "pid": null}',
+        "not json at all {{{",
+        '{"url": "no-scheme-host", "pid": 1}',
+        '{"port": 8765}',
+        "[]",
+        "",
+    ],
+)
+def test_garbled_serve_json_never_crashes_startup(canonical, content):
+    """(k4) 결함 6 (RN1 회귀) — 어떤 serve.json 내용으로도 기동이 죽지 않는다.
+    RN1 은 url 을 try 밖에서 Request() 에 넘겨 ValueError 로 serve/CLI/proxy 를
+    전부 크래시시켰다. 파싱 불가 = dead 취급 + 이관은 정상 진행."""
+    target, legacy = canonical
+    legacy.mkdir(parents=True)
+    _real_sqlite(legacy / snap_mod._LEGACY_DB_FILENAME)
+    (legacy / snap_mod._PORT_FILE_NAME).write_text(content, encoding="utf-8")
+
+    store = SnapshotStore(target)  # 예외 없이 끝나야 한다
+
+    assert store.db_path == target / DB_FILENAME
+    assert store.db_path.exists()  # dead 취급이므로 이관 진행
+
+
+def test_custom_data_dir_same_dir_adoption_is_guarded(tmp_path, live_pid):
+    """(k5) 결함 5 — 임의 --data-dir 의 same-dir 입양도 그 디렉토리 serve.json 을
+    본다. RN1 은 canonical legacy 만 봐서 커스텀 dir 의 살아있는 serve 밑에서
+    DB 를 rename 해버렸다 (i 로 일반화)."""
+    custom = tmp_path / "my-graphs"
+    custom.mkdir()
+    old = custom / snap_mod._LEGACY_DB_FILENAME
+    _real_sqlite(old)
+    _advertise(custom, live_pid)
+
+    store = SnapshotStore(custom)
+
+    assert old.exists()          # 살아있는 serve 밑에서 rename 하지 않았다
+    assert store.db_path == old  # 구 이름 그대로 제자리 사용
+    assert not (custom / DB_FILENAME).exists()
+
+
+def test_cross_dir_adoption_is_guarded_by_the_destination_serve(canonical, live_pid, caplog):
+    """(k5b) i — 가드는 source 쪽만이 아니라 *쓰기가 일어나는* 디렉토리 전부.
+
+    cross-dir 입양은 legacy 에서 읽어 target 에 쓴다. target 에서 serve 가 돌고
+    있으면(그 serve 의 빈 DB 를 교체하게 되므로) 보류해야 한다 — source.parent
+    만 검사하면 이 경우가 통과해버린다."""
+    target, legacy = canonical
+    legacy.mkdir(parents=True)
+    _store_db(legacy / snap_mod._LEGACY_DB_FILENAME, snapshots=2)
+    target.mkdir(parents=True)
+    _store_db(target / DB_FILENAME, snapshots=0)  # 살아있는 serve 가 만든 빈 스토어
+    _advertise(target, live_pid)                  # ...그리고 그 serve 는 아직 살아있다
+
+    with caplog.at_level(logging.WARNING, logger=snap_mod.log.name):
+        store = SnapshotStore(target)
+
+    assert (legacy / snap_mod._LEGACY_DB_FILENAME).exists()  # 가져오지 않았다
+    assert store.db_path == target / DB_FILENAME
+    assert snap_mod._is_empty_store(store.db_path)           # 빈 채로 둔다
+    assert "deferred" in caplog.text
+
+
+def test_file_side_race_fallback_prefers_surviving_side(tmp_path, monkeypatch):
+    """(k6) file-side (e) 폴백 — RN1 에서 테스트가 0이라 뮤테이션이 생존했다.
+    rename 이 지고 source 도 사라졌으면 target 을, source 가 남아있으면(same-dir)
+    source 를 반환해야 한다."""
+    d = tmp_path / "data"
+    d.mkdir()
+    old = d / snap_mod._LEGACY_DB_FILENAME
+    _real_sqlite(old)
+
+    real_rename = Path.rename
+
+    def lose_and_vanish(self, destination):
+        if str(self) == str(old):
+            old.unlink()  # 경쟁자가 먼저 가져갔다
+            raise OSError("lost the race")
+        return real_rename(self, destination)
+
+    monkeypatch.setattr(Path, "rename", lose_and_vanish)
+    assert SnapshotStore(d).db_path == d / DB_FILENAME  # 사라진 source 말고 target
+
+    # source 가 살아남은 경우: 제자리 사용
+    d2 = tmp_path / "data2"
+    d2.mkdir()
+    old2 = d2 / snap_mod._LEGACY_DB_FILENAME
+    _real_sqlite(old2)
+
+    def lose_only(self, destination):
+        if str(self) == str(old2):
+            raise OSError("lost the race")
+        return real_rename(self, destination)
+
+    monkeypatch.setattr(Path, "rename", lose_only)
+    assert SnapshotStore(d2).db_path == old2
+
+
+def test_wal_sidecar_survival_is_fail_closed(tmp_path):
+    """(k7) j — -wal/-shm 이 복구 open 후에도 남으면 not-clean (rename 포기).
+
+    살아있는 WAL 연결을 실제로 붙잡아 재현한다 — 고아 -wal 파일을 그냥 놓아두면
+    SQLite 가 복구 open 중에 스스로 치워버려 이 위험을 재현하지 못한다. 지속되는
+    -wal 은 "다른 프로세스가 이 DB 를 쓰는 중"이라는 뜻이고, 그 밑에서 rename 하면
+    그 프로세스의 쓰기가 갈 곳을 잃는다."""
+    db = tmp_path / snap_mod._LEGACY_DB_FILENAME
+    holder = sqlite3.connect(db)
+    try:
+        holder.execute("PRAGMA journal_mode=WAL")
+        holder.execute("CREATE TABLE t (v TEXT)")
+        holder.execute("INSERT INTO t VALUES ('gold')")
+        holder.commit()
+        assert (tmp_path / (db.name + "-wal")).exists()  # 보유자가 잡고 있다
+
+        assert snap_mod._recover_sqlite_sidecars(db) is False
+
+        store = SnapshotStore(tmp_path)
+        assert store.db_path == db                     # rename 하지 않았다
+        assert not (tmp_path / DB_FILENAME).exists()
+    finally:
+        holder.close()
+
+
+def test_recover_never_creates_the_database(tmp_path):
+    """(k8) j — 소스가 없으면 즉시 False. RN1 은 sqlite3.connect 가 파일을 만들어
+    0-byte DB 를 남기고 clean 이라고 보고했다."""
+    missing = tmp_path / "gone.sqlite3"
+    (tmp_path / "gone.sqlite3-journal").write_bytes(b"orphan journal")
+
+    assert snap_mod._recover_sqlite_sidecars(missing) is False
+    assert not missing.exists()  # ★ 만들지 않았다
