@@ -10,6 +10,7 @@ import copy
 import functools
 import json
 import math
+from functools import lru_cache
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -420,58 +421,111 @@ def _accepts(annotation: str, value: Any) -> bool:
     return True
 
 
-MAX_VALUE_DEPTH = 32
-"""[13-B] CH1b — how deeply a stored value may nest.
+MAX_CALLER_VALUE_DEPTH = 32
+"""[13-B] CH1c — how deeply a value **the caller supplied** may nest.
 
-The trigger was a node with ~900 nested dicts in ``properties``. That is 1.9KB of
-ordinary JSON — far under the [5-E] 1MB import cap, reachable by any AI through
-``push_node``, ``push_batch`` or ``import_graph``, and needing no exotic Python
-type at all. The node committed, the caller was told the write had failed, and
-from then on **every** write path was dead: delete, cascade, update, re-push,
-cite and clear_all all die in ``history.touch()``'s ``deepcopy``. No tool could
-remove the node, so the store stayed broken for good.
+The trigger was a node with ~900 nested dicts in ``properties``: 1.9KB of
+ordinary JSON, far under the [5-E] 1MB import cap, reachable through
+``push_node``/``push_batch``/``import_graph`` and needing no exotic Python type.
+The node committed, the caller was told the write had failed, and from then on
+delete, cascade, update, re-push, cite and clear_all all died in
+``history.touch()``'s ``deepcopy``. No tool could remove it.
 
-32 because it is far past anything a real graph annotation needs (a deeply
-structured property is two or three levels) and far short of CPython's ~1000
-frame limit, leaving room for the recursive consumers stacked on top of it —
-``deepcopy`` in history, ``json.dumps`` in the wire encoder and the snapshot
-writer, ``asdict`` in ``to_dict``. Checked with an explicit stack rather than
-recursion, because the check must survive input the consumers cannot.
+★ CH1c — this cap applies to the caller's value **only**, never to the finished
+record. The server writes into the same ``properties`` map: one
+``update_node(reason="supersede")`` adds exactly **+4** levels (properties →
+``_superseded`` list → entry dict → ``prev`` → the archived value). Measuring the
+whole map therefore turned a value this gate had *accepted* on the way in into
+one the restore gate rejected on the way out — and since ``_superseded`` is
+reserved, ``remove`` is refused too, so the caller had no way back. Measured on
+2bdaca1: a depth-31 value saved fine and then failed to load, taking the whole
+snapshot with it. Records and restores use ``MAX_STRUCTURE_DEPTH`` instead.
+
+32 because the observed legitimate maximum is 5 (whole test suite and every
+documented example), while the fatal region is far above: depth 402 still
+creates, saves, loads and deletes correctly, and 502 is where history's deepcopy
+starts raising RecursionError. So 32 is 6× real usage and 1/14 of the danger —
+with room for the +4 the server adds on top.
+"""
+
+MAX_STRUCTURE_DEPTH = 128
+"""[13-B] CH1c — the hard structural ceiling for a whole record.
+
+What ``MAX_CALLER_VALUE_DEPTH`` is to intent, this is to survival: past it the
+recursive consumers stacked on a record (``deepcopy`` in history, ``json.dumps``
+in the wire encoder and snapshot writer, ``asdict`` in ``to_dict``) start to fail,
+and a record that cannot be copied cannot be deleted either. It sits four times
+above the caller cap so the server's own bookkeeping can never push an accepted
+value past it, and well under the ~500 where the first real failure was measured.
+
+This is the only depth a **restore** rejects on. A snapshot that opens today has
+to keep opening ([13-B] CH1c C): policy limits produce a quarantine warning, not
+a refusal.
+"""
+
+MAX_CALLER_PROPERTIES_BYTES = 32 * 1024
+"""[13-B] CH1c — serialised ceiling for the ``properties`` map a caller supplies.
+
+Half of ``MAX_VALUE_BYTES``, and the gap is the point: the server's own reserved
+arrays live in the same map and are bounded separately (``_citations`` 100 entries
+≈ 15.5KB, ``_provenance`` 50, ``_superseded`` 10). Measured with all three at
+their caps: ~20KB of bookkeeping. Charging that against the caller's budget is
+what turned a legitimate node into one that could no longer be cited — and
+``cite()`` refuses rather than evicts ([13-B] CH1), while ``_citations`` is
+reserved so the AI cannot free a slot either. Leaving 32KB of headroom means the
+server can always finish recording what it owes.
 """
 
 MAX_VALUE_BYTES = 64 * 1024
-"""[13-B] CH1b — serialised ceiling for one record's incoming values.
+"""[13-B] CH1b — serialised ceiling for one whole record.
 
 [23-B] already bounds a Finding this way (title 1024, body 16384, superseded
 16KB); nodes and edges had no equivalent, so ``properties`` was unbounded in size
 as well as in depth. 64KB is deliberately loose — four times the finding-body cap
 — because this is a structural backstop, not a style rule: it exists so that one
-record cannot on its own exhaust the [5-E] 1MB import budget or dwarf the [5]
-50KB read budget, and anything near it is already a design mistake the AI should
-hear about at the door rather than at snapshot time.
+record cannot on its own exhaust the [5-E] 1MB import budget.
+
+It exceeds the [5] 50KB response budget on purpose. A 50–64KB record stores but
+does not fit in a ``get_node``/``list_nodes`` reply — that mismatch is a *read
+shape* problem ("a list row carries whole reserved arrays"), tracked in the [5-B]
+backlog. Lowering this instead would collide with ``MAX_CITATIONS_ENTRIES = 100``,
+which we sized deliberately.
 """
 
-
-def _check_depth(value: Any, field_name: str) -> None:
-    """[13-B] CH1b — bound nesting without recursing.
+def _check_depth(value: Any, field_name: str, limit: int) -> None:
+    """[13-B] CH1b/CH1c — bound nesting without recursing.
 
     An explicit stack, because the whole point is to reject values that would
     blow the stack of everything downstream; a recursive checker would be the
     first casualty. The depth cap also bounds cycles for free — a self-referential
-    dict reaches the limit in ``MAX_VALUE_DEPTH`` steps instead of looping.
+    dict reaches the limit in ``limit`` steps instead of looping.
+
+    ``limit`` is the caller's cap at the live doors and the structural cap on a
+    whole record ([13-B] CH1c A) — the same walk, two different questions.
     """
     stack: list[tuple[Any, int]] = [(value, 0)]
     while stack:
         current, depth = stack.pop()
-        if depth > MAX_VALUE_DEPTH:
+        if depth > limit:
             raise ValueError(
-                f"field {field_name!r} nests deeper than {MAX_VALUE_DEPTH} levels;"
+                f"field {field_name!r} nests deeper than {limit} levels;"
                 " such a value cannot be copied, serialised or snapshotted ([13-B])"
             )
         if type(current) is dict:
             stack.extend((item, depth + 1) for item in current.values())
         elif type(current) is list:
             stack.extend((item, depth + 1) for item in current)
+
+
+@lru_cache(maxsize=None)
+def _declared_types(cls: type) -> tuple[tuple[str, str], ...]:
+    """[13-B] CH1c — ``{field: annotation}`` per class, built once.
+
+    ``dataclasses.fields()`` rebuilds its tuple on every call (~0.95us), which the
+    gate then pays once per record on the bulk paths. The mapping is fixed at
+    class-definition time, so caching it is free correctness-wise.
+    """
+    return tuple((f.name, f.type) for f in fields(cls))
 
 
 def _as_stored_list(value: Any) -> Any:
@@ -498,6 +552,29 @@ def _as_stored_dict(value: Any) -> Any:
     if value is None:
         return {}
     return dict(value) if type(value) is dict else value
+
+
+def normalise_stored(cls: type, values: dict[str, Any]) -> dict[str, Any]:
+    """[13-B] CH1c D — an ``int`` accepted by a ``float`` field is stored as a float.
+
+    The acceptance itself is deliberate and load-bearing: ``push_node``/
+    ``push_edge``/``record_finding`` go through pydantic, which coerces int→float
+    in lax mode, but ``push_batch`` validates ``_EdgeSpecBounds`` and then hands
+    ``add_edge`` the **raw** spec, and ``import_graph`` hands over raw JSON. So
+    ``weight=7`` and ``confidence=1`` really do reach the record as ints.
+
+    What was missing was normalisation. SQLite's REAL column turns 7 into 7.0, so
+    the in-memory graph and the same graph after a save/load round trip held
+    different types — and ``/graph.json`` served ``7`` before a restart and ``7.0``
+    after one, for a value nobody changed. Normalising at the door makes the
+    round trip an identity, which is what every diffing client assumes.
+    """
+    declared = dict(_declared_types(cls))
+    out = dict(values)
+    for name, value in values.items():
+        if declared.get(name) == "float" and type(value) is int:
+            out[name] = float(value)
+    return out
 
 
 def check_storable(cls: type, values: dict[str, Any]) -> None:
@@ -534,7 +611,28 @@ def check_storable(cls: type, values: dict[str, Any]) -> None:
     in, so the record as a whole stays serialisable by induction — and an update
     then costs one small dict, not a full re-serialisation of the node.
     """
-    declared = {f.name: f.type for f in fields(cls)}
+    _walk_values(cls, values, depth_limit=MAX_CALLER_VALUE_DEPTH)
+
+    properties = values.get("properties")
+    if type(properties) is dict:
+        # [13-B] CH1c B — the caller's half of the map, measured on its own. The
+        # server's reserved arrays share this dict and are capped separately; if
+        # they counted against the caller, a legitimate node would eventually
+        # refuse the cite() that CH1 deliberately made a refusal rather than an
+        # eviction — and, `_citations` being reserved, the AI could not free a
+        # slot either. It would have nowhere to put evidence and no way to say so.
+        _encode_or_raise(
+            {"properties": properties},
+            MAX_CALLER_PROPERTIES_BYTES,
+            "the caller-supplied properties",
+        )
+
+    _encode_or_raise(values, MAX_VALUE_BYTES, "record")
+
+
+def _walk_values(cls: type, values: dict[str, Any], *, depth_limit: int) -> None:
+    """Per-field checks shared by the live gate and the restore gate."""
+    declared = dict(_declared_types(cls))
     for name, value in values.items():
         annotation = declared.get(name)
         if annotation is None:
@@ -546,34 +644,218 @@ def check_storable(cls: type, values: dict[str, Any]) -> None:
             )
         if not _accepts(annotation, value):
             raise ValueError(
-                f"field {name!r} expects {annotation}, got {_describe(value)}"
-                " ([5-A])"
+                f"field {name!r} expects {annotation}, got"
+                f" {_describe(value, annotation)} ([5-A])"
             )
         if type(value) is float and not math.isfinite(value):
             raise ValueError(
                 f"field {name!r} must be a finite number, got {value!r};"
                 " NaN and Infinity have no JSON form ([13-B])"
             )
-        _check_depth(value, name)
+        # [13-B] CH1c — only containers can nest, and skipping the ~1.7us call on
+        # every scalar is most of the gate's cost on the bulk paths.
+        if type(value) in (dict, list):
+            _check_depth(value, name, depth_limit)
 
+
+def _encode_or_raise(payload: dict[str, Any], limit: int, what: str) -> bytes:
+    """[13-B] CH1b gate (5) — serialise exactly as the store will, or refuse.
+
+    ``json.dumps(ensure_ascii=False, allow_nan=False).encode("utf-8")`` is the
+    call the snapshot writer, the [8-C] wire and ``export_graph`` all make, so
+    whatever fails here could never have been stored anywhere.
+
+    [13-B] CH1c E — the raw exception never escapes. ``UnicodeEncodeError`` says
+    "position 23" and ``ValueError`` says "Circular reference detected"; neither
+    names a field, and neither is something the three update tools translate into
+    a ``ToolError``. The message is rebuilt with the offending field and key path.
+    """
     try:
-        encoded = json.dumps(values, ensure_ascii=False, allow_nan=False).encode("utf-8")
-    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as exc:
+        where = _locate_unstorable(payload)
         raise ValueError(
-            f"value cannot be stored: {exc} ([13-B]). It would fail the same way in"
-            " save_snapshot, on the [8-C] wire and in export_graph, so it is"
-            " refused here where nothing has changed yet."
+            f"value cannot be stored: {exc}{where} ([13-B]). It would fail the"
+            " same way in save_snapshot, on the [8-C] wire and in export_graph,"
+            " so it is refused here where nothing has changed yet."
         ) from None
-    if len(encoded) > MAX_VALUE_BYTES:
+    if len(encoded) > limit:
         raise ValueError(
-            f"record is {len(encoded)} bytes serialised, over the"
-            f" {MAX_VALUE_BYTES} limit ([13-B])"
+            f"{what} is {len(encoded)} bytes serialised, over the {limit} limit"
+            " ([13-B])"
         )
+    return encoded
 
 
-def _describe(value: Any) -> str:
-    """Name the *exact* type, so a subclass refusal does not read as a puzzle."""
+def _locate_unstorable(payload: Any) -> str:
+    """Best-effort key path to the value that broke serialisation ([13-B] CH1c E).
+
+    Re-serialises one branch at a time to find the first that fails, so the error
+    can say ``at properties.snippet`` instead of leaving the caller to bisect a
+    record by hand. Bounded by ``MAX_STRUCTURE_DEPTH`` so the search cannot become
+    the thing it is diagnosing; returns "" when it cannot narrow things down.
+    """
+
+    def probe(value: Any) -> bool:
+        try:
+            json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    path: list[str] = []
+    current = payload
+    for _ in range(MAX_STRUCTURE_DEPTH):
+        if type(current) is dict:
+            nxt = next(((k, v) for k, v in current.items() if not probe(v)), None)
+        elif type(current) is list:
+            nxt = next(
+                ((str(i), v) for i, v in enumerate(current) if not probe(v)), None
+            )
+        else:
+            break
+        if nxt is None:
+            break
+        path.append(nxt[0])
+        current = nxt[1]
+    return f" at {'.'.join(path)}" if path else ""
+
+
+_INDEX_FIELDS: dict[str, frozenset[str]] = {
+    "Node": frozenset({"id", "type"}),
+    "Edge": frozenset({"source", "target", "relation", "key"}),
+    "Finding": frozenset({"finding_id"}),
+}
+"""[13-B] CH1c C — the fields a restore may **not** compromise on.
+
+These are what the record is found by: dict keys, index buckets, edge identity.
+A wrong type here is not a policy question — the graph cannot be summarised,
+sorted, deleted or snapshotted afterwards, which is the corruption CH1 existed to
+prevent. Everything else is data we may dislike but must still hand back.
+"""
+
+
+def check_restorable(cls: type, values: dict[str, Any]) -> list[str]:
+    """[13-B] CH1c C — the restore gate, layered. Returns quarantine notes.
+
+    Fail-closed was right for the live doors and wrong here, and the difference is
+    that a restore has **no way out**. CLI export and CLI import both go through
+    ``_latest_graph`` → ``load_snapshot``, and there is no snapshot editor or
+    repair tool, so a snapshot this gate refuses is data with no remaining exit
+    from the product. In a project whose reason for existing is keeping gold,
+    "gold you cannot open" is the worst outcome available.
+
+    Measured on the shipped build: nodes carrying a 92KB snippet, depth-40
+    properties, 200KB or 2MB properties, ``tags=[1]``, or a NaN *inside*
+    properties all save and load correctly **today**, and CH1b's gate would have
+    refused every one of them — the whole snapshot, not the row. Meanwhile the
+    genuinely fatal values (a surrogate anywhere, a NaN weight) never reach disk
+    at all, because ``save_snapshot`` dies on them first. So the violations a
+    restore actually meets are policy ones.
+
+    Hence two tiers:
+
+    * **Refused** — identity and serialisability only: a non-exact type in an
+      index field (CH1's ``type=None`` among them), a non-finite float field, a
+      record ``json.dumps`` cannot encode, and structural depth past
+      ``MAX_STRUCTURE_DEPTH``. Each of these makes the loaded graph unusable or
+      undeletable, so loading it would only move the failure somewhere less
+      explicable.
+    * **Quarantined** — every policy limit: size, depth 33..127, element types on
+      non-index fields. The row loads unchanged (we do not edit the user's data)
+      and the caller is told, loudly and durably.
+
+    The acceptance rule this encodes: *no snapshot that opens today stops opening
+    because of CH1c.*
+    """
+    notes: list[str] = []
+    declared = dict(_declared_types(cls))
+    index_fields = _INDEX_FIELDS.get(cls.__name__, frozenset())
+
+    for name, value in values.items():
+        annotation = declared.get(name)
+        if annotation is None or annotation not in _FIELD_TYPES:
+            continue
+        if not _accepts(annotation, value):
+            detail = (
+                f"field {name!r} expects {annotation},"
+                f" got {_describe(value, annotation)}"
+            )
+            if name in index_fields:
+                raise ValueError(detail + " — the record cannot be indexed ([5-A])")
+            notes.append(detail)
+        if type(value) is float and not math.isfinite(value):
+            raise ValueError(
+                f"field {name!r} is {value!r}, which has no JSON form ([13-B])"
+            )
+        if type(value) in (dict, list):
+            _check_depth(value, name, MAX_STRUCTURE_DEPTH)
+            over = _depth_over(value, MAX_CALLER_VALUE_DEPTH)
+            if over:
+                notes.append(
+                    f"field {name!r} nests {over} levels, over the"
+                    f" {MAX_CALLER_VALUE_DEPTH} a caller may supply"
+                )
+
+    # ★ Serialisability is asked in two steps here, unlike at the live doors.
+    # `allow_nan=True` is what today's snapshot writer actually uses, so it is the
+    # honest test of "did this round-trip before CH1c": a NaN *inside* properties
+    # is written as a bare `NaN` token and read back by json.loads, which is how
+    # such a node exists on disk at all. Refusing it would break the acceptance
+    # rule. What cannot survive any encoder — surrogates, cycles, unknown types —
+    # still refuses, because the loaded graph could not be re-saved or served.
+    try:
+        encoded = json.dumps(values, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as exc:
+        raise ValueError(
+            f"record cannot be serialised at all: {exc}{_locate_unstorable(values)}"
+            " ([13-B]) — a graph holding it could not be saved or served again"
+        ) from None
+    try:
+        json.dumps(values, ensure_ascii=False, allow_nan=False)
+    except ValueError:
+        notes.append(
+            "holds a non-finite number (NaN/Infinity) below the field level;"
+            " it has no JSON form and reaches the [8-C] wire as a bare token"
+        )
+    if len(encoded) > MAX_VALUE_BYTES:
+        notes.append(
+            f"record is {len(encoded)} bytes serialised, over the"
+            f" {MAX_VALUE_BYTES} limit"
+        )
+    return notes
+
+
+def _depth_over(value: Any, limit: int) -> int:
+    """Actual depth when it exceeds ``limit``, else 0 — for the warning text."""
+    deepest = 0
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        deepest = max(deepest, depth)
+        if type(current) is dict:
+            stack.extend((item, depth + 1) for item in current.values())
+        elif type(current) is list:
+            stack.extend((item, depth + 1) for item in current)
+    return deepest if deepest > limit else 0
+
+
+def _describe(value: Any, annotation: str | None = None) -> str:
+    """Name the *exact* type, so a subclass refusal does not read as a puzzle.
+
+    [13-B] CH1c E — for a list field it also points at the first offending
+    element, because "expects list[str], got list" tells the caller nothing about
+    which entry to fix.
+    """
     name = type(value).__name__
+    element = _ELEMENT_TYPES.get(annotation or "")
+    if element is not None and type(value) is list:
+        for index, item in enumerate(value):
+            if type(item) is not element:
+                return (
+                    f"{name} whose element [{index}] is"
+                    f" {_describe(item)} (expected {element.__name__})"
+                )
     for base in (str, int, float, list, dict):
         if type(value) is not base and isinstance(value, base):
             return f"{name} (a {base.__name__} subclass)"
@@ -730,6 +1012,7 @@ def _apply_patch(
     updates = patch.get("set") or {}
     removals = patch.get("remove") or []
 
+    updates = normalise_stored(type(target), updates)  # [13-B] CH1c D
     for name, value in updates.items():
         if name == "properties":
             target.properties.update(value)
@@ -801,6 +1084,30 @@ def _trim_by_count(archive: list[dict[str, Any]], cap: int) -> None:
         del archive[:excess]
 
 
+MAX_NODE_SUPERSEDED_BYTES = 16384
+"""[13-B] CH1c B — the byte cap a node's ``_superseded`` was missing.
+
+``MAX_SUPERSEDED_ENTRIES`` bounded the count only, and an entry's ``prev`` is as
+large as the value it archives. Measured: ten supersedes of a ~32KB property
+produce a 323,555 B archive and a 356KB record — five times the whole-record
+ceiling, in every snapshot and every wire payload, built entirely through
+supported calls. ``Finding`` has had the equivalent cap since [24-C]; a node
+carrying arbitrary ``properties`` needed it more, not less.
+
+Same value as ``MAX_FINDING_SUPERSEDED_BYTES``, and FIFO rather than refusal for
+the same reason CH1 gave: this is the **server's** bookkeeping, so what is lost is
+log resolution. (Refusal is for what the AI authored — ``_citations``,
+``Finding.evidence``.)
+"""
+
+
+def _trim_node_archive(archive: list[dict[str, Any]]) -> None:
+    """[13-B] CH1c B — bound a node's supersession log by count and by size."""
+    _trim_by_count(archive, MAX_SUPERSEDED_ENTRIES)
+    while len(archive) > 1 and _serialized_bytes(archive) > MAX_NODE_SUPERSEDED_BYTES:
+        archive.pop(0)
+
+
 def _trim_finding_archive(archive: list[dict[str, Any]]) -> None:
     """[24-C] finding 이력 — bound by serialized size, not just count.
 
@@ -869,6 +1176,13 @@ class Graph:
         self.version: str = ""
         self.dirty: bool = False
         self._mutations: int = 0  # [13-B] CH1(3) - dirty-flag epoch, see clear_dirty
+        self.restore_quarantine: list[str] = []
+        """[13-B] CH1c C — policy violations tolerated by the last restore.
+
+        Not a dataclass field and never persisted: it describes *this load*, not
+        the graph. load_snapshot fills it and the [5-E] tool reports it, so a
+        snapshot that opened with warnings says so instead of opening quietly.
+        """
         self.events = EventBus()
         self.indices = Indices()
         # [M2e] undo/redo command history — owned by Graph Core, the single owner
@@ -1195,7 +1509,7 @@ class Graph:
                 return patch
             archive = target.properties.setdefault(SUPERSEDED_PROPERTY, [])
             archive.append(_history_entry(previous, by))
-            _trim_by_count(archive, MAX_SUPERSEDED_ENTRIES)
+            _trim_node_archive(archive)  # [13-B] CH1c B — count *and* bytes
             extra[SUPERSEDED_PROPERTY] = copy.deepcopy(archive)
         else:  # REASON_CORRECTION — [24-B] 틀린 값은 버린다.
             log = target.properties.setdefault(PROVENANCE_PROPERTY, [])
@@ -1434,6 +1748,7 @@ class Graph:
             self.events.publish(EDGE_ADD, existing.to_dict())
             return existing
 
+        weight = float(weight) if type(weight) is int else weight  # [13-B] CH1c D
         edge = Edge(
             source=source,
             target=target,
@@ -1563,6 +1878,7 @@ class Graph:
             "tags": _as_stored_list(tags), "layer": layer, "created_by": created_by,
         })
         now = _now()
+        confidence = float(confidence) if type(confidence) is int else confidence
         finding = Finding(
             finding_id=str(uuid.uuid4()),
             title=title,

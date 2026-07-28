@@ -38,6 +38,7 @@ from visualizebetter.graph.core import (
     Graph,
     Node,
     _now,
+    check_restorable,
     check_storable,
 )
 
@@ -876,27 +877,60 @@ def _sizing_payload(graph: Graph) -> dict[str, Any]:
     }
 
 
+def _report_quarantine(
+    data_dir: Path, target_db: Path, snapshot_id: str, quarantine: list[str]
+) -> None:
+    """[13-B] CH1c C — a quarantined load must not be a quiet one.
+
+    The row is handed back unchanged, so the only thing standing between the user
+    and a silent surprise is this report. It goes where RN5 HH already established
+    migration reporting has to go — a file we own, not a ``log.warning``, because
+    both shipped forms throw stderr away (the proxy spawns serve with
+    ``stderr=DEVNULL``, the Tauri shell drops the sidecar's output receiver).
+    """
+    log.warning(
+        "snapshot %s loaded with %d quarantined record(s): %s",
+        snapshot_id,
+        len(quarantine),
+        "; ".join(quarantine[:5]),
+    )
+    parts = "\t".join(
+        (_now(), "quarantine", f"snapshot={snapshot_id}", f"count={len(quarantine)}")
+    )
+    line = parts + "\t" + " | ".join(quarantine) + "\n"
+    try:
+        with open(data_dir / _MIGRATION_LOG_NAME, "a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError:
+        pass
+
+
 def _check_restored(
     cls: type, record: Any, kind: str, identity: Any, snapshot_id: str
-) -> None:
-    """[13-B] CH1(3 개정) — the value contract, applied to rows coming off disk.
+) -> list[str]:
+    """[13-B] CH1c C — the restore gate. Returns quarantine notes, refuses rarely.
 
-    ``check_new_record`` refuses the same values here that ``add_node``/``add_edge``
-    refuse on the way in, so a snapshot written before that contract existed
-    cannot smuggle them back. The error names the snapshot and the row because a
-    refusal the operator cannot act on is barely better than the corruption.
+    CH1b applied the live gate here, and that was wrong in a way only measurement
+    showed: a snapshot written by the shipped build with a 92KB snippet, depth-40
+    properties or ``tags=[1]`` opens today and would have stopped opening — the
+    whole snapshot, for one row. With no snapshot editor and both CLI export and
+    CLI import going through ``load_snapshot``, that data would have had no exit
+    from the product at all.
+
+    So ``check_restorable`` refuses only what makes the loaded graph unusable
+    (identity fields, non-finite float fields, unencodable records, depth past
+    ``MAX_STRUCTURE_DEPTH``) and reports everything else. The row loads unchanged.
     """
     values = {f.name: getattr(record, f.name) for f in fields(cls)}
     try:
-        # [13-B] CH1b — the same storability gate the live doors use, so a row
-        # written before it existed cannot walk back in through the restore.
-        check_storable(cls, values)
+        notes = check_restorable(cls, values)
     except ValueError as exc:
         raise ValueError(
             f"snapshot {snapshot_id} cannot be loaded: {kind} {identity!r} is invalid"
-            f" — {exc}. It was written before the [13-B] value contract existed;"
-            " the snapshot is left untouched."
+            f" — {exc}. Loading it would leave a graph that cannot be summarised,"
+            " snapshotted or deleted."
         ) from None
+    return [f"{kind} {identity!r}: {note}" for note in notes]
 
 
 class SnapshotStore:
@@ -1161,6 +1195,7 @@ class SnapshotStore:
                 raise KeyError(snapshot_id)
 
             graph = Graph()
+            quarantine: list[str] = []
             graph.metadata = json.loads(header["metadata"])
             graph.layers = json.loads(header["layers"])
             graph.version = header["version"]
@@ -1184,7 +1219,9 @@ class SnapshotStore:
                         updated_at=row["updated_at"],
                         created_by=row["created_by"],
                     )
-                    _check_restored(Node, node, "node", node.id, snapshot_id)
+                    quarantine.extend(
+                        _check_restored(Node, node, "node", node.id, snapshot_id)
+                    )
                     graph.indices.add_node(node)  # index first, as add_node does
                     graph.nodes[node.id] = node
 
@@ -1208,7 +1245,9 @@ class SnapshotStore:
                         created_by=row["created_by"],
                     )
                     identity: EdgeKey = edge.identity
-                    _check_restored(Edge, edge, "edge", identity, snapshot_id)
+                    quarantine.extend(
+                        _check_restored(Edge, edge, "edge", identity, snapshot_id)
+                    )
                     graph.indices.add_edge(identity, edge)  # index first
                     graph.edges[identity] = edge
 
@@ -1233,8 +1272,19 @@ class SnapshotStore:
                         _superseded=json.loads(row["superseded"]),
                         _provenance=json.loads(row["provenance"]),
                     )
+                    # [13-B] CH1c E — findings were the one restored record with
+                    # no gate at all; a Finding is gold, so it is the last place
+                    # to skip the check.
+                    quarantine.extend(
+                        _check_restored(
+                            Finding, finding, "finding", finding.finding_id, snapshot_id
+                        )
+                    )
                     graph.findings[finding.finding_id] = finding
 
+        if quarantine:
+            _report_quarantine(self.data_dir, self.db_path, snapshot_id, quarantine)
+        graph.restore_quarantine = quarantine
         return graph
 
     @staticmethod

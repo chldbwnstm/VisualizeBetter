@@ -18,6 +18,8 @@ from hypothesis import strategies as st
 
 from visualizebetter.graph.core import (
     CITATIONS_PROPERTY,
+    Node,
+    check_restorable,
     MAX_FINDING_BODY_CHARS,
     MAX_FINDING_EVIDENCE,
     MAX_FINDING_NODE_IDS,
@@ -32,6 +34,7 @@ from visualizebetter.graph.snapshots import (
     AutoSnapshotter,
     DB_FILENAME,
     SnapshotStore,
+    _apply_schema,
     _dumps,
     _sizing_payload,
     _snapshot_payload,
@@ -2359,3 +2362,204 @@ def test_a_replace_import_stays_dirty_until_a_snapshot_takes_it(tmp_path):
 
     sizes = run(scenario())
     assert 50 in sizes, f"임포트 결과가 어떤 스냅샷에도 없다 (있는 것: {sizes})"
+
+
+# --- [13-B] CH1c C — 오늘 열리는 스냅샷은 계속 열린다 ---
+
+
+def _nest_props(depth):
+    value = {"leaf": 1}
+    for _ in range(depth):
+        value = {"n": value}
+    return value
+
+
+def _plant_node(store, node_row):
+    """CH1c C — 현행 배포본이 **실제로 쓰는** 그대로 한 행을 심는다.
+
+    게이트를 거치지 않고 SQLite 에 직접 쓴다: 이 값들은 CH1b 이전 빌드가 정상적으로
+    저장하던 것이고, 재현의 요점이 '이미 디스크에 있는 스냅샷' 이기 때문이다."""
+    snapshot_id = "s-legacy"
+    conn = sqlite3.connect(store.db_path)
+    try:
+        _apply_schema(conn)
+        conn.execute(
+            "INSERT INTO snapshot (id, name, description, created_at, kind,"
+            " node_count, edge_count, metadata, layers, version)"
+            " VALUES (?, 'legacy', '', '2026-01-01T00:00:00Z', 'manual', 1, 0, '{}', '[]', 1)",
+            (snapshot_id,),
+        )
+        conn.execute(
+            'INSERT INTO node (snapshot_id, id, label, "type", properties, parent_id,'
+            " style_hint, position_hint, layer, ttl, tags, created_at, updated_at,"
+            " created_by) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, ?,"
+            " '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', NULL)",
+            (snapshot_id, node_row["id"], node_row["label"], node_row["type"],
+             node_row["properties"], node_row["tags"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return snapshot_id
+
+
+_TOLERATED = [
+    pytest.param({"properties": json.dumps({"snippet": "x" * 92_000}), "tags": "[]"},
+                 "92KB", id="92kb-snippet"),
+    pytest.param({"properties": json.dumps(_nest_props(38)), "tags": "[]"},
+                 "깊이 40", id="depth-40"),
+    pytest.param({"properties": json.dumps({"snippet": "x" * 200_000}), "tags": "[]"},
+                 "200KB", id="200kb"),
+    pytest.param({"properties": "{}", "tags": "[1]"}, "tags=[1]", id="tags-int"),
+    pytest.param({"properties": '{"n": NaN}', "tags": "[]"},
+                 "properties 내부 NaN", id="nan-in-properties"),
+]
+
+
+@pytest.mark.parametrize(("overrides", "what"), _TOLERATED)
+def test_a_snapshot_that_opens_today_keeps_opening(store, tmp_path, overrides, what):
+    """(CH1c C) ★ 인수 기준 — CH1c 도입으로 **열리지 않게 되는 스냅샷은 없다**.
+
+    CH1b 는 복원에도 라이브 게이트를 걸었고, 그러면 위 5종이 전부 '스냅샷 전체'
+    로드 실패가 된다(한 행 때문에). 결정적으로 **출구가 없다**: CLI export 도 CLI
+    import 도 `_latest_graph` → load_snapshot 을 지나므로, 거부된 스냅샷은 제품
+    안에 데이터를 꺼낼 경로가 하나도 없다. gold 보존이 존재 이유인 프로젝트에서
+    '열 수 없는 gold' 는 최악의 결과다."""
+    row = {"id": "n", "label": "N", "type": "class", **overrides}
+    snapshot_id = _plant_node(store, row)
+
+    # (a) 로드 성공
+    loaded = run(store.load_snapshot(snapshot_id))
+    assert "n" in loaded.nodes, f"{what} 스냅샷이 열리지 않았다"
+
+    # (b) 경고·quarantine 보고가 존재한다 (조용하면 안 된다)
+    assert loaded.restore_quarantine, f"{what} 가 조용히 통과했다"
+    assert "node 'n'" in loaded.restore_quarantine[0]
+    log = (store.data_dir / "migration.log").read_text(encoding="utf-8")
+    assert "quarantine" in log and snapshot_id in log
+
+    # (c) 이후 요약·정렬·저장·export 가 정상
+    assert loaded.indices.by_type["class"] == {"n"}
+    assert sorted(loaded.nodes) == ["n"]
+    again = run(store.save_snapshot(loaded, name="round-trip"))
+    assert again["size"] > 0
+    assert "n" in run(store.load_snapshot(again["snapshot_id"])).nodes
+
+
+def test_a_row_that_cannot_be_indexed_is_still_a_hard_refusal(tmp_path):
+    """(CH1c C) 계층화가 '전부 통과'가 되면 안 된다. 정체성 필드가 깨진 행은
+    로드된 그래프를 요약·저장·삭제 불가로 만들므로 여전히 거부하고, 에러는 어느
+    행이 왜인지 말한다.
+
+    현행 스키마는 ``type TEXT NOT NULL`` 이라 NULL 을 못 넣지만
+    ``CREATE TABLE IF NOT EXISTS`` 라 제약 이전 스키마 스토어는 그대로 남는다 —
+    그 형태를 실제로 만들어 재현한다(CH1 과 같은 방식)."""
+    data_dir = tmp_path / "legacy-index"
+    data_dir.mkdir()
+    conn = sqlite3.connect(data_dir / DB_FILENAME)
+    conn.executescript(
+        """
+        CREATE TABLE snapshot (id TEXT PRIMARY KEY, name TEXT, description TEXT,
+            created_at TEXT, kind TEXT, node_count INT, edge_count INT,
+            metadata TEXT, layers TEXT, version INT);
+        CREATE TABLE node (snapshot_id TEXT, id TEXT, label TEXT, "type" TEXT,
+            properties TEXT, parent_id TEXT, style_hint TEXT, position_hint TEXT,
+            layer TEXT, ttl INT, tags TEXT, created_at TEXT, updated_at TEXT,
+            created_by TEXT, PRIMARY KEY (snapshot_id, id));
+        INSERT INTO snapshot VALUES ('s1','legacy','','2026-01-01T00:00:00Z',
+            'manual',1,0,'{}','[]',1);
+        INSERT INTO node VALUES ('s1','n','N',NULL,'{}',NULL,NULL,NULL,NULL,0,'[]',
+            '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SnapshotStore(data_dir)
+    with pytest.raises(ValueError, match="cannot be loaded") as caught:
+        run(store.load_snapshot("s1"))
+    message = str(caught.value)
+    assert "node 'n'" in message and "cannot be indexed" in message
+
+
+def test_a_deeply_nested_row_is_still_a_hard_refusal(store):
+    """(CH1c C) 구조 깊이 >= MAX_STRUCTURE_DEPTH 는 거부다 — 그 위로는 history 의
+    deepcopy 가 깨져 노드를 지울 수조차 없다."""
+    snapshot_id = _plant_node(store, {
+        "id": "n", "label": "N", "type": "class",
+        "properties": json.dumps(_nest_props(200)), "tags": "[]",
+    })
+    with pytest.raises(ValueError, match="nests deeper") as caught:
+        run(store.load_snapshot(snapshot_id))
+    assert "node 'n'" in str(caught.value)
+
+
+def test_an_unencodable_record_is_refused_though_it_cannot_reach_disk():
+    """(CH1c C) 하드 거부 목록의 세 번째 — 어떤 인코더로도 살아남지 못하는 레코드.
+
+    ★ 실측 결과 보고: 서로게이트는 **SQLite 가 쓰기 자체를 거부**하므로 스냅샷
+    파일에 도달하지 못한다(sqlite3 가 UnicodeEncodeError 를 낸다). 즉 이 분기는
+    실제 스냅샷으로는 재현 불가이고, 그래서 게이트를 직접 호출해 고정한다 —
+    도달 불가라고 지우면 어댑터([12])가 in-process 로 값을 구성할 때 구멍이 된다."""
+    values = {
+        "id": "n", "label": "bad" + chr(0xD800), "type": "class", "properties": {},
+        "parent_id": None, "style_hint": None, "position_hint": None, "layer": None,
+        "ttl": 0, "tags": [], "created_at": "x", "updated_at": "x", "created_by": None,
+    }
+    with pytest.raises(ValueError, match="cannot be serialised at all"):
+        check_restorable(Node, values)
+
+
+def test_a_finding_row_is_gated_too(store):
+    """(CH1c E) findings 는 복원 게이트가 아예 없었다 — Finding 이 gold 인데
+    마지막으로 검사를 건너뛴 자리였다."""
+    snapshot_id = _plant_node(
+        store, {"id": "n", "label": "N", "type": "class", "properties": "{}", "tags": "[]"}
+    )
+    conn = sqlite3.connect(store.db_path)
+    try:
+        conn.execute(
+            "INSERT INTO finding (snapshot_id, finding_id, title, body, confidence,"
+            " evidence, layer, tags, created_by, created_at, updated_at, superseded,"
+            " provenance) VALUES (?, 'f1', 'gold', '', 0.9, ?, NULL, '[]', NULL,"
+            " '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '[]', '[]')",
+            (snapshot_id, json.dumps([7])),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    loaded = run(store.load_snapshot(snapshot_id))
+    assert "f1" in loaded.findings                       # 로드는 된다
+    assert any("finding 'f1'" in note for note in loaded.restore_quarantine)
+
+
+# --- CH1c D — 왕복 타입 동일성 ---
+
+
+def test_an_int_weight_round_trips_as_the_same_float(store):
+    """(CH1c D) 정규화가 없으면 저장 전 그래프와 load 결과의 타입이 갈리고
+    /graph.json 바이트도 '7' vs '7.0' 로 달라진다 — 아무도 바꾸지 않은 값이다."""
+    from visualizebetter.mcp_server import import_payload
+
+    graph = Graph()
+    import_payload(
+        graph,
+        {
+            "nodes": [{"id": "a", "label": "A", "type": "t"},
+                      {"id": "b", "label": "B", "type": "t"}],
+            "edges": [{"source": "a", "target": "b", "relation": "r", "weight": 7}],
+            "findings": [{"title": "T", "confidence": 1}],
+        },
+        merge=True,
+    )
+    edge = graph.edges[("a", "b", "r", "")]
+    finding = next(iter(graph.findings.values()))
+    assert type(edge.weight) is float and type(finding.confidence) is float
+
+    result = run(store.save_snapshot(graph, name="ints"))
+    loaded = run(store.load_snapshot(result["snapshot_id"]))
+    reloaded = loaded.edges[("a", "b", "r", "")]
+    assert type(reloaded.weight) is type(edge.weight)
+    assert reloaded.weight == edge.weight
+    assert json.dumps(reloaded.to_dict()) == json.dumps(edge.to_dict())

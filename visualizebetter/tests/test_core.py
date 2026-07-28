@@ -1479,7 +1479,7 @@ def test_the_depth_check_survives_what_it_rejects():
     """(CH1b 게이트 4) 깊이 검사가 재귀였다면 그 자신이 첫 희생자가 된다 —
     막으려는 값이 정확히 스택을 터뜨리는 값이기 때문이다. 순환 참조도 깊이 상한이
     함께 막는다(무한 순회가 아니라 32 단계에서 끝난다)."""
-    from visualizebetter.graph.core import MAX_VALUE_DEPTH, check_storable
+    from visualizebetter.graph.core import MAX_CALLER_VALUE_DEPTH, check_storable
 
     g = Graph()
     with pytest.raises(ValueError, match="nests deeper"):
@@ -1490,7 +1490,7 @@ def test_the_depth_check_survives_what_it_rejects():
     with pytest.raises(ValueError, match="nests deeper"):
         check_storable(Node, {"properties": cycle})
 
-    g.add_node(id="ok", label="OK", type="t", properties=_nest(MAX_VALUE_DEPTH - 2))
+    g.add_node(id="ok", label="OK", type="t", properties=_nest(MAX_CALLER_VALUE_DEPTH - 2))
     assert "ok" in g.nodes
 
 
@@ -1542,3 +1542,176 @@ def test_a_non_finite_number_is_named_by_its_field():
         with pytest.raises(ValueError, match="'weight' must be a finite number"):
             g.add_edge(source="a", target="a", relation="r", weight=bad)
     assert g.edges == {}
+
+
+def _depth_of(value):
+    """CH1c A — 맵 전체의 실제 중첩 깊이(서버 예약 배열 포함)."""
+    if type(value) is dict:
+        return max([_depth_of(v) + 1 for v in value.values()] or [0])
+    if type(value) is list:
+        return max([_depth_of(v) + 1 for v in value] or [0])
+    return 0
+
+
+# --- [13-B] CH1c — 상한의 적용 대상 ---
+
+
+def test_the_server_own_bookkeeping_cannot_brick_an_accepted_value():
+    """(CH1c A) ★ 핵심 단언. 깊이 32 를 **레코드 전체**에 재면 서버 자신의 기록이
+    노드를 벽돌로 만든다: 호출자 값 깊이 31 → supersede 1회 → properties 맵 깊이
+    35(오버헤드 정확히 +4: properties → _superseded → 엔트리 → 'prev' → 값).
+    즉 생성 게이트가 **통과시킨** 값이 갱신·복원 게이트에서 거부되고, 예약키라
+    remove 도 안 되므로 호출자는 스스로 복구할 수 없다."""
+    deep = _nest(29)  # properties 맵 안에서 깊이 31
+    g = Graph()
+    g.add_node(id="n", label="N", type="class", properties={"deep": deep})
+    assert _depth_of(g.get_node("n").properties) == 31  # 전제
+
+    g.update_node("n", {"set": {"properties": {"deep": deep, "x": 1}}}, reason="supersede")
+    g.update_node("n", {"set": {"properties": {"deep": deep, "y": 2}}}, reason="supersede")
+    grown = _depth_of(g.get_node("n").properties)
+    assert grown == 35, f"서버 오버헤드가 +4 가 아니다: {grown}"
+
+    # (a) 갱신이 계속 된다 (b) cite 가 된다
+    g.update_node("n", {"set": {"label": "N2"}})
+    g.cite("n", "https://example.test/1", "src")
+    assert g.get_node("n").label == "N2"
+    assert len(g.get_node("n").properties[CITATIONS_PROPERTY]) == 1
+
+
+def test_the_caller_depth_cap_and_the_structural_cap_are_different_constants():
+    """(CH1c A) 두 상한이 같은 상수면 위 시나리오가 다시 성립한다."""
+    from visualizebetter.graph.core import MAX_CALLER_VALUE_DEPTH, MAX_STRUCTURE_DEPTH
+
+    assert MAX_CALLER_VALUE_DEPTH == 32
+    assert MAX_STRUCTURE_DEPTH == 128
+    assert MAX_STRUCTURE_DEPTH > MAX_CALLER_VALUE_DEPTH + 4  # 서버 오버헤드 여유
+
+
+def test_reserved_arrays_do_not_spend_the_callers_byte_budget():
+    """(CH1c B) 같은 함정의 바이트 버전. 예약 배열(_citations 100건 ≈ 15.5KB,
+    _provenance 50, _superseded 10)이 호출자 예산을 쓰면, 정당한 properties 를 가진
+    노드가 상한에 닿는 순간 cite() 가 거부된다 — 그리고 CH1 에서 확정한 대로 cite 는
+    evict 가 아니라 refuse 이고 예약키는 remove 도 안 되므로, AI 는 근거를 남길 수도
+    자리를 만들 수도 없게 된다."""
+    from visualizebetter.graph.core import MAX_CALLER_PROPERTIES_BYTES
+
+    g = Graph()
+    # 호출자 상한에 근접한 정당한 properties
+    g.add_node(id="n", label="N", type="class",
+               properties={"snippet": "x" * (MAX_CALLER_PROPERTIES_BYTES - 200)})
+    for i in range(MAX_CITATIONS_ENTRIES):
+        g.cite("n", f"https://example.test/evidence/{i:04d}", f"source {i}")
+    for i in range(30):
+        g.update_node("n", {"set": {"label": f"v{i}"}}, reason="correction")
+
+    record = len(json.dumps(g.get_node("n").to_dict(), ensure_ascii=False).encode("utf-8"))
+    assert record > MAX_CALLER_PROPERTIES_BYTES  # 전제: 서버 기록이 실제로 얹혔다
+
+    # 예약 배열이 얹혔어도 호출자 경로는 계속 산다
+    g.update_node("n", {"set": {"label": "still-editable"}})
+    with pytest.raises(ValueError, match="maximum"):
+        g.cite("n", "https://example.test/one-more", "src")   # 건수 상한 거부는 유지
+
+
+def test_the_callers_own_properties_are_still_capped():
+    """(CH1c B) 분리가 '호출자 상한이 사라졌다'가 되면 안 된다."""
+    from visualizebetter.graph.core import MAX_CALLER_PROPERTIES_BYTES
+
+    g = Graph()
+    with pytest.raises(ValueError, match="caller-supplied properties"):
+        g.add_node(id="n", label="N", type="class",
+                   properties={"blob": "x" * (MAX_CALLER_PROPERTIES_BYTES + 100)})
+    assert g.nodes == {}
+
+
+# --- CH1c D — float 정규화 ---
+
+
+def test_an_int_in_a_float_field_is_stored_as_a_float():
+    """(CH1c D) int 수용은 유지한다 — push_batch 는 _EdgeSpecBounds 검증 결과를
+    버리고 raw spec 을 넘기고 import 는 JSON 을 그대로 넘기므로 weight=7 이 실제로
+    도달한다. 문제는 정규화가 없어 SQLite REAL 이 7 → 7.0 으로 바꾸는 것이었다:
+    저장 전 그래프와 load 결과의 타입이 갈리고 /graph.json 바이트도 달라진다."""
+    g = Graph()
+    g.add_node(id="a", label="A", type="t")
+    g.add_node(id="b", label="B", type="t")
+    edge = g.add_edge(source="a", target="b", relation="r", weight=7)
+    finding = g.add_finding(title="T", confidence=1)
+
+    assert type(edge.weight) is float and edge.weight == 7.0
+    assert type(finding.confidence) is float and finding.confidence == 1.0
+
+    g.update_edge("a", "b", "r", "", {"set": {"weight": 3}})
+    assert type(g.edges[("a", "b", "r", "")].weight) is float
+
+
+# --- CH1c E — 에러 문구 ---
+
+
+def test_gate_errors_name_the_field_the_path_and_the_violation():
+    """(CH1c E) 게이트는 항상 ValueError 하위로 올리고, 원시 메시지('position 23',
+    'Circular reference detected')처럼 **어느 필드인지 말하지 않는** 문구를 그대로
+    새게 두지 않는다."""
+    g = Graph()
+
+    with pytest.raises(ValueError, match=r"at properties\.snippet"):
+        g.add_node(id="n", label="N", type="t",
+                   properties={"ok": 1, "snippet": "bad" + chr(0xD800)})
+
+    with pytest.raises(ValueError, match=r"element \[1\] is int"):
+        g.add_node(id="n", label="N", type="t", tags=["ok", 7])
+
+    cycle: dict = {"a": 1}
+    cycle["self"] = cycle
+    with pytest.raises(ValueError, match="nests deeper"):
+        g.add_node(id="n", label="N", type="t", properties=cycle)
+
+    assert g.nodes == {}
+
+
+def test_a_nodes_supersession_log_is_bounded_by_bytes_too():
+    """(CH1c B) MAX_SUPERSEDED_ENTRIES 는 **건수**만 묶는다 — 엔트리의 'prev' 는
+    보관하는 값만큼 크므로, 32KB 속성을 10회 supersede 하면 아카이브 323,555 B /
+    레코드 356KB 가 된다. 레코드 상한의 5배가 전 스냅샷·전 wire 페이로드에 실리고,
+    전부 지원되는 호출만으로 만들어진다. Finding 은 [24-C] 이래 같은 상한이 있었고,
+    임의 properties 를 지는 노드에는 덜 필요한 게 아니라 더 필요했다.
+
+    ★ FIFO 인 이유: 이건 **서버**의 부기이므로 잃는 것이 로그 해상도뿐이다
+    (거부는 AI 가 저작한 것 — _citations, Finding.evidence — 에 쓴다)."""
+    from visualizebetter.graph.core import MAX_NODE_SUPERSEDED_BYTES
+
+    g = Graph()
+    big = "y" * 30_000
+    g.add_node(id="n", label="N", type="class", properties={"blob": big})
+    for i in range(12):
+        g.update_node("n", {"set": {"properties": {"blob": big[: -i - 1]}}},
+                      reason="supersede")
+
+    archive = g.get_node("n").properties[SUPERSEDED_PROPERTY]
+    assert archive, "supersede 가 실제로 기록되지 않았다 — 죽은 단언"
+    size = len(json.dumps(archive, ensure_ascii=False).encode("utf-8"))
+    assert size <= MAX_NODE_SUPERSEDED_BYTES + 30_000  # 마지막 1건은 남긴다
+    assert len(json.dumps(g.get_node("n").to_dict(), ensure_ascii=False)) < 200_000
+
+
+def test_an_import_gate_error_says_which_item():
+    """(CH1c E) payload 는 수천 건을 실을 수 있다 — 위치가 없으면 호출자가 자기
+    JSON 을 이분 탐색해야 한다."""
+    from fastmcp.exceptions import ToolError
+
+    from visualizebetter.mcp_server import import_payload
+
+    g = Graph()
+    nodes = [{"id": f"n{i}", "label": "L", "type": "t"} for i in range(40)]
+    nodes[39]["tags"] = [1]
+    with pytest.raises(ToolError, match=r"nodes\[39\] \(id='n39'\)"):
+        import_payload(g, {"nodes": nodes}, merge=True)
+    assert g.nodes == {}
+
+    edges = [{"source": "a", "target": "b", "relation": "r", "weight": float("nan")}]
+    with pytest.raises(ToolError, match=r"edges\[0\]"):
+        import_payload(g, {"nodes": [{"id": "a", "label": "A", "type": "t"},
+                                     {"id": "b", "label": "B", "type": "t"}],
+                            "edges": edges}, merge=True)
+    assert g.nodes == {}

@@ -72,7 +72,14 @@ def _resolve_layer(layer: str | None) -> str | None:
 
 
 def _serialized_size(payload: Any) -> int:
-    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    """[13-B] CH1c E — ``allow_nan=False`` here costs nothing (measured 0.00ms on a
+    batch) and rejects NaN before the batch is walked.
+
+    ★ It is not a substitute for the per-record gate: this dumps the *whole*
+    batch, so one poisoned item would fail all of them and break [5-A]'s
+    per-item ``errors[]`` contract. Early exit, not the fence.
+    """
+    return len(json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8"))
 
 
 def _finding_list_item(finding: Finding) -> dict[str, Any]:
@@ -1251,6 +1258,17 @@ def _import_kwargs(
     return out
 
 
+def _gate_import_item(
+    cls: type, kwargs: dict[str, Any], section: str, index: int, identity: tuple[str, ...]
+) -> None:
+    """[13-B] CH1c E — run the storability gate and name the offending item."""
+    try:
+        check_storable(cls, kwargs)
+    except ValueError as exc:
+        where = ", ".join(f"{key}={kwargs.get(key)!r}" for key in identity)
+        raise ToolError(f"{section}[{index}] ({where}): {exc}") from None
+
+
 def _apply_import(target: Graph, payload: dict[str, Any]) -> dict[str, Any]:
     """Apply nodes → edges → findings onto ``target`` through the WRITE validation
     ([5-E]/[11]). Idempotent by identity; counts newly created.
@@ -1294,14 +1312,17 @@ def _apply_import(target: Graph, payload: dict[str, Any]) -> dict[str, Any]:
     # [13-B] CH1b — the storability gate, not just the type contract: import is
     # the widest door (arbitrary JSON straight to add_*), so it is where a
     # surrogate, a NaN or a 900-deep dict actually arrives.
-    for kwargs in node_kwargs:
+    # [13-B] CH1c E — say *which* item. A payload can carry thousands, and
+    # "field 'tags' expects list[str]" without a position leaves the caller to
+    # bisect its own JSON.
+    for index, kwargs in enumerate(node_kwargs):
         _reject_reserved_properties(kwargs.get("properties"))
-        check_storable(Node, kwargs)
-    for kwargs in edge_kwargs:
+        _gate_import_item(Node, kwargs, "nodes", index, ("id",))
+    for index, kwargs in enumerate(edge_kwargs):
         _reject_reserved_properties(kwargs.get("properties"))
-        check_storable(Edge, kwargs)
-    for kwargs in finding_kwargs:
-        check_storable(Finding, kwargs)
+        _gate_import_item(Edge, kwargs, "edges", index, ("source", "target", "relation"))
+    for index, kwargs in enumerate(finding_kwargs):
+        _gate_import_item(Finding, kwargs, "findings", index, ("title",))
         _check_finding_size(
             kwargs["title"],
             kwargs.get("body", ""),
