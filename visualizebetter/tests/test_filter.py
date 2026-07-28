@@ -388,12 +388,10 @@ def _reserved_graph():
         id="gold",
         label="Gold",
         type="class",
-        properties={
-            "field_count": 12,
-            "_citations": [{"url": "ida://0x1", "title": "t", "ts": "z"}],
-        },
+        properties={"field_count": 12},
     )
     g.add_node(id="plain", label="Plain", type="class", properties={"field_count": 1})
+    g.cite("gold", "trace://0x1", "t")  # 예약키는 cite() 로만 ([23-B], RN3)
     return g
 
 
@@ -418,7 +416,7 @@ def test_reserved_bare_name_access_resolves_missing():
 def test_reserved_property_value_is_not_matchable():
     g = _reserved_graph()
     # The citation url lives only inside the reserved key; no filter reaches it.
-    assert evaluate_nodes('properties._citations contains "ida"', g) == set()
+    assert evaluate_nodes('properties._citations contains "trace"', g) == set()
 
 
 def test_non_reserved_property_is_unaffected():
@@ -431,11 +429,15 @@ def test_reserved_property_excluded_on_edges():
     g = Graph(name="reserved-edge")
     g.add_node(id="a", label="A", type="class")
     g.add_node(id="b", label="B", type="class")
-    g.add_edge(
-        source="a", target="b", relation="calls",
-        properties={"_secret": "x", "note": "ok"},
-    )
-    # dotted + bare reserved access on an edge → MISSING → empty (mutation guard).
+    # ★ RN3: core 가 생성 시점에 예약키를 거부하므로 엣지에 예약키를 심는 입구가
+    # 없다. 평가기의 제외 규칙은 그대로 두되(스냅샷 로드가 복원할 수 있음),
+    # 여기서는 그 상태에 도달할 수 없음을 단언한다.
+    with pytest.raises(ValueError, match="reserved"):
+        g.add_edge(
+            source="a", target="b", relation="calls",
+            properties={"_secret": "x", "note": "ok"},
+        )
+    g.add_edge(source="a", target="b", relation="calls", properties={"note": "ok"})
     assert evaluate_edges("properties._secret != null", g) == set()
     assert evaluate_edges("_secret != null", g) == set()
     # a non-reserved edge property is still readable.

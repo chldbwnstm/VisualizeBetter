@@ -82,6 +82,27 @@ def is_reserved_property(key: str) -> bool:
     """
     return key.startswith(RESERVED_PROPERTY_PREFIX)
 
+
+def _reject_reserved_on_create(properties: dict[str, Any] | None) -> None:
+    """[23-B] the reserved-key rule, enforced on the **creation** path too.
+
+    ``_apply_patch`` has always rejected ``_``-prefixed keys on update, but a
+    brand-new node/edge went straight into the dataclass, so creation could
+    plant a forged ``_citations`` or a ``_citations: None`` that later makes
+    ``cite()`` fail. The MCP layer does reject it, yet [23-B] deliberately puts
+    this rule in **core**: import, snapshot load and adapters all call core
+    directly, so guarding only MCP leaves the invariant unenforced.
+    """
+    if not properties:
+        return
+    reserved = sorted(k for k in properties if is_reserved_property(k))
+    if reserved:
+        raise ValueError(
+            f"properties keys starting with '{RESERVED_PROPERTY_PREFIX}' are reserved: "
+            f"{reserved} ([23-B])"
+        )
+
+
 _NODE_SERVER_MANAGED = frozenset({"id", "created_at", "updated_at", "created_by"})
 _EDGE_SERVER_MANAGED = frozenset(
     {"source", "target", "relation", "key", "created_at", "created_by"}
@@ -241,6 +262,20 @@ def _apply_patch(
         raise ValueError(
             f"fields starting with '_' are system-owned and not patchable: {reserved} ([23-B])"
         )
+    # ...and to keys *nested inside* a `properties` update. Checking only the
+    # top level left the forgery [23-B] exists to prevent wide open through a
+    # second door: {"set": {"properties": {"_citations": "forged"}}} merged
+    # straight in and replaced the evidence cite() had accumulated. The server's
+    # own history writes are unaffected — _record_lifecycle and cite() mutate
+    # target.properties directly, and only the *published* patch carries the
+    # reserved key, never this apply path.
+    nested = updates.get("properties")
+    if isinstance(nested, dict):
+        forged = sorted(k for k in nested if is_reserved_property(k))
+        if forged:
+            raise ValueError(
+                f"properties keys starting with '_' are reserved: {forged} ([23-B])"
+            )
     rejected = server_managed.intersection(updates)
     if rejected:
         raise ValueError(f"server-managed fields are not patchable: {sorted(rejected)}")
@@ -495,6 +530,7 @@ class Graph:
 
         Re-pushing an auto-created placeholder resolves it ([5-A]: "merge 로 해소").
         """
+        _reject_reserved_on_create(properties)  # [23-B] core 강제 (RN3 부수건)
         self.history.touch_node(id)  # [M2e] before-image (absent → create, present → merge)
         existing = self.nodes.get(id)
         if existing is not None:
@@ -825,6 +861,7 @@ class Graph:
         Missing endpoints get a placeholder node ([5-A]) — AI pushes edges before
         nodes as a matter of course ([3-A]).
         """
+        _reject_reserved_on_create(properties)  # [23-B] core 강제 (RN3 부수건)
         for endpoint in (source, target):
             if endpoint not in self.nodes:
                 self._add_placeholder(endpoint, layer=layer, created_by=created_by)

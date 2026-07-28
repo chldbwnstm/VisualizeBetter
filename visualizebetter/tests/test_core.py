@@ -7,7 +7,12 @@ auto-creation ([5-A]).
 
 import pytest
 
-from visualizebetter.graph.core import PLACEHOLDER_PROPERTY, PLACEHOLDER_TYPE, Graph
+from visualizebetter.graph.core import (
+    CITATIONS_PROPERTY,
+    PLACEHOLDER_PROPERTY,
+    PLACEHOLDER_TYPE,
+    Graph,
+)
 
 
 @pytest.fixture
@@ -498,3 +503,77 @@ def test_adjacency_index_drops_deleted_edges(graph):
 
     assert graph.indices.edges_of("a") == set()
     assert graph.indices.edges_of("b") == set()
+
+
+# --- [23-B] 예약키 강제는 core 에 있다 (RN3 부수건) ---
+
+
+def test_add_node_rejects_reserved_properties_at_creation():
+    """[23-B] 는 이 규칙을 MCP 가 아니라 core 에 두라고 명시한다 — import·스냅샷
+    로드·어댑터가 core 를 직접 호출하므로 MCP 만 막으면 불변식이 강제되지 않는다.
+    update 경로(_apply_patch)는 처음부터 막았지만 생성 경로는 뚫려 있었다."""
+    g = Graph()
+    with pytest.raises(ValueError, match="reserved"):
+        g.add_node(id="n", label="N", type="class", properties={"_citations": [{"url": "forged"}]})
+    assert "n" not in g.nodes  # fail-closed: 아무것도 만들지 않는다
+
+
+def test_add_edge_rejects_reserved_properties_at_creation():
+    g = Graph()
+    g.add_node(id="a", label="A", type="class")
+    g.add_node(id="b", label="B", type="class")
+    with pytest.raises(ValueError, match="reserved"):
+        g.add_edge(source="a", target="b", relation="calls", properties={"_superseded": []})
+    assert g.edges == {}
+
+
+def test_cite_can_no_longer_meet_a_forged_citations_value():
+    """생성 경로가 막히면서 cite() 의 setdefault 크래시가 도달 불가가 된다.
+
+    이전에는 add_node(properties={"_citations": None}) 이 통과해 cite() 가
+    None.append 로 터졌다 (hypothesis 가 실제로 찾아낸 경로). 이제 그 상태를
+    만들 수 있는 입구가 생성·갱신 양쪽 모두 닫혔다."""
+    g = Graph()
+    with pytest.raises(ValueError, match="reserved"):
+        g.add_node(id="n", label="N", type="class", properties={CITATIONS_PROPERTY: None})
+
+    g.add_node(id="n", label="N", type="class")
+    # 최상위 예약 필드는 기존대로 거부된다 (_apply_patch).
+    with pytest.raises(ValueError, match="system-owned"):
+        g.update_node("n", {"set": {CITATIONS_PROPERTY: None}})
+
+    g.cite("n", "https://example.test/x", "ok")          # 정상 경로는 그대로
+    assert len(g.get_node("n").properties[CITATIONS_PROPERTY]) == 1
+
+
+def test_non_reserved_properties_are_unaffected():
+    g = Graph()
+    g.add_node(id="n", label="N", type="class", properties={"ns": "app.ui", "count": 3})
+    assert g.get_node("n").properties == {"ns": "app.ui", "count": 3}
+
+
+def test_update_cannot_forge_reserved_keys_nested_in_properties():
+    """[23-B] 게이트 A — 최상위 필드만 막으면 위조가 두 번째 문으로 그대로 들어온다.
+
+    {"set": {"properties": {"_citations": ...}}} 는 merge 로 들어가 cite() 가 쌓은
+    근거 배열을 통째로 덮었다. core 에서 닫는다 — MCP 만 막으면 import·스냅샷
+    로드·어댑터 경로가 우회한다([23-B])."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class")
+    g.cite("n", "https://example.test/real", "real evidence")
+
+    with pytest.raises(ValueError, match="reserved"):
+        g.update_node("n", {"set": {"properties": {CITATIONS_PROPERTY: "FORGED"}}})
+
+    # 진짜 근거가 그대로 남아있다 — 위조 시도가 아무것도 덮지 못했다
+    citations = g.get_node("n").properties[CITATIONS_PROPERTY]
+    assert len(citations) == 1
+    assert citations[0]["url"] == "https://example.test/real"
+
+
+def test_update_still_allows_ordinary_nested_properties():
+    """거부는 예약키에만 — 평범한 properties 갱신은 그대로 동작한다."""
+    g = Graph()
+    g.add_node(id="n", label="N", type="class", properties={"a": 1})
+    g.update_node("n", {"set": {"properties": {"b": 2}}})
+    assert g.get_node("n").properties == {"a": 1, "b": 2}

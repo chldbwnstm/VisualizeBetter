@@ -24,7 +24,9 @@ def graph():
     g = Graph(name="test")
     # A small, known shape: Order → View → (User ↔ Auth), plus an island.
     g.add_node(id="app.Order", label="OrderContext", type="class",
-               properties={"field_count": 12, "_citations": [{"url": "ida://0x1", "title": "t", "ts": "z"}]})
+               properties={"field_count": 12})
+    # 예약키는 cite() 로만 심는다 — core 가 생성 시 직접 주입을 거부한다([23-B], RN3).
+    g.cite("app.Order", "trace://0x1", "t")
     g.add_node(id="UI.View", label="MainView", type="component", properties={"field_count": 3})
     g.add_node(id="Svc.User", label="PaymentService", type="service")
     g.add_node(id="Svc.Auth", label="AuthService", type="service")
@@ -94,7 +96,7 @@ def test_get_node_returns_whole_node(mcp):
 def test_get_node_exposes_reserved_keys(mcp):
     # [23-B] reserved keys are shown as-is on read (evidence/history), not hidden.
     r = call(mcp, "get_node", id="app.Order")
-    assert r["node"]["properties"]["_citations"][0]["url"] == "ida://0x1"
+    assert r["node"]["properties"]["_citations"][0]["url"] == "trace://0x1"
 
 
 def test_get_node_missing_is_tool_error(mcp):
@@ -487,7 +489,7 @@ def test_search_limit_below_one_is_rejected(mcp):
 def test_search_reserved_property_field_is_refused(mcp):
     # 'properties._citations' targets a reserved ('_') key — fail-closed.
     with pytest.raises(ToolError, match="reserved"):
-        call(mcp, "search", query="ida", in_fields=["properties._citations"])
+        call(mcp, "search", query="trace", in_fields=["properties._citations"])
 
 
 def test_search_unknown_field_is_refused(mcp):
