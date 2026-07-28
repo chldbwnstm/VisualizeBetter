@@ -72,7 +72,14 @@ hidden_imports = (
 )
 
 datas = (
-    [(os.path.join(_ROOT, "frontend", "dist"), "frontend/dist")]
+    [
+        (os.path.join(_ROOT, "frontend", "dist"), "frontend/dist"),
+        # The licences of everything bundled below travel with the binary — MIT
+        # and BSD want the copyright line, MPL-2.0 (certifi) wants a source
+        # pointer. Shipping the exe without this file cannot satisfy them.
+        (os.path.join(_ROOT, "THIRD_PARTY_NOTICES.txt"), "."),
+        (os.path.join(_ROOT, "LICENSE"), "."),
+    ]
     + collect_data_files("lark")
     + collect_data_files("fastmcp")
     + collect_data_files("mcp")
