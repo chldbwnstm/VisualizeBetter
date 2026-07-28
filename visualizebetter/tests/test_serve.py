@@ -502,3 +502,46 @@ def test_ws_non_json_frame_does_not_crash_the_connection(client, graph):
         # ★ The connection survived the bad frame: a valid event still round-trips.
         ws.send_text(json.dumps({"op": "focus.set", "data": {"id": "a"}}))
         assert json.loads(ws.receive_text())["op"] == "focus.set"
+
+
+# --- [13-B] CH1b — 거부 이후 모든 표면이 살아 있다 ---
+
+
+def _nest(depth):
+    value = {"leaf": 1}
+    for _ in range(depth):
+        value = {"n": value}
+    return value
+
+
+SURROGATE = "bad" + chr(0xD800)
+
+
+@pytest.mark.parametrize(
+    ("what", "call"),
+    [
+        ("deep properties", lambda g: g.add_node(id="x", label="X", type="t",
+                                                 properties=_nest(900))),
+        ("surrogate label", lambda g: g.add_node(id="x", label=SURROGATE, type="t")),
+        ("surrogate in properties", lambda g: g.add_node(id="x", label="X", type="t",
+                                                         properties={"k": SURROGATE})),
+        ("nan weight", lambda g: g.add_edge(source="a", target="a", relation="r",
+                                            weight=float("nan"))),
+    ],
+)
+def test_a_refused_value_leaves_graph_json_serving(client, graph, what, call):
+    """(CH1b 완료검증) ★ 이 TASK 의 핵심 단언 — 오염이 애초에 성립하지 않는다.
+
+    이전에는 이 값들이 커밋된 뒤 /graph.json 이 500 을 냈다. 초기 로드뿐 아니라
+    [8-C] resync 진입점이기도 하므로, 클라는 재연결로도 복구할 수 없었다."""
+    graph.add_node(id="a", label="A", type="class")
+    assert client.get("/graph.json", headers=HEADERS).status_code == 200  # 전제
+
+    with pytest.raises(ValueError):
+        call(graph)
+
+    response = client.get("/graph.json", headers=HEADERS)
+    assert response.status_code == 200, f"{what} 거부 뒤 /graph.json 이 죽었다"
+    body = response.json()
+    assert [n["id"] for n in body["nodes"]] == ["a"]
+    json.dumps(body, ensure_ascii=False, allow_nan=False)  # wire 로 나갈 수 있다

@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import functools
 import json
+import math
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -161,15 +162,20 @@ def check_patch_shape(patch: Any) -> None:
             f"unknown patch keys: {unknown_keys}. A patch takes {sorted(_PATCH_KEYS)} ([5-A])"
         )
 
-    updates = patch.get("set")
-    if updates is not None:
+    # [13-B] CH1b: present-but-null is refused, not treated as absent. `{"set":
+    # null}` used to be a *successful no-op* on edges and findings and an
+    # AttributeError on nodes — the same three-answers-to-one-input shape RN6
+    # NN(1) closed, and the same silent-no-op class as `{"sett": ...}`. A caller
+    # who sends the key meant to send fields with it.
+    if "set" in patch:
+        updates = patch["set"]
         if not isinstance(updates, dict):
             raise ValueError(f"patch 'set' must be an object, got {type(updates).__name__}")
         bad = sorted((repr(k) for k in updates if not isinstance(k, str)), key=str)
         if bad:
             raise ValueError(f"patch 'set' keys must be strings: {bad}")
-    removals = patch.get("remove")
-    if removals is not None:
+    if "remove" in patch:
+        removals = patch["remove"]
         if isinstance(removals, str) or not isinstance(removals, (list, tuple)):
             raise ValueError(
                 f"patch 'remove' must be a list of property names, got "
@@ -360,8 +366,8 @@ _FIELD_TYPES: dict[str, tuple[type, ...]] = {
     "int": (int,),
     "float": (int, float),
     "bool": (bool,),
-    "list[str]": (list, tuple),
-    "list[dict[str, Any]]": (list, tuple),
+    "list[str]": (list,),
+    "list[dict[str, Any]]": (list,),
     "dict[str, Any]": (dict,),
     "dict[str, Any] | None": (dict, type(None)),
     "dict[str, float] | None": (dict, type(None)),
@@ -373,17 +379,205 @@ makes every field's ``.type`` a string. Deliberately explicit rather than
 inferred: an annotation this table does not know about raises instead of being
 waved through, so a field added later cannot become a silent hole (that is what
 ``test_every_declared_field_type_is_covered`` pins down).
+
+[13-B] CH1b — read as **exact** types now (see ``_accepts``), so the sequence
+annotations no longer list ``tuple``: every ``add_*`` normalises through
+``list(...)`` before this runs, and the gate judges what will actually be stored.
+"""
+
+_ELEMENT_TYPES: dict[str, type] = {
+    "list[str]": str,
+    "list[dict[str, Any]]": dict,
+}
+"""[13-B] CH1b — a list annotation constrains its elements too.
+
+``list[str]`` used to mean "is a list", full stop, so ``node_ids=[{...}]`` was
+accepted and then took out every snapshot (sqlite3.ProgrammingError) and
+``get_finding`` (TypeError). The declared type says ``str``; the check now says
+it as well.
 """
 
 
 def _accepts(annotation: str, value: Any) -> bool:
-    """True if ``value`` is assignable to a field declared as ``annotation``."""
+    """True if ``value`` may be stored in a field declared as ``annotation``.
+
+    [13-B] CH1b — **exact** types, not ``isinstance``. Subclasses are refused
+    outright, which retires a whole family of defects rather than the members of
+    it we happened to find: a ``str`` subclass with ``__hash__ = None`` (CH1), one
+    with a broken ``__eq__`` (unreachable, undeletable, duplicable nodes), an
+    ``int`` subclass with a lying ``__index__`` — none of these are values the
+    store can round-trip, and all of them satisfy ``isinstance``.
+
+    It also makes the old ``bool``-versus-``int`` special case disappear:
+    ``type(True) is bool``, which is simply not in an ``int`` field's tuple.
+    """
     allowed = _FIELD_TYPES[annotation]
-    # bool is a subclass of int, so an int field would silently accept True.
-    # A flag arriving where a count belongs is a caller mistake, not a coercion.
-    if bool not in allowed and isinstance(value, bool):
+    if type(value) not in allowed:
         return False
-    return isinstance(value, allowed)
+    element = _ELEMENT_TYPES.get(annotation)
+    if element is not None:
+        return all(type(item) is element for item in value)
+    return True
+
+
+MAX_VALUE_DEPTH = 32
+"""[13-B] CH1b — how deeply a stored value may nest.
+
+The trigger was a node with ~900 nested dicts in ``properties``. That is 1.9KB of
+ordinary JSON — far under the [5-E] 1MB import cap, reachable by any AI through
+``push_node``, ``push_batch`` or ``import_graph``, and needing no exotic Python
+type at all. The node committed, the caller was told the write had failed, and
+from then on **every** write path was dead: delete, cascade, update, re-push,
+cite and clear_all all die in ``history.touch()``'s ``deepcopy``. No tool could
+remove the node, so the store stayed broken for good.
+
+32 because it is far past anything a real graph annotation needs (a deeply
+structured property is two or three levels) and far short of CPython's ~1000
+frame limit, leaving room for the recursive consumers stacked on top of it —
+``deepcopy`` in history, ``json.dumps`` in the wire encoder and the snapshot
+writer, ``asdict`` in ``to_dict``. Checked with an explicit stack rather than
+recursion, because the check must survive input the consumers cannot.
+"""
+
+MAX_VALUE_BYTES = 64 * 1024
+"""[13-B] CH1b — serialised ceiling for one record's incoming values.
+
+[23-B] already bounds a Finding this way (title 1024, body 16384, superseded
+16KB); nodes and edges had no equivalent, so ``properties`` was unbounded in size
+as well as in depth. 64KB is deliberately loose — four times the finding-body cap
+— because this is a structural backstop, not a style rule: it exists so that one
+record cannot on its own exhaust the [5-E] 1MB import budget or dwarf the [5]
+50KB read budget, and anything near it is already a design mistake the AI should
+hear about at the door rather than at snapshot time.
+"""
+
+
+def _check_depth(value: Any, field_name: str) -> None:
+    """[13-B] CH1b — bound nesting without recursing.
+
+    An explicit stack, because the whole point is to reject values that would
+    blow the stack of everything downstream; a recursive checker would be the
+    first casualty. The depth cap also bounds cycles for free — a self-referential
+    dict reaches the limit in ``MAX_VALUE_DEPTH`` steps instead of looping.
+    """
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > MAX_VALUE_DEPTH:
+            raise ValueError(
+                f"field {field_name!r} nests deeper than {MAX_VALUE_DEPTH} levels;"
+                " such a value cannot be copied, serialised or snapshotted ([13-B])"
+            )
+        if type(current) is dict:
+            stack.extend((item, depth + 1) for item in current.values())
+        elif type(current) is list:
+            stack.extend((item, depth + 1) for item in current)
+
+
+def _as_stored_list(value: Any) -> Any:
+    """[13-B] CH1b — mirror the constructors' ``list(...)``, and nothing more.
+
+    The gate has to judge the value as it will be stored, which means applying
+    the same normalisation ``add_*`` applies. It must not *launder* anything
+    while doing so: ``list("a")`` is ``["a"]``, so normalising unconditionally
+    would turn a refused ``tags="a"`` into a silently accepted one-element list.
+    Only list/tuple are converted; anything else is handed to the gate untouched
+    so it gets refused for what it is.
+    """
+    if value is None:
+        return []
+    return list(value) if type(value) in (list, tuple) else value
+
+
+def _as_stored_dict(value: Any) -> Any:
+    """The mapping counterpart of ``_as_stored_list`` — same reasoning.
+
+    ``dict([["_citations", "forged"]])`` is a valid call, which is why blind
+    normalisation is dangerous here too ([23-B] RN4 AA).
+    """
+    if value is None:
+        return {}
+    return dict(value) if type(value) is dict else value
+
+
+def check_storable(cls: type, values: dict[str, Any]) -> None:
+    """[13-B] CH1b — one gate: can the store actually keep this value?
+
+    Every earlier round added a rule for the *kind* of bad value it had just been
+    shown — a dict where a str belongs (RN7 SS), the same on the creation path
+    (CH1), an unhashable str subclass. The list never closed, because the contract
+    was pitched at the wrong altitude: it asked "is this a str" when what the
+    store needs to know is "does this survive ``json.dumps`` and an SQLite bind".
+    So ask that instead. The failures this replaces were not exotic — a lone
+    lone unpaired surrogate in any string field, a NaN weight, a nested dict
+    — all reachable
+
+    Five layers, cheapest first, each one a precondition for the next:
+
+    1. **exact declared type** (``_accepts``) — no subclasses, so identity-breaking
+       ``str``/``int`` subclasses cannot enter at all.
+    2. **finite floats** — NaN and ±Inf are neither JSON nor a meaningful weight;
+       they used to reach ``save_snapshot`` and fail it as "NOT NULL constraint
+       failed", which names the wrong problem entirely.
+    3. **element types** for list fields (folded into ``_accepts``).
+    4. **depth** — iteratively, before anything recursive touches the value.
+    5. **serialisation** — the record's own values through
+       ``json.dumps(ensure_ascii=False, allow_nan=False).encode("utf-8")``, the
+       exact call the snapshot writer, the [8-C] wire and ``export_graph`` all
+       make. Whatever fails here could never have been stored, so refusing it at
+       the door is the only outcome that leaves the graph usable. This one line
+       closes surrogates, NaN, cycles and unknown types together, and keeps
+       closing them when a new field is added.
+
+    Gating the **incoming** values rather than the whole record is deliberate and
+    sufficient: every value already in a record passed this same gate on its way
+    in, so the record as a whole stays serialisable by induction — and an update
+    then costs one small dict, not a full re-serialisation of the node.
+    """
+    declared = {f.name: f.type for f in fields(cls)}
+    for name, value in values.items():
+        annotation = declared.get(name)
+        if annotation is None:
+            continue
+        if annotation not in _FIELD_TYPES:
+            raise ValueError(
+                f"field {name!r} has an unmapped declared type {annotation!r};"
+                " extend _FIELD_TYPES ([23-C] RN7 SS)"
+            )
+        if not _accepts(annotation, value):
+            raise ValueError(
+                f"field {name!r} expects {annotation}, got {_describe(value)}"
+                " ([5-A])"
+            )
+        if type(value) is float and not math.isfinite(value):
+            raise ValueError(
+                f"field {name!r} must be a finite number, got {value!r};"
+                " NaN and Infinity have no JSON form ([13-B])"
+            )
+        _check_depth(value, name)
+
+    try:
+        encoded = json.dumps(values, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ValueError(
+            f"value cannot be stored: {exc} ([13-B]). It would fail the same way in"
+            " save_snapshot, on the [8-C] wire and in export_graph, so it is"
+            " refused here where nothing has changed yet."
+        ) from None
+    if len(encoded) > MAX_VALUE_BYTES:
+        raise ValueError(
+            f"record is {len(encoded)} bytes serialised, over the"
+            f" {MAX_VALUE_BYTES} limit ([13-B])"
+        )
+
+
+def _describe(value: Any) -> str:
+    """Name the *exact* type, so a subclass refusal does not read as a puzzle."""
+    name = type(value).__name__
+    for base in (str, int, float, list, dict):
+        if type(value) is not base and isinstance(value, base):
+            return f"{name} (a {base.__name__} subclass)"
+    return name
 
 
 def check_new_record(cls: type, values: dict[str, Any]) -> None:
@@ -402,21 +596,7 @@ def check_new_record(cls: type, values: dict[str, Any]) -> None:
     guarding MCP alone leaves import, snapshot load and adapters outside. The
     value contract had not followed them down yet.
     """
-    declared = {f.name: f.type for f in fields(cls)}
-    for name, value in values.items():
-        annotation = declared.get(name)
-        if annotation is None:
-            continue
-        if annotation not in _FIELD_TYPES:
-            raise ValueError(
-                f"field {name!r} has an unmapped declared type {annotation!r};"
-                " extend _FIELD_TYPES ([23-C] RN7 SS)"
-            )
-        if not _accepts(annotation, value):
-            raise ValueError(
-                f"field {name!r} expects {annotation}, got {type(value).__name__}"
-                " ([5-A])"
-            )
+    check_storable(cls, values)
 
 
 def check_field_types(target: Node | Edge | Finding, updates: dict[str, Any]) -> None:
@@ -442,21 +622,24 @@ def check_field_types(target: Node | Edge | Finding, updates: dict[str, Any]) ->
     nothing — exactly the "guard one door, leave the other open" shape [23-B]
     warns about.
     """
-    declared = {f.name: f.type for f in fields(target)}
-    for name, value in updates.items():
-        annotation = declared.get(name)
-        if annotation is None:
-            continue  # unknown fields are rejected by validate_patch itself
-        if annotation not in _FIELD_TYPES:
-            raise ValueError(
-                f"field {name!r} has an unmapped declared type {annotation!r};"
-                " extend _FIELD_TYPES ([23-C] RN7 SS)"
-            )
-        if not _accepts(annotation, value):
-            raise ValueError(
-                f"field {name!r} expects {annotation}, got {type(value).__name__}"
-                " ([5-A])"
-            )
+    check_storable(type(target), updates)
+
+
+def _patch_set(patch: dict[str, Any]) -> dict[str, Any]:
+    """[13-B] CH1b — the ``set`` map of an already-shape-checked patch.
+
+    ``patch.get("set", {}).get(...)`` is the anti-pattern this repo's own
+    ``_patch_properties`` docstring warns about: ``{"set": null}`` makes the outer
+    ``get`` return ``None`` and the inner one an ``AttributeError``, which is not a
+    ``ValueError`` and so escapes the tools' translation into ``ToolError`` — a
+    bare traceback for the caller, and a third answer to an input RN6 NN(1) had
+    already made uniform across the three update tools.
+
+    ``check_patch_shape`` runs first and guarantees ``set`` is a dict when present,
+    so this is the honest reading of that guarantee rather than a second guess.
+    """
+    value = patch.get("set")
+    return value if type(value) is dict else {}
 
 
 def validate_patch(
@@ -692,7 +875,7 @@ class Graph:
         # of graph state ([8-D]). Records before/after images of each mutation.
         self.history = GraphHistory(self)
 
-    def reload_from(self, other: Graph) -> None:
+    def reload_from(self, other: Graph, *, dirty: bool = False) -> None:
         """Replace this graph's contents with another's, in place ([5-E] 전체 그래프 교체).
 
         In place, not by swapping the object: serve owns exactly one Graph Core
@@ -716,7 +899,14 @@ class Graph:
         self.focus = other.focus
         self.version = other.version
         self.indices = other.indices
-        self.dirty = False
+        # [13-B] CH1b — whether the new content is already on disk is the
+        # caller's fact, not this method's. ``load_snapshot`` reloads *from* a
+        # snapshot, so clean is right; ``import_graph(merge=False)`` reloads from
+        # something that has never been saved, and clearing the flag there meant
+        # the autosnapshotter skipped it — a 50-node replace-import left the disk
+        # holding one snapshot of the *pre-import* graph (node_count=1) and
+        # nothing else, so the import existed only in memory.
+        self.dirty = dirty
         # [13-B] CH1(4 정정) — advance, never adopt. ``other`` is built by
         # load_snapshot/import without going through add_*, so its counter is 0;
         # copying it walks this graph's token *backwards* and a clear_dirty(token)
@@ -808,10 +998,15 @@ class Graph:
         Re-pushing an auto-created placeholder resolves it ([5-A]: "merge 로 해소").
         """
         check_properties(properties)  # [23-B] core 강제 (RN3 부수건)
-        check_new_record(Node, {  # [13-B] CH1(1) — same contract as update
+        # [13-B] CH1b — every value that will be stored, in the form it will be
+        # stored in (the constructor's own list(...) normalisation applied here),
+        # so the gate judges the record rather than the call.
+        check_new_record(Node, {
             "id": id, "label": label, "type": type, "parent_id": parent_id,
+            "properties": _as_stored_dict(properties),
             "style_hint": style_hint, "position_hint": position_hint,
-            "layer": layer, "ttl": ttl, "tags": tags or [], "created_by": created_by,
+            "layer": layer, "ttl": ttl, "tags": _as_stored_list(tags),
+            "created_by": created_by,
         })
         self.history.touch_node(id)  # [M2e] before-image (absent → create, present → merge)
         existing = self.nodes.get(id)
@@ -954,7 +1149,7 @@ class Graph:
         # validate_patch cannot foresee (a str subclass with __hash__ = None), so
         # it has to happen before touch_node/_record_lifecycle too.
         old_type = node.type
-        new_type = patch.get("set", {}).get("type", old_type)
+        new_type = _patch_set(patch).get("type", old_type)
         self.indices.retype_node(id, old_type, new_type)
         self.history.touch_node(id)  # [M2e] before any lifecycle/patch mutates it
         published = self._record_lifecycle(node, patch, reason)
@@ -1208,10 +1403,11 @@ class Graph:
         nodes as a matter of course ([3-A]).
         """
         check_properties(properties)  # [23-B] core 강제 (RN3 부수건)
-        check_new_record(Edge, {  # [13-B] CH1(1) — same contract as update
+        check_new_record(Edge, {  # [13-B] CH1b — see add_node
             "source": source, "target": target, "relation": relation, "key": key,
             "directed": directed, "weight": weight, "layer": layer,
-            "style_hint": style_hint, "ttl": ttl, "tags": tags or [],
+            "properties": _as_stored_dict(properties),
+            "style_hint": style_hint, "ttl": ttl, "tags": _as_stored_list(tags),
             "created_by": created_by,
         })
         for endpoint in (source, target):
@@ -1361,9 +1557,10 @@ class Graph:
         Raises ValueError if a [23-B] size invariant is exceeded.
         """
         _check_finding_size(title, body, node_ids, evidence, tags)
-        check_new_record(Finding, {  # [13-B] CH1(1)
+        check_new_record(Finding, {  # [13-B] CH1b — see add_node
             "title": title, "body": body, "confidence": confidence,
-            "layer": layer, "created_by": created_by,
+            "node_ids": _as_stored_list(node_ids), "evidence": _as_stored_list(evidence),
+            "tags": _as_stored_list(tags), "layer": layer, "created_by": created_by,
         })
         now = _now()
         finding = Finding(

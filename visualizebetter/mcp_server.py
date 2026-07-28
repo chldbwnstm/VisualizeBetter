@@ -28,8 +28,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from visualizebetter.filter import FilterError, compile_filter
 from visualizebetter.graph.core import (
     _check_finding_size,
-    check_new_record,
     check_properties,
+    check_storable,
     MAX_FINDING_BODY_CHARS,
     MAX_FINDING_EVIDENCE,
     MAX_FINDING_NODE_IDS,
@@ -1263,8 +1263,18 @@ def _apply_import(target: Graph, payload: dict[str, Any]) -> dict[str, Any]:
     turns a bad payload into a *partial* import, which is worse than either
     outcome the caller can reason about.
     """
+    # [13-B] CH1b — required mirrors the add_* signature, not a subset of it.
+    # ``add_node`` has no defaults for label/type, so a payload whose last node
+    # omitted them committed the previous N-1 (events published, undo command
+    # committed) and then raised a bare TypeError out of the call itself — the
+    # "rejected ⇒ nothing changed" guarantee CH1(5) claimed, broken by the two
+    # keys the pre-pass forgot to ask for.
     node_kwargs = _import_kwargs(
-        _import_specs(payload, "nodes"), _IMPORT_NODE_FIELDS, ("id",), "node", "[4-A]"
+        _import_specs(payload, "nodes"),
+        _IMPORT_NODE_FIELDS,
+        ("id", "label", "type"),
+        "node",
+        "[4-A]",
     )
     edge_kwargs = _import_kwargs(
         _import_specs(payload, "edges"),
@@ -1281,14 +1291,17 @@ def _apply_import(target: Graph, payload: dict[str, Any]) -> dict[str, Any]:
         "[23-B]",
     )
 
+    # [13-B] CH1b — the storability gate, not just the type contract: import is
+    # the widest door (arbitrary JSON straight to add_*), so it is where a
+    # surrogate, a NaN or a 900-deep dict actually arrives.
     for kwargs in node_kwargs:
         _reject_reserved_properties(kwargs.get("properties"))
-        check_new_record(Node, kwargs)
+        check_storable(Node, kwargs)
     for kwargs in edge_kwargs:
         _reject_reserved_properties(kwargs.get("properties"))
-        check_new_record(Edge, kwargs)
+        check_storable(Edge, kwargs)
     for kwargs in finding_kwargs:
-        check_new_record(Finding, kwargs)
+        check_storable(Finding, kwargs)
         _check_finding_size(
             kwargs["title"],
             kwargs.get("body", ""),
@@ -1334,7 +1347,7 @@ def import_payload(graph: Graph, payload: dict[str, Any], merge: bool) -> dict[s
             return _apply_import(graph, payload)
     fresh = Graph(name=graph.metadata.get("name", "visualizebetter"))
     result = _apply_import(fresh, payload)
-    graph.reload_from(fresh)
+    graph.reload_from(fresh, dirty=True)  # [13-B] CH1b — never saved yet
     # A full replace, like load_snapshot: tell live clients everything they hold is
     # stale so they full-resync from /graph.json ([8-C], audit #10). Published on the
     # graph's own bus so the hub forwards it and seq stays monotonic. snapshot_id is

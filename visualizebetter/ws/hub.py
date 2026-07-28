@@ -279,12 +279,41 @@ class WSHub:
         return len(self._outbox) + open_batch
 
     async def flush(self) -> int:
-        """Send everything queued. serve calls this on the [8-C] 16~50ms window."""
+        """Send everything queued. serve calls this on the [8-C] 16~50ms window.
+
+        [13-B] CH1b — encoding is isolated **per message**. CH1(2) promoted encode
+        failures to a resync, but it did that in ``_on_event``, where only the four
+        batch ops are validated; the real ``json.dumps`` happens right here. And
+        because the outbox is swapped out before the loop, one message that failed
+        to encode took **every remaining message with it** — no resync, no log, no
+        signal of any kind, since ``_flush_loop`` swallows what escapes.
+
+        So each message stands or falls alone, and a failure becomes a resync
+        instead of a silence. The resync is coalesced to at most one per flush:
+        promoting per message turns a persistently unencodable event into a 1:1
+        amplifier — every broken message spawning its own full-graph refetch —
+        which is a self-inflicted DoS on exactly the client already struggling.
+        One resync says everything several would.
+        """
         self._close_batch()
         messages, self._outbox = self._outbox, []
+        sent = 0
+        resync_seq: int | None = None
         for seq, op, data in messages:
-            await self._send_all(encode_message(op, data, seq))
-        return len(messages)
+            try:
+                text = encode_message(op, data, seq)
+            except Exception:  # noqa: BLE001
+                logger.exception("cannot encode %s (seq=%s); forcing a client resync", op, seq)
+                resync_seq = seq if resync_seq is None else resync_seq
+                continue
+            await self._send_all(text)
+            sent += 1
+        if resync_seq is not None:
+            await self._send_all(
+                encode_message("snapshot.load", {"snapshot_id": ""}, resync_seq)
+            )
+            sent += 1
+        return sent
 
     async def _send_all(self, text: str) -> None:
         """Fan out to every live connection, isolating failures.

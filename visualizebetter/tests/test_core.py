@@ -20,6 +20,7 @@ from visualizebetter.graph.core import (
     PLACEHOLDER_PROPERTY,
     PLACEHOLDER_TYPE,
     Graph,
+    Node,
 )
 
 
@@ -1243,7 +1244,10 @@ def test_an_index_refusal_leaves_records_and_indices_agreeing(mutate):
     before_types = {k: set(v) for k, v in g.indices.by_type.items()}
     before_adj = {k: set(v) for k, v in g.indices.adjacency.items()}
 
-    with pytest.raises(TypeError):
+    # [13-B] CH1b — 예전에는 인덱스가 TypeError 로 막았다(그래서 순서가 필요했다).
+    # 이제는 정확 타입 게이트가 **문에서** ValueError 로 막아 인덱스까지 가지도
+    # 않는다. 순서 불변식 자체는 아래 두 테스트가 따로 고정한다.
+    with pytest.raises(ValueError):
         mutate(g)
 
     assert {k: v.to_dict() for k, v in g.nodes.items()} == before_nodes
@@ -1276,7 +1280,7 @@ def test_a_refused_retype_leaves_the_old_bucket_intact():
     assert indices.by_type["class"] == {"n"}  # 전제
 
     with pytest.raises(TypeError):
-        indices.retype_node("n", "class", _Unhashable("weird"))
+        indices.retype_node("n", "class", _Unhashable("weird"))  # 인덱스 직접 호출
     assert indices.by_type["class"] == {"n"}
 
     indices.retype_node("n", "class", "service")  # 정상 경로 회귀
@@ -1309,3 +1313,232 @@ def test_a_failed_index_removal_leaves_the_record_in_place():
     assert g.get_node("n").label == "N"
     g.delete_node("n", cascade=True)            # 정상 경로 회귀
     assert "n" not in g.nodes and "n" not in g.indices.adjacency
+
+
+def test_index_registration_still_precedes_the_record_write():
+    """(CH1b) 게이트가 생기면서 "인덱스가 실패하는 값"이 공개 API 로는 도달 불가가
+    됐다 — 그렇다고 순서 보장을 지울 수는 없다. 다음 구멍이 열릴 때 마지막으로
+    남는 방어이므로, 인덱스를 직접 실패시켜 순서를 계속 고정한다."""
+    g = Graph()
+    g.add_node(id="keep", label="K", type="class")
+    before = dict(g.nodes)
+
+    def explode(node):
+        raise RuntimeError("index refused")
+
+    g.indices.add_node = explode
+    with pytest.raises(RuntimeError):
+        g.add_node(id="ghost", label="G", type="class")
+    assert dict(g.nodes) == before          # 인덱스가 먼저였으므로 dict 은 무변경
+
+    def explode_edge(key, edge):
+        raise RuntimeError("index refused")
+
+    g.indices.add_edge = explode_edge
+    with pytest.raises(RuntimeError):
+        g.add_edge(source="keep", target="keep", relation="self")
+    assert g.edges == {}
+
+
+# --- [13-B] CH1b — 저장 가능성 게이트 ---
+
+
+def _nest(depth):
+    """평문 JSON 으로 도달하는 중첩 — Python 서브클래스가 전혀 필요 없다."""
+    value = {"leaf": 1}
+    for _ in range(depth):
+        value = {"n": value}
+    return value
+
+
+SURROGATE = "bad" + chr(0xD800)
+
+_UNSTORABLE = [
+    pytest.param(
+        lambda g: g.add_node(id="x", label="X", type="t", properties=_nest(900)),
+        id="properties-900-deep",
+    ),
+    pytest.param(lambda g: g.add_node(id="x", label=SURROGATE, type="t"), id="surrogate-label"),
+    pytest.param(lambda g: g.add_node(id=SURROGATE, label="X", type="t"), id="surrogate-id"),
+    pytest.param(
+        lambda g: g.add_node(id="x", label="X", type="t", properties={"k": SURROGATE}),
+        id="surrogate-in-properties",
+    ),
+    pytest.param(
+        lambda g: g.add_edge(source="keep", target="keep", relation="r", weight=float("nan")),
+        id="nan-weight",
+    ),
+    pytest.param(
+        lambda g: g.add_edge(source="keep", target="keep", relation="r", weight=float("inf")),
+        id="inf-weight",
+    ),
+    pytest.param(lambda g: g.add_finding(title="T", node_ids=[{"a": 1}]), id="node_ids-dict"),
+    pytest.param(lambda g: g.add_finding(title="T", evidence=[7]), id="evidence-int"),
+    pytest.param(lambda g: g.add_node(id="x", label="X", type="t", tags=[None]), id="tags-none"),
+    pytest.param(
+        lambda g: g.update_node("keep", {"set": {"label": SURROGATE}}), id="update-surrogate"
+    ),
+    pytest.param(
+        lambda g: g.update_node("keep", {"set": {"properties": _nest(900)}}),
+        id="update-deep-properties",
+    ),
+]
+
+
+@pytest.mark.parametrize("mutate", _UNSTORABLE)
+def test_unstorable_values_are_refused_at_the_door(mutate):
+    """(CH1b) ★ 부류를 하나씩 막는 걸 그만두고 **저장 가능성**을 직접 묻는다.
+
+    여기 값들의 공통점은 '평범한 JSON 으로 도달한다'는 것이다 — Python 서브클래싱은
+    필요 없다. 900 중첩은 1.9KB 평문(1MB import 캡 한참 아래)인데 노드를 커밋시킨 뒤
+    delete·cascade·update·재push·cite·clear_all 을 **전부 영구히** 죽였고(history 의
+    deepcopy 에서 RecursionError), 그 노드는 어떤 도구로도 지울 수 없었다.
+    서로게이트 하나는 /graph.json 을 500 으로 만들고 자동 스냅샷을 매 틱 실패시켜
+    디스크에 스냅샷이 0개가 되게 했다."""
+    g = Graph()
+    g.add_node(id="keep", label="Keep", type="class")
+    before_nodes = {k: v.to_dict() for k, v in g.nodes.items()}
+    before_edges = {k: v.to_dict() for k, v in g.edges.items()}
+    before_findings = {k: v.to_dict() for k, v in g.findings.items()}
+    seen = _capture_events(g)
+
+    with pytest.raises(ValueError):
+        mutate(g)
+
+    # (b) 그래프 완전 무변경
+    assert {k: v.to_dict() for k, v in g.nodes.items()} == before_nodes
+    assert {k: v.to_dict() for k, v in g.edges.items()} == before_edges
+    assert {k: v.to_dict() for k, v in g.findings.items()} == before_findings
+    assert seen == []
+
+    # (c) ★ 핵심 단언 — 오염이 애초에 성립하지 않으므로 모든 후속 표면이 산다
+    assert json.dumps(
+        {"nodes": [n.to_dict() for n in g.nodes.values()]},
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    g.add_node(id="after", label="After", type="class")
+    g.cite("keep", "https://example.test/1", "src")
+    g.update_node("keep", {"set": {"label": "Kept"}})
+    g.add_edge(source="keep", target="after", relation="calls")
+    g.undo()
+    g.delete_node("after", cascade=True)
+    g.clear_all()
+    assert g.nodes == {} and g.edges == {}
+
+
+def test_the_capture_of_a_refused_value_is_not_a_dead_assertion():
+    """(CH1b) 위 테스트가 '전제에 도달했는지'를 스스로 증명한다 — 같은 모양의
+    **정상** 값은 실제로 들어가야 한다."""
+    g = Graph()
+    g.add_node(id="keep", label="Keep", type="class")
+    seen = _capture_events(g)
+    g.add_node(id="ok", label="OK", type="t", properties=_nest(4), tags=["a"])
+    g.add_node(id="a", label="A", type="t")
+    g.add_edge(source="keep", target="a", relation="r", weight=1.5)
+    g.add_finding(title="T", node_ids=["keep"], evidence=["https://x"])
+    assert seen == ["node.add", "node.add", "edge.add", "finding.add"]
+    assert g.get_node("ok").properties == _nest(4)
+
+
+def test_exact_types_retire_the_subclass_family():
+    """(CH1b 게이트 1) isinstance 를 쓰는 한 계약은 부류를 하나씩 쫓아다닌다.
+    `type(v) is str` 로 바꾸면 hash 파괴·eq 파괴·미래의 무엇이든 한 번에 닫힌다."""
+
+    class NoHash(str):
+        __hash__ = None  # type: ignore[assignment]
+
+    class NoEq(str):
+        def __eq__(self, other):
+            return False
+
+        __hash__ = str.__hash__
+
+    g = Graph()
+    for bad in (NoHash("weird"), NoEq("weird")):
+        with pytest.raises(ValueError, match="subclass"):
+            g.add_node(id="x", label="X", type=bad)
+    assert g.nodes == {}
+
+
+def test_bool_is_still_refused_where_a_number_belongs():
+    """(CH1b 게이트 1) 정확 타입이 되면서 bool/int 특례가 사라졌다 —
+    `type(True) is bool` 이라 int 필드의 튜플에 애초에 없다. 회귀로 고정한다."""
+    g = Graph()
+    with pytest.raises(ValueError):
+        g.add_node(id="x", label="X", type="t", ttl=True)
+    g.add_node(id="a", label="A", type="t")
+    g.add_node(id="b", label="B", type="t")
+    with pytest.raises(ValueError):
+        g.add_edge(source="a", target="b", relation="r", weight=True)
+    g.add_edge(source="a", target="b", relation="r", weight=3)  # int 는 float 필드 OK
+    assert g.edges[("a", "b", "r", "")].weight == 3
+
+
+def test_the_depth_check_survives_what_it_rejects():
+    """(CH1b 게이트 4) 깊이 검사가 재귀였다면 그 자신이 첫 희생자가 된다 —
+    막으려는 값이 정확히 스택을 터뜨리는 값이기 때문이다. 순환 참조도 깊이 상한이
+    함께 막는다(무한 순회가 아니라 32 단계에서 끝난다)."""
+    from visualizebetter.graph.core import MAX_VALUE_DEPTH, check_storable
+
+    g = Graph()
+    with pytest.raises(ValueError, match="nests deeper"):
+        g.add_node(id="x", label="X", type="t", properties=_nest(5000))
+
+    cycle: dict = {}
+    cycle["self"] = cycle
+    with pytest.raises(ValueError, match="nests deeper"):
+        check_storable(Node, {"properties": cycle})
+
+    g.add_node(id="ok", label="OK", type="t", properties=_nest(MAX_VALUE_DEPTH - 2))
+    assert "ok" in g.nodes
+
+
+def test_a_record_over_the_size_ceiling_is_refused():
+    """(CH1b 게이트 4) [23-B] 는 finding 에만 크기 불변식을 줬다 — 노드/엣지의
+    properties 는 깊이도 크기도 무제한이었다."""
+    from visualizebetter.graph.core import MAX_VALUE_BYTES
+
+    g = Graph()
+    with pytest.raises(ValueError, match="serialised"):
+        g.add_node(id="x", label="X", type="t", properties={"blob": "y" * (MAX_VALUE_BYTES + 10)})
+    assert g.nodes == {}
+
+
+def test_set_null_converges_across_the_three_update_tools():
+    """(CH1b 결함 6) `{"set": null}` 이 노드에서는 AttributeError(→ tool 의
+    except ValueError 를 탈출해 맨 트레이스백), 엣지·finding 에서는 **성공한
+    no-op** 이었다. RN6 NN(1) 이 닫은 '세 tool, 한 입력, 세 답'이 부활한 것이고
+    성공한 no-op 은 `{"sett": ...}` 와 같은 조용한 소실 부류다."""
+    g = Graph()
+    g.add_node(id="a", label="A", type="t")
+    g.add_node(id="b", label="B", type="t")
+    g.add_edge(source="a", target="b", relation="r")
+    fid = g.add_finding(title="T").finding_id
+    before = (g.get_node("a").to_dict(), g.get_edge("a", "b", "r").to_dict(),
+              g.get_finding(fid).to_dict())
+
+    for patch in ({"set": None}, {"set": []}, {"set": "x"}, {"remove": None}):
+        for call in (
+            lambda p=patch: g.update_node("a", p),
+            lambda p=patch: g.update_edge("a", "b", "r", "", p),
+            lambda p=patch: g.update_finding(fid, p),
+        ):
+            with pytest.raises(ValueError):
+                call()
+
+    assert (g.get_node("a").to_dict(), g.get_edge("a", "b", "r").to_dict(),
+            g.get_finding(fid).to_dict()) == before
+
+
+def test_a_non_finite_number_is_named_by_its_field():
+    """(CH1b 게이트 2) 게이트 (5) 의 allow_nan=False 도 NaN 을 막지만, 그 메시지는
+    "Out of range float values are not JSON compliant" 라 **어느 필드인지 말하지
+    않는다**. AI 가 고칠 수 있으려면 필드 이름이 있어야 하므로 (2) 를 따로 둔다 —
+    두 겹이 서로를 가리는 관계이고, 구분되는 실제 차이가 여기다."""
+    g = Graph()
+    g.add_node(id="a", label="A", type="class")
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="'weight' must be a finite number"):
+            g.add_edge(source="a", target="a", relation="r", weight=bad)
+    assert g.edges == {}

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -37,7 +38,7 @@ from visualizebetter.graph.core import (
     Graph,
     Node,
     _now,
-    check_new_record,
+    check_storable,
 )
 
 DB_FILENAME = "visualizebetter.sqlite3"
@@ -836,8 +837,13 @@ def _snapshot_payload(graph: Graph) -> dict[str, Any]:
     safe to hold across the ``await``s in ``save_snapshot``.
     """
     return {
-        "metadata": graph.metadata,
-        "layers": graph.layers,
+        # [13-B] CH1b — copied, not referenced. nodes/edges/findings go through
+        # asdict and were already deep, but these two were live objects: a
+        # mid-save push added a phantom layer to a snapshot taken before it, and
+        # a mid-save clear_all left an orphan one. The capture has to be true for
+        # all six keys or it is not a capture.
+        "metadata": copy.deepcopy(graph.metadata),
+        "layers": copy.deepcopy(graph.layers),
         "version": graph.version,
         "nodes": [node.to_dict() for node in graph.nodes.values()],
         "edges": [edge.to_dict() for edge in graph.edges.values()],
@@ -882,7 +888,9 @@ def _check_restored(
     """
     values = {f.name: getattr(record, f.name) for f in fields(cls)}
     try:
-        check_new_record(cls, values)
+        # [13-B] CH1b — the same storability gate the live doors use, so a row
+        # written before it existed cannot walk back in through the restore.
+        check_storable(cls, values)
     except ValueError as exc:
         raise ValueError(
             f"snapshot {snapshot_id} cannot be loaded: {kind} {identity!r} is invalid"

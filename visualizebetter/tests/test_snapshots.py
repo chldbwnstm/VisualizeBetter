@@ -12,6 +12,7 @@ import sqlite3
 import time
 
 import pytest
+from fastmcp.exceptions import ToolError
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
@@ -2253,3 +2254,108 @@ def test_the_idle_debounce_saves_without_waiting_for_the_tick(tmp_path):
         assert snapshotter._task is None and snapshotter._idle_task is None
 
     run(scenario())
+
+
+# --- [13-B] CH1b — 결함 5 (import 필수키) ---
+
+
+@pytest.mark.parametrize("merge", [True, False])
+def test_a_node_missing_label_or_type_imports_nothing(merge):
+    """(CH1b 결함 5) CH1(5) 의 '거부 ⇒ 무변경' 이 거짓이었다 — 사전검사의 required
+    가 노드에 대해 ('id',) 뿐인데 add_node 는 label/type 에 기본값이 없다. 마지막
+    노드에 둘이 빠진 payload 가 앞의 39개를 **커밋**하고(이벤트 발행 + undo 커맨드
+    커밋까지) 맨 TypeError 를 던졌다 — ValueError 가 아니라서 tool 의 변환도 못 탄다."""
+    from visualizebetter.mcp_server import import_payload
+
+    graph = Graph()
+    good = Graph()
+    nodes = [{"id": f"n{i}", "label": f"L{i}", "type": "t"} for i in range(39)]
+    import_payload(good, {"nodes": list(nodes)}, merge=merge)
+    assert len(good.nodes) == 39  # 전제: 성한 39개는 실제로 들어간다
+
+    seen = []
+    graph.events.subscribe(lambda event: seen.append(event.op))
+    for missing in ({"id": "last"}, {"id": "last", "label": "L"}, {"id": "last", "type": "t"}):
+        with pytest.raises(ToolError, match="missing"):
+            import_payload(graph, {"nodes": [*nodes, missing]}, merge=merge)
+        assert graph.nodes == {}
+        assert seen == []
+        assert not graph.history.can_undo()
+
+
+# --- 결함 7 (payload 얕은 참조) ---
+
+
+def test_layers_and_metadata_are_captured_not_referenced(store):
+    """(CH1b 결함 7) nodes/edges/findings 는 asdict 딥카피라 원자적이었는데
+    metadata/layers 만 **살아 있는 객체**였다 — 저장 도중 push 가 스냅샷에 유령
+    레이어를 남기고, clear_all 이 고아 레이어를 남겼다."""
+    graph = Graph()
+    graph.add_node(id="a", label="A", type="class", layer="original")
+    graph.metadata["note"] = "before"
+    layers_at_capture = list(graph.layers)
+
+    original = store._ensure_schema
+    raced = []
+
+    async def mutate_mid_save(db):
+        await original(db)
+        graph.add_node(id="ghost", label="G", type="class", layer="phantom")
+        graph.metadata["note"] = "after"
+        raced.append(True)
+
+    store._ensure_schema = mutate_mid_save
+    try:
+        result = run(store.save_snapshot(graph, name="race"))
+    finally:
+        store._ensure_schema = original
+
+    assert raced, "저장 도중 변경이 일어나지 않았다 — 죽은 단언"
+    assert "phantom" in graph.layers  # 라이브 그래프는 실제로 움직였다
+
+    loaded = run(store.load_snapshot(result["snapshot_id"]))
+    assert loaded.layers == layers_at_capture
+    assert loaded.metadata["note"] == "before"
+
+
+# --- 결함 8 (replace-import 이 저장되지 않음) ---
+
+
+def test_a_replace_import_stays_dirty_until_a_snapshot_takes_it(tmp_path):
+    """(CH1b 결함 8) reload_from 이 무조건 dirty 를 내렸다. load_snapshot 에는
+    맞지만 import(merge=False) 에는 틀리다 — 임포트 결과가 어떤 스냅샷에도 들어가지
+    않는다. 실측: 50노드 replace-import 뒤 디스크의 유일한 스냅샷이 node_count=1."""
+    from visualizebetter.mcp_server import import_payload
+
+    async def scenario():
+        store = SnapshotStore(tmp_path / "replace")
+        await store.initialize()
+        graph = Graph()
+        graph.add_node(id="pre", label="Pre", type="t")
+        snapshotter = AutoSnapshotter(
+            graph, store, interval_seconds=3600, idle_debounce_seconds=0.3
+        )
+        snapshotter.start()
+        try:
+            await snapshotter.snapshot_before("import_graph(replace)")
+            assert not graph.dirty  # 전제: 임포트 직전 그래프는 저장됐고 clean 이다
+
+            payload = {"nodes": [{"id": f"n{i}", "label": f"L{i}", "type": "t"}
+                                 for i in range(50)]}
+            import_payload(graph, payload, merge=False)
+            assert len(graph.nodes) == 50
+            assert graph.dirty, "임포트 결과가 '이미 저장됨'으로 표시됐다"
+
+            await asyncio.sleep(1.2)  # 유휴 디바운스가 집어간다
+            assert not graph.dirty, "디바운스가 임포트 결과를 저장하지 않았다"
+        finally:
+            await snapshotter.stop()
+
+        snapshots = await store.list_snapshots()
+        sizes = []
+        for row in snapshots:
+            sizes.append(len((await store.load_snapshot(row["id"])).nodes))
+        return sizes
+
+    sizes = run(scenario())
+    assert 50 in sizes, f"임포트 결과가 어떤 스냅샷에도 없다 (있는 것: {sizes})"

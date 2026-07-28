@@ -11,6 +11,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+import visualizebetter.ws.hub as hub_module
 from visualizebetter.graph.core import Graph
 from visualizebetter.ws.hub import (
     DEFAULT_RATE_LIMIT,
@@ -806,4 +807,63 @@ def test_a_failed_encode_drops_the_half_built_batch(graph, hub, conn):
         hub._add_to_batch = original
 
     run(hub.flush())
+    assert conn.ops == ["snapshot.load"]
+
+
+# --- [13-B] CH1b 결함 9 — flush 인코딩 실패가 outbox 를 데려가지 않는다 ---
+
+
+def test_one_unencodable_message_does_not_take_the_outbox_with_it(graph, hub, conn):
+    """(CH1b 결함 9) CH1(2) 의 resync 승격은 `_on_event` 에만 있었고 실제
+    `json.dumps` 는 flush() 에서 일어난다. flush 는 outbox 를 **먼저 비우므로**
+    첫 메시지의 인코딩 실패가 나머지 전부를 데려갔다 — 승격도 로그도 클라 신호도
+    0건이었다(_flush_loop 가 삼킨다)."""
+    graph.add_node(id="a", label="A", type="class")
+    run(hub.flush())
+    assert conn.ops == ["graph.batch"]  # 전제: 정상 경로가 실제로 도착한다
+    conn.sent.clear()
+
+    real_encode = hub_module.encode_message
+    calls = []
+
+    def flaky(op, data, seq):
+        calls.append(op)
+        if len(calls) == 1:
+            raise UnicodeEncodeError("utf-8", "x", 0, 1, "surrogates not allowed")
+        return real_encode(op, data, seq)
+
+    hub._outbox = [(1, "node.delete", {"id": "a"}),
+                   (2, "node.delete", {"id": "b"}),
+                   (3, "node.delete", {"id": "c"})]
+    hub_module.encode_message = flaky
+    try:
+        sent = run(hub.flush())
+    finally:
+        hub_module.encode_message = real_encode
+
+    assert calls, "인코딩 경로에 도달하지 않았다 — 죽은 단언"
+    ops = conn.ops
+    assert ops.count("node.delete") == 2      # 나머지 둘은 살아서 도착한다
+    assert ops.count("snapshot.load") == 1    # 실패는 resync 로 승격된다
+    assert sent == 3
+
+
+def test_many_unencodable_messages_coalesce_into_one_resync(graph, hub, conn):
+    """(CH1b 결함 9) 메시지마다 승격하면 지속 실패가 1:1 증폭이 된다 — 이미
+    힘들어하는 클라에게 전체 그래프 재적재를 실패 건수만큼 시키는 자기-DoS 다.
+    flush 당 최대 1건으로 합친다."""
+    real_encode = hub_module.encode_message
+
+    def always_broken(op, data, seq):
+        if op == "snapshot.load":
+            return real_encode(op, data, seq)
+        raise UnicodeEncodeError("utf-8", "x", 0, 1, "surrogates not allowed")
+
+    hub._outbox = [(i, "node.delete", {"id": f"n{i}"}) for i in range(5)]
+    hub_module.encode_message = always_broken
+    try:
+        run(hub.flush())
+    finally:
+        hub_module.encode_message = real_encode
+
     assert conn.ops == ["snapshot.load"]
