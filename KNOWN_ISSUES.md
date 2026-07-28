@@ -44,4 +44,4 @@
 - **검증:** 계측 제거 후 전체 스위트 **retries:0 로 18회 연속 clean**(수정 전
   7/14 실패 → 수정 후 0 크래시). `playwright.config.ts retries:1 → 0` 제거(더
   이상 가릴 플레이크 없음). 회귀: pytest 658 / vitest 252 / build exit0.
-  상세 계측·증거: `reports/ki1-diagnosis.md`.
+  (상세 계측·증거는 내부 진단 리포트에 보관)

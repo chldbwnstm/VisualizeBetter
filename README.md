@@ -345,7 +345,6 @@ Claude: save_snapshot("project-structure-v1")   ← the next session loads this 
   snippet + implemented tool reference
 - [docs/filter-dsl.md](./docs/filter-dsl.md) — filter DSL grammar, semantics, and safety
   caps (canonical)
-- [PROGRESS.md](./PROGRESS.md) — checkpoint index (points to roll back to)
 
 ## License
 

@@ -322,7 +322,6 @@ Claude: save_snapshot("프로젝트-구조-v1")   ← 다음 세션이 이걸 �
 - [docs/handoff.md](./docs/handoff.md) — 세션 핸드오프 프로토콜 + 시스템 프롬프트
   스니펫 + 구현된 도구 레퍼런스
 - [docs/filter-dsl.md](./docs/filter-dsl.md) — 필터 DSL 문법·의미론·안전 상한 정본
-- [PROGRESS.md](./PROGRESS.md) — 체크포인트(되돌아갈 지점) 인덱스
 
 ## 라이선스
 
