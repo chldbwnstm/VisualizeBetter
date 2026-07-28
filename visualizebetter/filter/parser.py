@@ -6,7 +6,7 @@ operator, and ``degree`` be a function only when a ``(`` follows — [6]'s gramm
 leans on exactly that keyword/identifier overlap ("identifier # 단축 표기").
 
 The grammar here is [6] transcribed. Any change to it is a change to the DSL
-grammar, which is a STOP&ASK item — this file does not extend [6].
+grammar, which is a fixed contract — this file does not extend it.
 """
 
 from __future__ import annotations

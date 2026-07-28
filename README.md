@@ -107,6 +107,17 @@ cd ..
 uv run visualizebetter serve --port 8765
 ```
 
+Any free port works — `--port` exists because 8765 may already be taken (an
+instance you left running, or something else); the server will refuse to bind
+rather than silently share it.
+
+**Where your data lives.** Everything stays on your machine. Snapshots and
+server state go to the platform data directory —
+`%LOCALAPPDATA%isualizebetter` on Windows, `~/.local/share/visualizebetter` on
+Linux, `~/Library/Application Support/visualizebetter` on macOS — and
+`--data-dir <path>` puts them wherever you prefer, which is also how you keep
+separate graphs for separate projects.
+
 Skipping step 1 is not fatal: the server still starts and the MCP/JSON/WebSocket
 API works, but the browser gets a 503 telling you which build command is missing.
 

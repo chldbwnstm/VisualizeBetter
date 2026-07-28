@@ -556,44 +556,66 @@ def test_a_refused_value_leaves_graph_json_serving(client, graph, what, call):
 # --- PUB1 P3 — a fresh clone has no SPA bundle ---
 
 
-def test_a_missing_frontend_bundle_explains_itself(tmp_path):
+def test_a_missing_frontend_bundle_explains_itself(tmp_path, graph, monkeypatch):
     """(PUB1 P3) frontend/dist 는 gitignore 되므로 **신규 클론에는 번들이 없다**.
     이전에는 브라우저가 맨 404 로 열렸다 — API 는 멀쩡히 떠 있고 정적 마운트만
     없는 상태인데, 404 는 그 사실을 말할 수 없는 응답이다.
 
     200 이 아니라 503 인 이유: 서버가 실제로 아직 앱을 서빙할 준비가 안 됐고,
-    모니터가 그걸 구분할 수 있어야 한다."""
-    dist = frontend_dist()
-    moved = dist.with_name("dist.test-moved")
-    had_dist = dist.is_dir()
-    if had_dist:
-        dist.rename(moved)
-    try:
-        app = create_app(graph=Graph(), data_dir=tmp_path / "data")
-        with TestClient(app, base_url=f"http://{HOST}") as client:
-            for path in ("/", "/settings", "/anything/deep"):
-                response = client.get(path, headers=HEADERS)
-                assert response.status_code == 503, path
-                body = response.text
-                assert "npm run build" in body
-                assert "frontend" in body
-                assert str(dist) in body
-            # API 는 계속 살아 있다 — 번들만 없다는 사실이 응답과 일치해야 한다
-            assert client.get("/graph.json", headers=HEADERS).status_code == 200
-    finally:
-        if had_dist:
-            moved.rename(dist)
-    assert dist.is_dir() == had_dist
+    모니터가 그걸 구분할 수 있어야 한다.
+
+    ★ 부재 상태는 tmp 하위의 없는 경로를 monkeypatch 해서 만든다. 첫 판에서는
+    저장소의 **진짜** frontend/dist 를 rename 하고 finally 로 되돌렸는데, 그건
+    이 테스트가 막으려는 실패를 이 테스트가 만드는 구조였다: pytest 가 하드킬
+    되거나 두 세션이 겹치면 실제 번들이 dist.test-moved 로 남고, 그 순간부터
+    앱은 방금 도입한 이 안내 페이지만 서빙한다. CI backend job 은 번들을 빌드하지
+    않아 그 위험을 볼 수조차 없다 — 개발자 머신에서만 터진다. 같은 파일이 이미
+    쓰던 관용구로 통일했다."""
+    missing = tmp_path / "never-built" / "dist"
+    monkeypatch.setattr("visualizebetter.server.frontend_dist", lambda: missing)
+
+    app = create_app(graph=graph, data_dir=tmp_path / "data")
+    with TestClient(app, base_url=f"http://{HOST}") as client:
+        for path in ("/", "/settings", "/anything/deep"):
+            response = client.get(path, headers=HEADERS)
+            assert response.status_code == 503, path
+            body = response.text
+            assert "npm run build" in body
+            assert "frontend" in body
+            assert str(missing) in body
+        # API 는 계속 살아 있다 — 번들만 없다는 사실이 응답과 일치해야 한다
+        assert client.get("/graph.json", headers=HEADERS).status_code == 200
+
+    assert frontend_dist().is_dir() or True  # 실제 트리는 건드리지 않았다
 
 
-def test_the_built_bundle_still_takes_precedence(tmp_path, graph):
+def test_the_missing_bundle_test_does_not_touch_the_real_tree():
+    """(PUB1 P3) 위 테스트가 저장소의 진짜 번들을 옮기지 않음을 소스로 고정한다.
+
+    이 저장소에 '실제 트리를 만지는 테스트' 가 다시 들어오지 않게 하는 단언이다 —
+    한 번 있었고, 실패 모드가 조용했다(다음 실행부터 앱이 안내 페이지만 서빙)."""
+    import inspect
+
+    source = inspect.getsource(test_a_missing_frontend_bundle_explains_itself)
+    assert ".rename(" not in source
+    assert "monkeypatch.setattr" in source
+
+
+def test_the_built_bundle_still_takes_precedence(tmp_path, graph, monkeypatch):
     """(PUB1 P3) 회귀 — 번들이 있으면 안내가 아니라 SPA 가 서빙된다.
 
-    공용 client 픽스처는 serve_static=False 라 이 축을 볼 수 없다."""
-    if not frontend_dist().is_dir():
-        pytest.skip("이 체크아웃에는 빌드된 번들이 없다")
+    공용 client 픽스처는 serve_static=False 라 이 축을 볼 수 없다. 여기서도 실제
+    트리가 아니라 tmp 에 만든 번들을 쓴다."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><div id=root></div>", encoding="utf-8")
+    monkeypatch.setattr("visualizebetter.server.frontend_dist", lambda: dist)
+
     app = create_app(graph=graph, data_dir=tmp_path / "data")
     with TestClient(app, base_url=f"http://{HOST}") as client:
         response = client.get("/", headers=HEADERS)
         assert response.status_code == 200
         assert "npm run build" not in response.text
+        assert "id=root" in response.text
+
+

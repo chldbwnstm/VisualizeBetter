@@ -1,6 +1,6 @@
 """[M2] undo/redo — Graph Core command history (M2e, approved design D-1…D-6).
 
-Design of record (M2e STOP&ASK, coordinator-approved):
+Design of record (M2e, confirmed):
 
 - **D-1 Global stack.** One history for the whole graph — "undo the last graph
   mutation". ★Multi-client caveat: the stack is shared, so one client (or the

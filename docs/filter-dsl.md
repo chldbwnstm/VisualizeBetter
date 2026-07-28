@@ -5,7 +5,7 @@ operators and their comparison semantics, the group-function signatures, and the
 safety caps. If the implementation and this document disagree, this document is
 what the implementation should be corrected to — the parser lives in
 `visualizebetter/filter/parser.py` and the evaluator in
-`visualizebetter/filter/evaluator.py`.
+`visualizebetter/filter/evaluate.py`.
 
 Changing anything here changes a public contract: the same evaluator backs the
 `filter` / `edge_filter` arguments of the MCP read tools, the WebSocket

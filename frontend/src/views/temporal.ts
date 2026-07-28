@@ -1,12 +1,12 @@
 /**
- * Temporal scrubber ([2-B]/M3, 계획서 TASK 11) — a created_at overlay.
+ * Temporal scrubber ([2-B]/M3) — a created_at overlay.
  *
  * The graph's growth *is already timestamped*: every Node/Edge/Finding carries a
  * server ``created_at``. So "the graph at time T" is a pure visibility overlay —
  * show what was created at or before T, fade what came after — reusing the same
  * ``dim: {visibleIds}`` path the filter already drives. No event log, no
  * reconstruction, no structural change: scrubbing costs a filter-dim, so it stays
- * off the [7-D] structural render path (M3c decision A, coordinator-approved).
+ * off the [7-D] structural render path (M3c decision A).
  *
  * ★ Limitation (by design, documented in the UI): this reveals the *current* graph
  * in creation order. A node deleted before now is not in the graph, so it cannot

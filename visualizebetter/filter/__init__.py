@@ -1,4 +1,4 @@
-"""필터 DSL — 계획서 [6] 의 순수 평가기.
+"""필터 DSL — [6] 의 순수 평가기.
 
 The DSL is the schema-less predicate language over the graph ([6]). One evaluator
 is shared by [5-B]'s ``filter`` parameter, WS ``filter.set``, and

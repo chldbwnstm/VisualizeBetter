@@ -22,6 +22,9 @@ frontend/dist/
 *.sqlite3
 *.db
 
+# clone_smoketest.py run artifacts (reports/baselines, not source)
+scripts/_baselines/
+
 # Server discovery file — written by `serve` and contains the auth token in
 # plain text. Running with `--data-dir .` puts it inside the checkout, where an
 # untracked, unignored file gets swept up by `git add -A`.

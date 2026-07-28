@@ -105,6 +105,16 @@ cd ..
 uv run visualizebetter serve --port 8765
 ```
 
+포트는 아무거나 써도 된다. `--port` 가 있는 이유는 8765 가 이미 점유돼 있을 수
+있기 때문이다(띄워둔 인스턴스나 다른 프로그램) — 서버는 조용히 공유하지 않고
+바인드를 거부한다.
+
+**데이터가 어디에 저장되나.** 전부 이 컴퓨터에 남는다. 스냅샷과 서버 상태는
+플랫폼 데이터 디렉토리에 저장된다 — Windows `%LOCALAPPDATA%isualizebetter`,
+Linux `~/.local/share/visualizebetter`, macOS
+`~/Library/Application Support/visualizebetter`. `--data-dir <경로>` 로 원하는
+곳에 둘 수 있고, 프로젝트별로 그래프를 분리하는 방법이기도 하다.
+
 1번을 건너뛰어도 치명적이지는 않다. 서버는 뜨고 MCP/JSON/WebSocket API 도 동작하며,
 브라우저에는 어떤 빌드 명령이 빠졌는지 알려주는 503 이 표시된다.
 

@@ -1,5 +1,5 @@
 /**
- * ★ [15] settle 별도 지표 (TASK N / 코디 판정 A).
+ * ★ [15] settle 별도 지표 (TASK N, decision A).
  *
  * The layout lifecycle buys its KPI numbers by not laying out during ingest, so
  * the cost it moves — the simulation re-enable stall, and how long the graph

@@ -1,6 +1,6 @@
 """Completion verification for TASK M2e — [M2] undo/redo command history.
 
-Covers the coordinator-approved design (D-1…D-6): every mutation kind reverses
+Covers the design of record (D-1…D-6): every mutation kind reverses
 correctly (push / update / delete-cascade / clear / cite / supersede / finding /
 import / push_batch), redo re-applies, a new mutation clears redo, the ``_suspended``
 replay guard stops undo/redo from recording fresh history, a full replace clears

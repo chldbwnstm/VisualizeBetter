@@ -1,5 +1,5 @@
 /**
- * TemporalScrubber — the [2-B]/M3 time-axis scrubber (계획서 TASK 11).
+ * TemporalScrubber — the [2-B]/M3 time-axis scrubber.
  *
  * Drag the timeline to hold the view at a past created_at cutoff; press play to
  * watch the graph grow from there to now. It is a pure view overlay ([7-D] like the
