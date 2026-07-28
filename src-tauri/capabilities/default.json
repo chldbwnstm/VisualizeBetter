@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "VisualizeBetter shell — a window over the visualizebetter serve web app. The serve sidecar is spawned and killed entirely in Rust (setup/ExitRequested, [8-D]/[8-F]); the webview is the plain React SPA loaded over HTTP and never calls the shell plugin, so it is granted no shell capability ([11] least privilege — audit nit #9).",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

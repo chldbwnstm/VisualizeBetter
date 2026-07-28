@@ -1,0 +1,159 @@
+# [8-F]/[23-F] TASK 12 — desktop release matrix.
+#
+# "One build" = one codebase + one workflow → per-OS artifacts on native runners.
+# A single machine cannot produce a signed+notarized macOS build and a Windows
+# build; each OS builds on its own runner. Each runner: build the SPA → bundle
+# `visualizebetter serve` with PyInstaller into the Tauri externalBin sidecar
+# (visualizebetter-<target-triple>) → tauri build (sign/notarize via secrets) → upload.
+#
+# Signing is best-effort: the secrets below are optional. Absent them the app still
+# builds, just unsigned (macOS notarization and Windows Authenticode need the R8
+# credentials — Apple Developer account, Windows code-signing cert).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            triple: x86_64-pc-windows-msvc
+          - platform: macos-latest
+            triple: aarch64-apple-darwin
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # ---- frontend: the SPA serve hosts and the shell loads ----
+      - name: Build the SPA
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      # ---- backend deps + PyInstaller sidecar ----
+      - name: Install backend + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install . pyinstaller
+
+      - name: Bundle the serve sidecar
+        shell: bash
+        run: |
+          pyinstaller --noconfirm packaging/visualizebetter-serve.spec
+          mkdir -p src-tauri/binaries
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "dist/visualizebetter.exe" "src-tauri/binaries/visualizebetter-${{ matrix.triple }}.exe"
+          else
+            cp "dist/visualizebetter" "src-tauri/binaries/visualizebetter-${{ matrix.triple }}"
+            chmod +x "src-tauri/binaries/visualizebetter-${{ matrix.triple }}"
+          fi
+
+      # ---- ★ smoke-test the BUILT sidecar (M2f) ----
+      # The root cause of the M2 ship-blocker was that CI never *ran* the bundled
+      # exe: a sidecar that crashes on `import re2` (missing vendored DLL) still
+      # produced a green build, so the desktop app shipped and hung forever on a
+      # clean machine. This step runs the frozen binary and fails CI if the sidecar
+      # cannot start — the crash reproduces here instead of at a user's machine.
+      # It deliberately uses ONLY the frozen binary (no `pip`-installed visualizebetter on
+      # PATH), so it proves the exe self-contains re2 and its DLLs.
+      - name: Smoke-test the sidecar (crash = fail CI)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="src-tauri/binaries/visualizebetter-${{ matrix.triple }}"
+          [ "${{ runner.os }}" = "Windows" ] && BIN="${BIN}.exe"
+          SMOKE="$(mktemp -d)"
+
+          # [1] eager `import re2` must succeed — this is exactly where the shipped
+          #     sidecar crashed (DLL load failed). `version` walks the same import
+          #     chain (cli -> mcp_server -> filter.evaluate -> import re2).
+          "$BIN" version
+
+          # [2] re2 `matches` at runtime, through the frozen exe end to end.
+          printf '{"nodes":[{"id":"a","label":"AuthService","type":"service"}]}' > "$SMOKE/g.json"
+          "$BIN" import "$SMOKE/g.json" --data-dir "$SMOKE"
+          "$BIN" export --format json --filter 'label matches /Auth.*/' --data-dir "$SMOKE"
+
+          # [3] the actual [8-D] sidecar path: serve writes serve.json (the shell's
+          #     readiness signal) and answers /graph.json. If the sidecar crashed,
+          #     serve.json never appears and this step fails.
+          PORT=8799
+          "$BIN" serve --no-open --port "$PORT" --data-dir "$SMOKE" &
+          SPID=$!
+          for _ in $(seq 1 60); do
+            [ -f "$SMOKE/serve.json" ] && break
+            sleep 0.5
+          done
+          if [ ! -f "$SMOKE/serve.json" ]; then
+            echo "::error::sidecar did not write serve.json — it crashed on startup"
+            kill "$SPID" 2>/dev/null || true
+            exit 1
+          fi
+          cat "$SMOKE/serve.json"
+          curl -fsS "http://127.0.0.1:${PORT}/graph.json" > /dev/null
+          echo "sidecar smoke OK: re2 imported, matches works, serve healthy"
+          kill "$SPID" 2>/dev/null || true
+
+      # ---- generate app icons from a source PNG (Tauri requires them) ----
+      - name: Generate icons
+        run: |
+          npm --prefix src-tauri exec --yes @tauri-apps/cli@2 -- icon src-tauri/icons/source.png
+
+      # ---- tauri build (bundles the SPA + sidecar, signs when secrets exist) ----
+      - name: Build the desktop app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          # macOS signing + notarization (R8) — optional.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Windows Authenticode (R8) — optional.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: src-tauri
+          args: --target ${{ matrix.triple }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: visualizebetter-${{ matrix.triple }}
+          path: |
+            src-tauri/target/${{ matrix.triple }}/release/bundle/**/*.msi
+            src-tauri/target/${{ matrix.triple }}/release/bundle/**/*.exe
+            src-tauri/target/${{ matrix.triple }}/release/bundle/**/*.dmg
+            src-tauri/target/${{ matrix.triple }}/release/bundle/**/*.app
+          if-no-files-found: warn

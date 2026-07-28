@@ -1,0 +1,8 @@
+# Rust build output
+/target
+
+# Tauri-generated schemas/permissions
+/gen/schemas
+
+# Sidecar binaries are produced by PyInstaller in CI (or locally); never checked in.
+/binaries/
