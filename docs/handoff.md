@@ -2,7 +2,7 @@
 
 > 목적: **재리서치 0.** 한 AI 세션이 그래프에 기록한 지식(구조 + gold)을
 > 다음 세션이 처음부터 다시 파악하지 않고 즉시 이어받는다. 사람은 그 그래프를
-> 눈으로 보고, AI 와 같은 화면을 공유한다. ([23-D])
+> 눈으로 보고, AI 와 같은 화면을 공유한다.
 
 이 문서는 두 독자를 위한 것이다:
 - **AI 에이전트** — 작업을 시작할 때의 권장 시퀀스와 도구 목록.
@@ -10,7 +10,7 @@
 
 ---
 
-## 1. 새 세션 권장 시작 시퀀스 ([23-D])
+## 1. 새 세션 권장 시작 시퀀스
 
 이전 세션의 작업을 이어받을 때:
 
@@ -54,7 +54,7 @@
 | `list_snapshots()` | 저장된 스냅샷 목록 |
 | `save_snapshot(name, description="")` | 현재 그래프+finding 을 이름으로 저장 |
 | `load_snapshot(snapshot_id)` | 스냅샷 복원(로드 전 자동 안전 스냅샷) |
-| `export_graph(format, filter=…)` | 그래프를 파일로 내보냄(json/graphml/dot/cytoscape, filter=[6] DSL 서브그래프) |
+| `export_graph(format, filter=…)` | 그래프를 파일로 내보냄(json/graphml/dot/cytoscape, filter= 필터 DSL 서브그래프) |
 | `import_graph(data, format, merge=True)` | 인라인 데이터 임포트(≤1MB, merge=병합/False=교체) |
 | `import_from_file(path, format, merge=True)` | 대량 파일 임포트(서버 데이터 디렉토리 내 경로만) |
 
@@ -81,7 +81,7 @@
 |---|---|
 | `get_graph_summary()` | 규모·타입 분포·layer·top hub |
 | `get_node(id, include_neighbors=False)` | 노드 전체(+1홉 이웃) |
-| `list_nodes(filter=…, limit, offset, sort_by, order)` | 필터([6] DSL) + 페이지네이션 |
+| `list_nodes(filter=…, limit, offset, sort_by, order)` | 필터 DSL + 페이지네이션 |
 | `list_edges(filter=…, limit, offset)` | 엣지 필터 |
 | `get_neighbors(id, depth=1, max_nodes=200, direction="both", edge_filter=…)` | 이웃 서브그래프(방향 in/out/both) |
 | `find_paths(source, target, max_length=5, max_paths=10, edge_filter=…)` | 두 노드 간 경로 열거 |
@@ -109,7 +109,7 @@
 | `suggest_filter(dsl_expr, reason)` | 필터 제안(배너로 뜸, 적용은 사람이 결정) |
 | `focus_on(node_id, zoom_level=1.5)` | 사람 화면을 이 노드의 상세 뷰로 이동 |
 | `set_layout(algorithm, options={})` | 상세 뷰 레이아웃 변경(dagre/concentric/fcose/grid/preset) |
-| `apply_style(selector, style, ttl=0)` | selector([6] DSL) 매칭 노드 임시 강조(color/size/border) |
+| `apply_style(selector, style, ttl=0)` | selector(필터 DSL) 매칭 노드 임시 강조(color/size/border) |
 | `clear_style(style_id=None)` | 임시 스타일 해제(None=전체) |
 | `add_annotation(x, y, text, ttl=0)` | 화면 좌표에 텍스트 주석 |
 | `render_in_chat(node_id)` | 그 노드의 이웃 서브그래프를 대화창 안 인라인 카드로 렌더(MCP Apps) |
@@ -125,7 +125,7 @@
 
 ---
 
-## 4. 데이터 수명주기 (중복·정정·최신화) — [24]
+## 4. 데이터 수명주기 (중복·정정·최신화)
 
 AI 가 이미 잘 기록한 데이터를 다룰 때:
 - **중복 금지** — push 는 멱등이다. 같은 노드/엣지를 다시 push 해도 중복되지 않고
@@ -136,16 +136,16 @@ AI 가 이미 잘 기록한 데이터를 다룰 때:
   `_superseded` 에 백업한 뒤 최신값으로 덮어쓴다. 옛 정보가 사라지지 않는다.
 
 `_` 로 시작하는 예약 속성(`_citations` / `_superseded` / `_provenance`)은
-시스템이 관리하며 직접 set/remove 할 수 없다(위조 방지, [11]).
+시스템이 관리하며 직접 set/remove 할 수 없다(위조 방지).
 
 ---
 
 ## 5. 연결 방법 (요약)
 
 - **웹앱 (M1)**: `visualizebetter serve` → 브라우저에서 그래프 뷰, MCP 는 HTTP 로 노출.
-- **stdio 프록시 (예정, [8-D])**: Claude Desktop 등 stdio MCP 클라이언트를
+- **stdio 프록시**: Claude Desktop 등 stdio MCP 클라이언트를
   serve 에 연결. 연결의 clientInfo 가 layer 태그로 전달돼 "누가 기록했는지"가
-  provenance 로 남는다([23-E]).
+  provenance 로 남는다.
 
 ---
 

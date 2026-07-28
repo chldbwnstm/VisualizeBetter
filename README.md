@@ -75,7 +75,7 @@ AI clients like Claude Desktop and Cursor use to call external tools.*
 
 **Status: M2 Feature Complete (2026-07-19).** M1 MVP + M2 (stdio proxy, Tauri desktop
 app, MCP Apps inline render, undo/redo, multi-format export) implemented and verified —
-backend pytest 806 / frontend vitest 288 / Playwright E2E 21. Run with
+backend pytest 1129 / frontend vitest 288 / Playwright E2E 21. Run with
 `uv run visualizebetter serve`; Claude Desktop connects via `visualizebetter mcp-stdio`.
 
 ---
@@ -334,18 +334,11 @@ Cross-platform installers are built and signed on a GitHub Actions matrix
 
 ## Usage
 
-> **M1 status (2026-07-18): feature-complete.** The full MCP tool API
-> (WRITE/READ/finding/user-state/view-control/persistence/JSON import·export/search),
-> dual views (cosmos.gl overview + cytoscape detail), filter DSL, snapshots/handoff, and
-> the human↔AI shared view are implemented and verified (backend 720 + frontend 254
-> tests, E2E 18, [15] performance KPIs measured and passed). Security/correctness items
-> from a multi-agent audit closed. **stdio proxy and the Tauri desktop app are M2.**
-
 ```bash
 # run the server from source (PyPI release coming)
 uv run visualizebetter serve --port 8765          # opens the browser automatically
 
-# register in Claude Desktop / Claude Code via the stdio proxy ([8-D])
+# register in Claude Desktop / Claude Code via the stdio proxy
 #   command: visualizebetter  /  args: ["mcp-stdio"]
 ```
 

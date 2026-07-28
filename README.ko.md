@@ -73,7 +73,7 @@ AI가 외부 도구를 호출할 때 쓰는 표준 프로토콜.*
 
 **상태: M2 Feature Complete (2026-07-19).** M1 MVP + M2(stdio 프록시·Tauri 데스크톱
 앱·MCP Apps 인라인 렌더·undo/redo·다중 export 포맷) 구현·검증 완료 — 백엔드 pytest
-806 / 프론트 vitest 288 / Playwright E2E 21. `uv run visualizebetter serve` 로 실행,
+1129 / 프론트 vitest 288 / Playwright E2E 21. `uv run visualizebetter serve` 로 실행,
 Claude Desktop 은 `visualizebetter mcp-stdio` 로 연결.
 
 ---
@@ -313,17 +313,11 @@ GitHub Actions 매트릭스(Windows/Mac 러너)로 빌드·서명한다. (웹앱
 
 ## 사용 예
 
-> **M1 상태 (2026-07-18): 기능 완성.** 전체 MCP tool API(WRITE/READ/finding/
-> 사용자상태/뷰컨트롤/영속성/JSON import·export/search), 이중 뷰(cosmos.gl 개요 +
-> cytoscape 상세), 필터 DSL, 스냅샷·핸드오프, 사람↔AI 공유 뷰가 구현·검증됐다
-> (백엔드 720 + 프론트 254 테스트, E2E 18, [15] 성능 KPI 실측 통과). 다중 에이전트
-> 통합 감사로 발견한 보안·정확성 항목까지 마감. **stdio 프록시·Tauri 데스크톱은 M2.**
-
 ```bash
 # 소스에서 서버 실행 (PyPI 배포는 준비 중)
 uv run visualizebetter serve --port 8765          # 브라우저 자동 오픈
 
-# Claude Desktop / Claude Code 에는 stdio 프록시로 등록 ([8-D])
+# Claude Desktop / Claude Code 에는 stdio 프록시로 등록
 #   command: visualizebetter  /  args: ["mcp-stdio"]
 ```
 
