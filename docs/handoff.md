@@ -150,4 +150,4 @@ AI 가 이미 잘 기록한 데이터를 다룰 때:
 ---
 
 *이 문서는 구현된 도구 집합을 반영한다. 필터 문법 상세는
-[filter-dsl.md](filter-dsl.md), 설계 정본은 `VISUALIZEBETTER_PROJECT_PLAN.txt` 참조.*
+[filter-dsl.md](filter-dsl.md).*

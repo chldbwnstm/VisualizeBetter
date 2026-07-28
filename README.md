@@ -77,7 +77,6 @@ AI clients like Claude Desktop and Cursor use to call external tools.*
 app, MCP Apps inline render, undo/redo, multi-format export) implemented and verified —
 backend pytest 806 / frontend vitest 288 / Playwright E2E 21. Run with
 `uv run visualizebetter serve`; Claude Desktop connects via `visualizebetter mcp-stdio`.
-Details: [project plan v0.4](./VISUALIZEBETTER_PROJECT_PLAN.txt) (Korean).
 
 ---
 
@@ -176,7 +175,7 @@ separate tool (the dedicated one, Bloom, is paid). Static viewers (Gephi/yEd) lo
 so there's no realtime AI push. MCP chart servers are chart-oriented, not specialized for
 node-edge graphs or large scale (100K+). An open-source tool that is
 "MCP-native + realtime bidirectional + GPU large-scale + local-first" in one package
-doesn't exist yet. ([plan §1-B, §1-C](./VISUALIZEBETTER_PROJECT_PLAN.txt))
+doesn't exist yet.
 
 ---
 
@@ -184,7 +183,6 @@ doesn't exist yet. ([plan §1-B, §1-C](./VISUALIZEBETTER_PROJECT_PLAN.txt))
 
 Keeping knowledge from evaporating is the core of this program. The problems above are
 addressed with concrete mechanisms.
-(Design and implementation details: [plan §23 "knowledge persistence"](./VISUALIZEBETTER_PROJECT_PLAN.txt))
 
 | Problem | VisualizeBetter's answer |
 |---|---|
@@ -237,7 +235,6 @@ One system-prompt line, usable with any AI, enforces the habit (planned):
 
 The 100K figure is measured, not aspirational: the M3 tuning pass clocked 59.9 FPS
 rendering, a 9.3 s import, and 73.9 ms live-push apply at 100K nodes (RTX 4070 SUPER).
-([plan §15](./VISUALIZEBETTER_PROJECT_PLAN.txt))
 
 ---
 
@@ -265,8 +262,7 @@ visualizebetter serve                         ← the single local process that 
 The core loop: **the AI draws → the human sees and reacts → the AI reads the reaction →
 draws more.**
 
-Stack: Python backend (FastMCP + FastAPI/WebSocket) + React 19/TypeScript frontend —
-see [plan §8, §9](./VISUALIZEBETTER_PROJECT_PLAN.txt).
+Stack: Python backend (FastMCP + FastAPI/WebSocket) + React 19/TypeScript frontend.
 
 **Performance (a lag-free browser) is a core design goal.** cosmos.gl (WebGL/GPU) does
 the graph rendering, so the renderer — not the framework — sets the speed; live-push lag
@@ -345,9 +341,6 @@ Claude: save_snapshot("project-structure-v1")   ← the next session loads this 
 
 ## Documents
 
-- [Project plan v0.4](./VISUALIZEBETTER_PROJECT_PLAN.txt) (Korean) — data model, full MCP tool
-  API, filter DSL grammar, architecture, security, milestones, **§8-F packaging**,
-  **§23 knowledge-persistence design & implementation guide**
 - [docs/handoff.md](./docs/handoff.md) — session handoff protocol + system prompt
   snippet + implemented tool reference
 - [docs/filter-dsl.md](./docs/filter-dsl.md) — filter DSL grammar, semantics, and safety

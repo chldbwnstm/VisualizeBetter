@@ -74,7 +74,7 @@ AI가 외부 도구를 호출할 때 쓰는 표준 프로토콜.*
 **상태: M2 Feature Complete (2026-07-19).** M1 MVP + M2(stdio 프록시·Tauri 데스크톱
 앱·MCP Apps 인라인 렌더·undo/redo·다중 export 포맷) 구현·검증 완료 — 백엔드 pytest
 806 / 프론트 vitest 288 / Playwright E2E 21. `uv run visualizebetter serve` 로 실행,
-Claude Desktop 은 `visualizebetter mcp-stdio` 로 연결. 상세: [계획서 v0.4](./VISUALIZEBETTER_PROJECT_PLAN.txt).
+Claude Desktop 은 `visualizebetter mcp-stdio` 로 연결.
 
 ---
 
@@ -159,14 +159,13 @@ AI가 구조를 설계하고 코드를 짜면 **결과물은 저장소에 남는
 정적 뷰어(Gephi/yEd)는 파일을 로드해 보는 방식이라 AI 실시간 push가 안 된다.
 MCP 차트 서버들은 차트 위주라 노드-엣지 그래프나 대규모(100K+) 처리에 특화되어 있지 않다.
 "MCP 네이티브 + 실시간 쌍방향 + GPU 대규모 + 로컬 우선"을 한 번에 갖춘
-오픈소스는 아직 없다. ([계획서 §1-B, §1-C](./VISUALIZEBETTER_PROJECT_PLAN.txt))
+오픈소스는 아직 없다.
 
 ---
 
 ## 어떻게 해결하나
 
 지식이 증발하지 않게 만드는 것이 이 프로그램의 핵심이다. 위 문제들을 구체적인 메커니즘으로 푼다.
-(설계·구현 상세는 [계획서 §23 "지식 영속성"](./VISUALIZEBETTER_PROJECT_PLAN.txt))
 
 | 문제 | VisualizeBetter의 해법 |
 |---|---|
@@ -219,7 +218,6 @@ MCP 차트 서버들은 차트 위주라 노드-엣지 그래프나 대규모(10
 
 100K는 목표가 아니라 실측이다: M3 튜닝에서 100K 노드 기준 렌더 59.9 FPS,
 import 9.3초, 라이브 push 반영 73.9 ms를 측정했다 (RTX 4070 SUPER).
-([계획서 §15](./VISUALIZEBETTER_PROJECT_PLAN.txt))
 
 ---
 
@@ -246,8 +244,7 @@ visualizebetter serve                         ← 그래프를 소유하는 단�
 
 핵심 루프: **AI가 그리고 → 사람이 보고 반응하고 → AI가 그 반응을 읽고 → 더 그린다.**
 
-구현 스택: Python 백엔드(FastMCP + FastAPI/WebSocket) + React 19/TypeScript 프론트엔드 —
-[계획서 §8, §9](./VISUALIZEBETTER_PROJECT_PLAN.txt) 참조.
+구현 스택: Python 백엔드(FastMCP + FastAPI/WebSocket) + React 19/TypeScript 프론트엔드.
 
 **성능(브라우저 무렉)이 핵심 설계 목표다.** 그래프 렌더링은 cosmos.gl(WebGL/GPU)이
 담당하므로 프레임워크가 아니라 렌더러가 속도를 결정하고, 라이브 push의 lag는
@@ -322,9 +319,6 @@ Claude: save_snapshot("프로젝트-구조-v1")   ← 다음 세션이 이걸 �
 
 ## 문서
 
-- [프로그램 계획서 v0.4](./VISUALIZEBETTER_PROJECT_PLAN.txt) — 데이터 모델, 전체 MCP tool API,
-  필터 DSL 문법, 아키텍처, 보안, 마일스톤, **§8-F 배포/패키징**,
-  **§23 지식 영속성 설계 & 구현 가이드**
 - [docs/handoff.md](./docs/handoff.md) — 세션 핸드오프 프로토콜 + 시스템 프롬프트
   스니펫 + 구현된 도구 레퍼런스
 - [docs/filter-dsl.md](./docs/filter-dsl.md) — 필터 DSL 문법·의미론·안전 상한 정본
