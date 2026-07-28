@@ -818,19 +818,21 @@ class Graph:
             updated_at=now,
             created_by=created_by,
         )
-        # [13-B] CH1(3) — structural guarantee, not just a type check. The dict
-        # write used to land first, so an index failure left a record that was
-        # present but invisible: by_type had no bucket for it, and from then on
-        # get_graph_summary, list_nodes(sort_by), delete_node, save_snapshot,
-        # clear_all and undo all raised — the store could not even be snapshotted
-        # again. "Committed but unindexed" has to be unreachable, or the next
-        # type hole reproduces the same corruption.
+        # [13-B] CH1(1) — index first, then the dict. The dict write used to land
+        # first, so an index failure left a record that was present but invisible:
+        # by_type had no bucket for it, and from then on get_graph_summary,
+        # list_nodes(sort_by), delete_node, save_snapshot, clear_all and undo all
+        # raised — the store could not even be snapshotted again.
+        #
+        # Ordering rather than a try/except rollback, because the two are only
+        # equivalent while this stays the create path: `del self.nodes[id]` on an
+        # upsert would delete the record that was already there. Indexing first
+        # makes "committed but unindexed" unreachable without depending on a
+        # handler being correct, and the dict assignment that follows cannot fail.
+        # The value contract above should keep this unreachable anyway; this is
+        # what holds when the next type hole gets through it.
+        self.indices.add_node(node)
         self.nodes[id] = node
-        try:
-            self.indices.add_node(node)
-        except Exception:
-            del self.nodes[id]
-            raise
         self._track_layer(layer)
         self._touch()
         self.events.publish(NODE_ADD, node.to_dict())
@@ -874,9 +876,18 @@ class Graph:
             else []
         )
         patch = {"set": patch_set, "remove": removals}
+        # [13-B] CH1(1) — same ordering as the create path, for the same reason.
+        # ``retype_node`` ran *after* the record was already patched, so a type
+        # the index cannot hold left the node carrying it while ``by_type`` lost
+        # the node entirely: the graph became unsummarisable, unsortable,
+        # unsnapshottable and unrecoverable, and the caller was told the re-push
+        # failed. The value contract cannot see this one — a str subclass with
+        # ``__hash__ = None`` satisfies every declared type — so the index has to
+        # accept the new type *before* the record commits to it.
+        validate_patch(node, patch, _NODE_SERVER_MANAGED)  # RN6 LL, pure/pre-state
+        self.indices.retype_node(node.id, old_type, type)
         _apply_patch(node, patch, _NODE_SERVER_MANAGED)
         node.updated_at = _now()
-        self.indices.retype_node(node.id, old_type, node.type)
         self._track_layer(node.layer)
         self._touch()
         self.events.publish(NODE_UPDATE, {"id": node.id, "patch": patch})
@@ -910,12 +921,22 @@ class Graph:
         # itself, the event), so a patch that is going to be refused must be
         # refused here or its refusal leaves debris.
         validate_patch(node, patch, _NODE_SERVER_MANAGED)
-        self.history.touch_node(id)  # [M2e] before any lifecycle/patch mutates it
+        # [13-B] CH1(1) — the index accepts the new type before the record commits
+        # to it, exactly as in the create/merge paths. RN6 LL made validation come
+        # first so a refusal leaves no debris; the index is the one refusal
+        # validate_patch cannot foresee (a str subclass with __hash__ = None), so
+        # it has to happen before touch_node/_record_lifecycle too.
         old_type = node.type
+        new_type = patch.get("set", {}).get("type", old_type)
+        self.indices.retype_node(id, old_type, new_type)
+        self.history.touch_node(id)  # [M2e] before any lifecycle/patch mutates it
         published = self._record_lifecycle(node, patch, reason)
-        _apply_patch(node, patch, _NODE_SERVER_MANAGED)
+        try:
+            _apply_patch(node, patch, _NODE_SERVER_MANAGED)
+        except Exception:
+            self.indices.retype_node(id, new_type, old_type)  # 인덱스만 앞서가지 않게
+            raise
         node.updated_at = _now()
-        self.indices.retype_node(id, old_type, node.type)
         self._track_layer(node.layer)
         self._touch()
         self.events.publish(NODE_UPDATE, {"id": id, "patch": published})
@@ -1149,12 +1170,6 @@ class Graph:
             "style_hint": style_hint, "ttl": ttl, "tags": tags or [],
             "created_by": created_by,
         })
-        check_new_record(Edge, {  # [13-B] CH1(1)
-            "source": source, "target": target, "relation": relation, "key": key,
-            "directed": directed, "weight": weight, "layer": layer,
-            "style_hint": style_hint, "ttl": ttl, "tags": tags or [],
-            "created_by": created_by,
-        })
         for endpoint in (source, target):
             if endpoint not in self.nodes:
                 self._add_placeholder(endpoint, layer=layer, created_by=created_by)
@@ -1194,12 +1209,15 @@ class Graph:
             created_at=_now(),
             created_by=created_by,
         )
-        self.edges[identity] = edge  # [13-B] CH1(3) — same rollback as add_node
-        try:
-            self.indices.add_edge(identity, edge)
-        except Exception:
-            del self.edges[identity]
-            raise
+        # [13-B] CH1(1) — index first, same as add_node. Here the two orders are
+        # provably equivalent, not merely untested: every key indices.add_edge
+        # hashes (the identity tuple, source, target) is a component of the tuple
+        # the dict write hashes first, so neither can fail while the other
+        # succeeds. Kept in this order anyway so the two creation paths read the
+        # same and a future index that keys on something outside the tuple does
+        # not quietly reintroduce the create-path bug.
+        self.indices.add_edge(identity, edge)
+        self.edges[identity] = edge
         self._track_layer(layer)
         self._touch()
         self.events.publish(EDGE_ADD, edge.to_dict())

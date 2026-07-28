@@ -1100,24 +1100,6 @@ def test_finding_size_check_types_before_len():
         g.add_finding(title="t", node_ids=5)
 
 
-def test_index_never_disagrees_with_the_record_dict():
-    """(CH1-1) 구조 보장 — 인덱싱이 실패하면 dict 등록도 되돌린다. 둘이 갈리면
-    노드는 조회되는데 어떤 필터에도 안 잡히는 유령이 된다."""
-    g = Graph()
-    g.add_node(id="n", label="N", type="class")
-    before_nodes, before_edges = dict(g.nodes), dict(g.edges)
-
-    class Unhashable(str):
-        __hash__ = None  # type: ignore[assignment]
-
-    # 계약 검사를 통과하는(str 서브클래스) 값으로 인덱싱만 실패시킨다
-    with pytest.raises(TypeError):
-        g.add_node(id="ghost", label="G", type=Unhashable("weird"))
-    assert g.nodes == before_nodes
-    with pytest.raises(TypeError):
-        g.add_edge(source="n", target="n", relation=Unhashable("self"))
-    assert g.edges == before_edges
-
 
 def test_a_raising_subscriber_cannot_undo_a_committed_mutation():
     """(CH1-2) ★ 구독자 하나가 raise 하면 (a) 뒤 구독자들이 이벤트를 못 받고
@@ -1184,3 +1166,88 @@ def test_rejected_creation_leaves_every_downstream_surface_working():
     assert g.delete_node("keep")["ok"]
     g.clear_all()
     assert g.nodes == {}
+
+
+class _Unhashable(str):
+    """str 계약은 만족하되 인덱스에는 들어갈 수 없는 값.
+
+    ★ CH1(1) 값 계약이 **볼 수 없는** 유일한 부류다 — 선언 타입이 str 이고
+    isinstance 도 True 라, 인덱스만이 이걸 거부할 수 있다. 그래서 "인덱스가 먼저
+    받아들인 뒤에 레코드가 커밋한다"는 순서가 타입 검사와 별개로 필요하다."""
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda g: g.add_node(id="fresh", label="X", type=_Unhashable("weird")),
+            id="create",
+        ),
+        pytest.param(
+            lambda g: g.add_node(id="n", label="Replacement", type=_Unhashable("weird")),
+            id="merge-repush",
+        ),
+        pytest.param(
+            lambda g: g.update_node("n", {"set": {"type": _Unhashable("weird")}}),
+            id="update",
+        ),
+        pytest.param(
+            lambda g: g.add_edge(source="n", target="m", relation=_Unhashable("weird")),
+            id="edge",
+        ),
+    ],
+)
+def test_an_index_refusal_leaves_records_and_indices_agreeing(mutate):
+    """(CH1-1) ★ 네 경로 전부. 이전에는 레코드를 먼저 바꾼 뒤 인덱스가 raise 해서,
+    노드가 자기 type 을 든 채 by_type 에서 **통째로 사라졌다** — 그 뒤 요약·정렬·
+    삭제·스냅샷·undo 가 전부 old_type 해싱에서 죽는 복구 불가 상태다. 호출자는
+    실패를 통보받으므로 무엇이 깨졌는지도 모른다."""
+    g = Graph()
+    g.add_node(id="n", label="Original", type="class")
+    g.add_node(id="m", label="M", type="class")
+    g.add_edge(source="n", target="m", relation="calls")
+    before_nodes = {k: v.to_dict() for k, v in g.nodes.items()}
+    before_edges = {k: v.to_dict() for k, v in g.edges.items()}
+    before_types = {k: set(v) for k, v in g.indices.by_type.items()}
+    before_adj = {k: set(v) for k, v in g.indices.adjacency.items()}
+
+    with pytest.raises(TypeError):
+        mutate(g)
+
+    assert {k: v.to_dict() for k, v in g.nodes.items()} == before_nodes
+    assert {k: v.to_dict() for k, v in g.edges.items()} == before_edges
+    assert {k: set(v) for k, v in g.indices.by_type.items()} == before_types
+    assert {k: set(v) for k, v in g.indices.adjacency.items()} == before_adj
+
+    # 거부 이후에도 모든 후속 표면이 산다 (오염 시나리오가 성립하지 않는다)
+    node = g.get_node("n")
+    assert node.id in g.indices.by_type[node.type]
+    g.update_node("n", {"set": {"type": "service"}})
+    assert g.indices.by_type["service"] == {"n"}
+    g.delete_node("n", cascade=True)
+    assert "n" not in g.nodes and "n" not in g.indices.adjacency
+
+
+def test_a_refused_retype_leaves_the_old_bucket_intact():
+    """(CH1-1) 인덱스 연산은 all-or-nothing 이어야 한다. `retype_node` 는 옛
+    버킷을 먼저 비웠기 때문에 새 버킷 쓰기가 실패하면 노드가 어느 버킷에도 없게
+    됐다 — 실패한 재-push 가 노드를 타입 필터에서 영구히 지우는 경로다.
+
+    이 불변식은 지금 두 겹으로 지켜진다(선행 해시 검사 + add-before-discard).
+    둘 중 하나만 지우면 다른 하나가 가려서 이 테스트가 초록으로 남으므로, 뮤테이션
+    검증은 **둘을 동시에** 되돌려서 했다 — 리포트 참조."""
+    from visualizebetter.graph.indices import Indices
+
+    indices = Indices()
+    node = Graph().add_node(id="n", label="N", type="class")
+    indices.add_node(node)
+    assert indices.by_type["class"] == {"n"}  # 전제
+
+    with pytest.raises(TypeError):
+        indices.retype_node("n", "class", _Unhashable("weird"))
+    assert indices.by_type["class"] == {"n"}
+
+    indices.retype_node("n", "class", "service")  # 정상 경로 회귀
+    assert indices.by_type == {"service": {"n"}}
