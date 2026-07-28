@@ -2596,3 +2596,123 @@ def test_a_quarantined_nan_graph_can_still_be_listed(store):
     # 반대 축: 새 NaN 은 여전히 못 들어온다
     with pytest.raises(ValueError):
         loaded.add_node(id="fresh", label="F", type="t", properties={"x": float("nan")})
+
+
+def test_a_store_missing_a_header_column_still_loads(tmp_path):
+    """(CH1c3 [3]) 컬럼이 없던 시절의 스토어가 `IndexError: No item with that key`
+    만 내고 죽었다 — 스냅샷 id 도, 어느 컬럼인지도, 조치 방법도 없다. 스토어에서
+    가장 행동 불가능한 에러 표면이었고, 하필 copy-forward 가 존재하는 이유인 바로
+    그 인구에게 떨어진다.
+
+    ★ 컬럼이 선택적인 것은 구조상 이미 사실이다 — `_copy_one_snapshot` 이
+    shared-column 교집합을 계산한다는 게 컬럼 드리프트를 실재로 가정한다는 뜻이다.
+    없던 것은 그걸 **볼 수단**이었다. (근본인 스키마 버전 표식 부재는 CH3 항목.)"""
+    data_dir = tmp_path / "no-version"
+    data_dir.mkdir()
+    conn = sqlite3.connect(data_dir / DB_FILENAME)
+    conn.executescript(
+        """
+        CREATE TABLE snapshot (id TEXT PRIMARY KEY, name TEXT, description TEXT,
+            created_at TEXT, kind TEXT, node_count INT, edge_count INT,
+            metadata TEXT, layers TEXT);
+        CREATE TABLE node (snapshot_id TEXT, id TEXT, label TEXT, "type" TEXT,
+            properties TEXT, parent_id TEXT, style_hint TEXT, position_hint TEXT,
+            layer TEXT, ttl INT, tags TEXT, created_at TEXT, updated_at TEXT,
+            created_by TEXT, PRIMARY KEY (snapshot_id, id));
+        INSERT INTO snapshot VALUES ('s1','old','','2026-01-01T00:00:00Z','manual',
+            1,0,'{}','[]');
+        INSERT INTO node VALUES ('s1','n','N','class','{}',NULL,NULL,NULL,NULL,0,
+            '[]','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SnapshotStore(data_dir)
+    loaded = run(store.load_snapshot("s1"))
+    assert "n" in loaded.nodes
+    assert loaded.version == 1                       # 문서화된 기본값
+    again = run(store.save_snapshot(loaded, name="re-saved"))
+    assert "n" in run(store.load_snapshot(again["snapshot_id"])).nodes
+
+
+def test_a_header_column_with_no_alter_still_loads(tmp_path):
+    """(CH1c3 [3]) `version` 은 ALTER 로 메꿔지지만 `layers`/`metadata` 는 아니다 —
+    두 방어가 덮는 범위가 다르다. ALTER 가 없는 컬럼이 빠진 스토어에서는
+    `_header_value` 만이 유일한 방어이고, 그게 없으면 `IndexError: No item with
+    that key` 하나로 끝난다(스냅샷 id 도 컬럼 이름도 없이)."""
+    data_dir = tmp_path / "no-layers"
+    data_dir.mkdir()
+    conn = sqlite3.connect(data_dir / DB_FILENAME)
+    conn.executescript(
+        """
+        CREATE TABLE snapshot (id TEXT PRIMARY KEY, name TEXT, description TEXT,
+            created_at TEXT, kind TEXT, node_count INT, edge_count INT,
+            metadata TEXT, version INT);
+        CREATE TABLE node (snapshot_id TEXT, id TEXT, label TEXT, "type" TEXT,
+            properties TEXT, parent_id TEXT, style_hint TEXT, position_hint TEXT,
+            layer TEXT, ttl INT, tags TEXT, created_at TEXT, updated_at TEXT,
+            created_by TEXT, PRIMARY KEY (snapshot_id, id));
+        INSERT INTO snapshot VALUES ('s1','old','','2026-01-01T00:00:00Z','manual',
+            1,0,'{}',1);
+        INSERT INTO node VALUES ('s1','n','N','class','{}',NULL,NULL,NULL,NULL,0,
+            '[]','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SnapshotStore(data_dir)
+    loaded = run(store.load_snapshot("s1"))
+    assert "n" in loaded.nodes
+    assert loaded.layers == []                       # 문서화된 기본값
+
+
+def test_the_hard_refusal_message_does_not_overclaim():
+    """(CH1c3 [1]) 거부 문구가 "요약·스냅샷·삭제가 불가능해진다" 고 주장했는데,
+    깊이 129~490 구간에서 그 주장은 **경험적으로 거짓**이다(baseline 이 그 네 동작을
+    전부 통과시킨다). 깊이를 하드 거부에서 뺐으므로 문구도 함께 정정했다 —
+    무엇이 거부되고 무엇이 quarantine 인지를 말한다."""
+    import inspect
+
+    from visualizebetter.graph import snapshots
+
+    source = inspect.getsource(snapshots._check_restored)
+    assert "cannot be summarised" not in source
+    assert "Only identity and serialisability refuse here" in source
+
+
+CORPUS_ROOT = Path(os.environ.get(
+    "VISUALIZEBETTER_CORPUS",
+    Path(os.environ.get("LOCALAPPDATA", "")) / "visualizebetter-corpus",
+))
+
+
+@pytest.mark.skipif(
+    not (CORPUS_ROOT / "verify_corpus.py").exists(),
+    reason="게이트 이전 빌드로 만든 코퍼스가 이 머신에 없다",
+)
+def test_no_pre_gate_snapshot_stopped_opening():
+    """(CH1c3) ★ 코디의 독립 코퍼스를 완료 검증에 직접 건다.
+
+    이 라운드의 교훈이 그것이다: 내 테스트 1112건이 **전부 통과하는 상태에서**
+    회귀 3건이 남아 있었다(e_props_nan 의 list_nodes, f_depth_402, z_all_mixed).
+    내 인수 기준 5종에 깊이 402 와 "quarantine 된 뒤의 읽기 경로" 가 없었기
+    때문이다. 스스로 고른 케이스만으로는 스스로의 사각을 못 본다 — 그래서 채점자와
+    **같은 기준**을 여기서 돌린다.
+
+    baseline 은 사용자 디스크에 실제로 있는 빌드(2bdaca1)다."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "verify_corpus.py",
+         "--build", str(Path(__file__).resolve().parents[2]),
+         "--baseline", "baselines/2bdaca1_pre_gate.json"],
+        cwd=CORPUS_ROOT, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=900,
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+    )
+    assert "REGRESSION" not in result.stdout, result.stdout[-3000:]
+    assert result.returncode == 0, result.stdout[-3000:]
+    assert "no regressions vs baseline" in result.stdout

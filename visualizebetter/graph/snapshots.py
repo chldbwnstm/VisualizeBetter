@@ -320,6 +320,23 @@ def _history_column_alters(existing: set[str]) -> list[str]:
     ]
 
 
+def _snapshot_column_alters(existing: set[str]) -> list[str]:
+    """[13-B] CH1c3 — heal a ``snapshot`` table written before ``version`` existed.
+
+    Such a store *reads* fine (``_header_value`` supplies the documented default)
+    but could not be written to: ``CREATE TABLE IF NOT EXISTS`` leaves the old
+    table alone and ``save_snapshot``'s INSERT then names a column that is not
+    there. Being able to open a store but not save into it is the worst of the
+    two — the next auto-snapshot fails on a store that looked healthy.
+
+    Spelled out here for the same reason as the [24-C] ALTERs: both schema paths
+    build from one list, so they cannot drift (RN4 DD).
+    """
+    if not existing or "version" in existing:
+        return []
+    return ["ALTER TABLE snapshot ADD COLUMN version INTEGER NOT NULL DEFAULT 1"]
+
+
 def _apply_schema(connection: sqlite3.Connection) -> None:
     """[23-C] RN3 V — the whole schema, in one place both paths call.
 
@@ -334,6 +351,15 @@ def _apply_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(_SCHEMA)
     columns = {row[1] for row in connection.execute('PRAGMA table_info("finding")')}
     for statement in _history_column_alters(columns):
+        connection.execute(statement)
+    # [13-B] CH1c3 — the same treatment for `snapshot.version`. A store written
+    # before that column existed loads fine (see `_header_value`) but could not be
+    # *written* to: `CREATE TABLE IF NOT EXISTS` leaves the old table alone and the
+    # INSERT then names a column that is not there. Reading an old store while
+    # being unable to save into it is the worst of both — the user's next
+    # auto-snapshot fails on a store that looked healthy.
+    header_columns = {row[1] for row in connection.execute('PRAGMA table_info("snapshot")')}
+    for statement in _snapshot_column_alters(header_columns):
         connection.execute(statement)
 
 
@@ -877,6 +903,37 @@ def _sizing_payload(graph: Graph) -> dict[str, Any]:
     }
 
 
+def _header_value(row: Any, column: str, snapshot_id: str, fallback: Any) -> Any:
+    """[13-B] CH1c3 — read a snapshot header column that an older store may lack.
+
+    A store written before a column existed raised ``IndexError: No item with that
+    key`` and nothing else: no snapshot id, no column name, no idea what to do
+    about it. That is the least actionable error surface in the store, and it
+    lands on exactly the population copy-forward exists for.
+
+    The value is optional by construction — ``_copy_one_snapshot`` already
+    computes a shared-column intersection, which is an admission that column
+    drift is real. What was missing was any way to *see* it. Missing columns get
+    a documented default and a warning naming the snapshot and the column;
+    anything the graph genuinely cannot do without still fails loudly.
+
+    (The deeper gap — this store carries no schema version marker at all: no
+    ``PRAGMA user_version``, no version table — is registered as a [13-B] CH3
+    contract item. This is the diagnostic, not the fix.)
+    """
+    try:
+        return row[column]
+    except (IndexError, KeyError):
+        log.warning(
+            "snapshot %s has no %r column (store predates it); using %r."
+            " The snapshot still loads; re-saving it writes the current schema.",
+            snapshot_id,
+            column,
+            fallback,
+        )
+        return fallback
+
+
 def _report_quarantine(
     data_dir: Path, target_db: Path, snapshot_id: str, quarantine: list[str]
 ) -> None:
@@ -927,8 +984,9 @@ def _check_restored(
     except ValueError as exc:
         raise ValueError(
             f"snapshot {snapshot_id} cannot be loaded: {kind} {identity!r} is invalid"
-            f" — {exc}. Loading it would leave a graph that cannot be summarised,"
-            " snapshotted or deleted."
+            f" — {exc}. Only identity and serialisability refuse here; policy"
+            " limits (size, depth, element types) load with a quarantine warning"
+            " instead ([13-B] CH1c)."
         ) from None
     return [f"{kind} {identity!r}: {note}" for note in notes]
 
@@ -1004,6 +1062,11 @@ class SnapshotStore:
         columns = {row[1] for row in await cursor.fetchall()}
         await cursor.close()
         for statement in _history_column_alters(columns):
+            await db.execute(statement)
+        cursor = await db.execute('PRAGMA table_info("snapshot")')
+        header_columns = {row[1] for row in await cursor.fetchall()}
+        await cursor.close()
+        for statement in _snapshot_column_alters(header_columns):
             await db.execute(statement)
         await db.commit()
 
@@ -1196,9 +1259,9 @@ class SnapshotStore:
 
             graph = Graph()
             quarantine: list[str] = []
-            graph.metadata = json.loads(header["metadata"])
-            graph.layers = json.loads(header["layers"])
-            graph.version = header["version"]
+            graph.metadata = json.loads(_header_value(header, "metadata", snapshot_id, "{}"))
+            graph.layers = json.loads(_header_value(header, "layers", snapshot_id, "[]"))
+            graph.version = _header_value(header, "version", snapshot_id, 1)
 
             async with db.execute(
                 "SELECT * FROM node WHERE snapshot_id = ?", (snapshot_id,)
