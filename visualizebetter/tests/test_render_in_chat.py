@@ -8,6 +8,7 @@ sourced labels, a strict no-external CSP, and no serve URL/token in the card.
 
 import asyncio
 import json
+import re
 
 import pytest
 from fastmcp import Client
@@ -143,8 +144,66 @@ def test_card_carries_no_serve_url_or_token(graph):
     assert "token" not in html and "authorization" not in html
 
 
+# [13-B] CH2(2) — the one place the card is allowed to assign markup: an
+# empty-state div built from a literal, with nothing caller-supplied in it.
+MARKER = "visualizebetter-subgraph"
+
+_ALLOWED_INNER_HTML = re.compile(
+    r"""wrap\.innerHTML = '<div id="empty">no subgraph</div>';"""
+)
+
+
+def _template_code(html: str) -> str:
+    """The card minus its embedded JSON payload — i.e. the part we author.
+
+    [13-B] CH2(2) — the original assertion grepped the payload and *only* the
+    payload; the correct scope is its exact complement. Graph data is data: a
+    node label may legitimately contain any string, including "innerHTML", and a
+    guard over the authored template must not care what a label says.
+    """
+    parts = html.split(MARKER)
+    if len(parts) < 3:
+        return html  # marker shape changed — grep everything rather than nothing
+    return parts[0] + MARKER.join(parts[2:])
+
+
 def test_card_renders_labels_as_svg_text_not_html(graph):
-    # Labels reach the DOM via textContent on an SVG <text>, never innerHTML.
+    """Labels reach the DOM via textContent on an SVG <text>, never innerHTML.
+
+    [13-B] CH2(2) — this used to read
+    ``html.split("visualizebetter-subgraph")[1]``, and that window was **7% of
+    the document**: the marker appears twice (script id, then getElementById), so
+    `[1]` is the text *between* them — the embedded JSON payload — while the code
+    that renders labels sits outside it. The assertion therefore could not fail
+    for the reason it claimed. Worse, it could fail for a reason it did not
+    claim: a node label containing the literal string "innerHTML" lands in that
+    JSON payload and reddens the test with nothing unsafe happening (both
+    reproduced). Now it greps the exact complement — everything we author, none
+    of the data.
+
+    ★ This is a **grep guard, not a safety proof.** What actually proves labels
+    cannot become markup is the behavioural test in
+    ``frontend/e2e/render_in_chat.spec.ts`` — it loads the card in a real browser
+    with a ``</script><img src=x onerror=...>`` label and asserts zero ``img``
+    elements. This one just keeps a second ``innerHTML =`` from appearing in the
+    template unnoticed, over the 93% we wrote rather than the 7% we did not.
+    """
     html = render_card_html(build_subgraph(graph, "A"))
     assert ".textContent = " in html
-    assert "innerHTML" not in html.split("visualizebetter-subgraph")[1]  # not used for labels
+
+    remaining = _ALLOWED_INNER_HTML.sub("", html)
+    assert "innerHTML" not in remaining, (
+        "the card template gained a new innerHTML assignment; if it is genuinely"
+        " safe, extend _ALLOWED_INNER_HTML with the exact literal and say why"
+    )
+
+
+def test_a_label_named_innerHTML_does_not_redden_this_test(graph):
+    """[13-B] CH2(2) — 창 방식이 만들던 **거짓 실패**가 사라졌음을 고정한다.
+
+    라벨은 JSON 페이로드로 들어가므로, 옛 단언은 라벨 문자열이 'innerHTML' 이기만
+    하면 안전과 무관하게 빨개졌다(재현됨)."""
+    graph.add_node(id="odd", label="innerHTML", type="class")
+    html = render_card_html(build_subgraph(graph, "odd"))
+    assert "innerHTML" in html  # 전제: 라벨이 실제로 문서에 실린다
+    assert "innerHTML" not in _ALLOWED_INNER_HTML.sub("", _template_code(html))

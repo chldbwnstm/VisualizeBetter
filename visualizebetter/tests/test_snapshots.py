@@ -938,12 +938,39 @@ def test_source_contains_no_destructive_file_calls():
     import ast
 
     source = Path(snap_mod.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    allowed_line = next(
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_leave_breadcrumb"
+    assert _destructive_offenders(source) == [], (
+        f"파괴적 파일 호출이 재도입됐다: {_destructive_offenders(source)}"
     )
+
+
+def _destructive_offenders(source: str) -> list[str]:
+    """[13-B] CH2(1) — 파괴 호출을 찾되, 면제는 **스코프**로 준다.
+
+    처음엔 면제 조건이 `node.lineno > allowed_line` 이었고 allowed_line 은
+    ``_leave_breadcrumb`` 의 **def 줄**이었다. 그래서 면제 구역이 그 함수 본문이
+    아니라 **그 아래 전부**였다 — 521행, 모듈의 41%, SnapshotStore 의 async API
+    전체와 AutoSnapshotter 를 포함한다. 실증: 모듈 맨 끝에
+    ``Path(db_path).write_text("")``(사용자 스냅샷 DB 전멸)를 넣어도 감사가
+    통과했고, 같은 자리에 ``.unlink()`` 를 넣으면 잡혔다 — 구멍은 write_text
+    면제 조건에 특정된다.
+
+    이 감사가 지키는 것은 "커밋된 legacy 콘텐츠는 어떤 경로로도 제거되지
+    않는다"이므로, 덮어쓰기가 모듈 어디에 들어오든 잡혀야 한다. 이제 면제는
+    breadcrumb 함수의 AST 서브트리 안에 있는 노드로 한정된다.
+    """
+    import ast
+
+    tree = ast.parse(source)
+    breadcrumb = next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_leave_breadcrumb"
+        ),
+        None,
+    )
+    exempt = {id(n) for n in ast.walk(breadcrumb)} if breadcrumb is not None else set()
+
     offenders = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -951,11 +978,37 @@ def test_source_contains_no_destructive_file_calls():
         func = node.func
         name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
         if name in _DESTRUCTIVE_CALLS:
-            if name == "write_text" and node.lineno > allowed_line:
-                continue  # breadcrumb 작성 (새 파일만)
+            if name == "write_text" and id(node) in exempt:
+                continue  # breadcrumb 작성 (새 파일만) — 그 함수 안에서만
             offenders.append(f"{name}() @ line {node.lineno}")
-    assert offenders == [], f"파괴적 파일 호출이 재도입됐다: {offenders}"
+    return offenders
 
+
+def test_the_destructive_call_audit_has_teeth():
+    """[13-B] CH2(1) — 감사 자신이 살아 있는지 합성 소스로 증명한다.
+
+    실제 모듈이 깨끗하면 감사는 "아무것도 못 찾아서" 통과하는 것과 구분되지
+    않는다. 다음 리팩터에서 면제 창이 다시 넓어져도 이 단언이 드러낸다."""
+    breadcrumb_only = textwrap.dedent(
+        """
+        def _leave_breadcrumb(path):
+            path.write_text('moved')
+        """
+    )
+    assert _destructive_offenders(breadcrumb_only) == []
+
+    # ★ 모듈 후반부의 덮어쓰기 — 첫 판이 놓쳤던 바로 그 형태
+    late_overwrite = breadcrumb_only + textwrap.dedent(
+        """
+        def _wipe(db):
+            db.write_text('')
+        """
+    )
+    assert any("write_text" in o for o in _destructive_offenders(late_overwrite))
+
+    for call in ("unlink", "rmtree", "replace", "rename"):
+        source = breadcrumb_only + f"\ndef _bad(p):\n    p.{call}()\n"
+        assert any(call in o for o in _destructive_offenders(source)), call
 
 def test_concurrent_processes_leave_both_stores_intact(canonical):
     """R1 ★ 실프로세스 N개 동시 실행 — RN2 의 unlink→rename 은 여기서 25회 중

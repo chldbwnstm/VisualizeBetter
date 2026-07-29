@@ -511,8 +511,29 @@ def test_pong_server_event_round_trip():
 # --- rate limit ([8-C] 연결당 rate limit) ---
 
 
-def test_default_rate_limit_is_20_per_second():
-    assert DEFAULT_RATE_LIMIT == 20
+def test_the_default_rate_limiter_is_actually_wired(graph):
+    """[13-B] CH2(4) — 기본 배선을 **동작으로** 확인한다.
+
+    이전에는 `assert DEFAULT_RATE_LIMIT == 20` 하나였고, 동작 테스트 3건은 전부
+    자기 limiter 를 주입했다. 그래서 hub 의 `rate_limiter or RateLimiter()` 기본
+    경로가 한 번도 평가되지 않았다 — 기본값을 사실상 무제한(max_events=10**9)으로
+    바꿔도 백엔드 전건이 통과했다. serve 가 실제로 만드는 hub 가 바로 그 기본
+    경로를 쓰므로, 보호가 사라져도 초록인 상태였다.
+
+    상수는 여기서도 함께 고정하되, 근거는 상수가 아니라 거부 동작이다."""
+    hub = WSHub(graph)  # ★ limiter 미주입 — serve 와 같은 경로
+    assert hub.rate_limiter.max_events == DEFAULT_RATE_LIMIT == 20
+
+    clock = [0.0]
+    hub.rate_limiter.clock = lambda: clock[0]
+    conn = FakeConnection()
+    hub.register(conn)
+
+    for index in range(DEFAULT_RATE_LIMIT):
+        run(hub.handle_client_event(conn, {"op": "focus.set", "data": {"id": f"n{index}"}}))
+
+    with pytest.raises(RateLimitExceeded):
+        run(hub.handle_client_event(conn, {"op": "focus.set", "data": {"id": "over"}}))
 
 
 def test_rate_limit_rejects_over_budget(graph):

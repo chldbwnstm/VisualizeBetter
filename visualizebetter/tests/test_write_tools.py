@@ -655,3 +655,25 @@ def test_push_batch_rejects_nan_before_walking_the_batch(mcp, graph):
 
     ok = call(mcp, "push_batch", nodes=[{"id": "a", "label": "A", "type": "t"}])
     assert ok["added_nodes"] == 1                 # 전제: 성한 배치는 통과한다
+
+
+def test_a_huge_identifier_does_not_come_back_in_the_error(mcp, graph):
+    """[13-B] CH2(7b) — 에러는 AI 가 읽는다. 60KB 노드 id 가 그대로 실리면 실패한
+    호출 **한 번에 60KB 토큰**이 컨텍스트로 되돌아온다(실측: 60,000자 id 의
+    KeyError 메시지가 60,002자였고 ToolError 가 그대로 옮겼다).
+
+    80자면 실제 id(경로·점표기·uuid)를 알아보기에 충분하고, 뒤에 전체 길이를
+    붙이므로 조용히 잃는 것도 없다 — 길게 되풀이하지 않을 뿐이다."""
+    from visualizebetter.mcp_server import MAX_IDENTIFIER_IN_MESSAGE, brief
+
+    huge = "n" * 60_000
+    with pytest.raises(ToolError) as caught:
+        call(mcp, "update_node", id=huge, patch={"set": {"label": "x"}})
+
+    message = str(caught.value)
+    assert len(message) < 400, f"에러가 {len(message)}자다 — 식별자가 절단되지 않았다"
+    assert huge[:MAX_IDENTIFIER_IN_MESSAGE] in message  # 알아볼 수는 있어야 한다
+    assert "60000 chars" in message                     # 얼마가 생략됐는지 말한다
+
+    # 짧은 식별자는 그대로 나온다 — 절단이 평상시를 해치지 않는다
+    assert brief("app.OrderService") == "app.OrderService"

@@ -23,6 +23,19 @@ const calls = {
   /** Last positions handed to the GPU — the only place the call-site's map shows. */
   lastPositions: null as Float32Array | null,
   lastColors: null as Float32Array | null,
+  /** [13-B] CH2(3) — indices the component asked to track, for the readback mock. */
+  trackedIndices: [] as number[],
+  /**
+   * [13-B] CH2(3) — what the "GPU" reports back, independent of what was
+   * uploaded. That independence is the point of a readback: the simulation moves
+   * points, so what comes back is *not* what went in. Leave it null and the mock
+   * echoes the last upload; set it and the component sees a moved layout.
+   */
+  gpuPositions: null as Float32Array | null,
+  /** [13-B] CH2(3) — how many times the component read back from the "GPU". */
+  readbacks: 0,
+  /** [13-B] CH2(3) — label-overlay readbacks, counted separately. */
+  labelReadbacks: 0,
 }
 
 /**
@@ -63,14 +76,40 @@ vi.mock('@cosmos.gl/graph', () => ({
       calls.start += 1
     }
     pause() {}
+    // [13-B] CH2(3) — the readbacks return what was written, not always empty.
+    //
+    // They used to be `return []` / `return new Map()`: the signatures matched,
+    // so every call type-checked and nothing ever failed — but the two pipelines
+    // that consume them were invisible to all 288 tests. Deleting the whole body
+    // of `capturePositions` (the [7-D] SETTLING→FROZEN readback, including its
+    // "NaN must never become a seed anchor" guard) left the suite fully green,
+    // and so did stubbing the label overlay to `setLabels([])`.
+    //
+    // A mock that always answers "nothing" cannot tell a working pipeline from a
+    // deleted one. This one echoes: whatever the component last wrote is what it
+    // reads back, so a component that stops reading, or reads and discards, is
+    // now a visible difference.
     getPointPositions() {
-      return []
+      calls.readbacks += 1
+      const source = calls.gpuPositions ?? calls.lastPositions
+      return source ? Array.from(source) : []
     }
     destroy() {}
     fitView() {}
-    trackPointPositionsByIndices() {}
+    trackPointPositionsByIndices(indices: number[]) {
+      calls.trackedIndices = Array.from(indices ?? [])
+    }
     getTrackedPointPositionsMap() {
-      return new Map()
+      calls.labelReadbacks += 1
+      const flat = calls.gpuPositions ?? calls.lastPositions
+      const map = new Map<number, [number, number]>()
+      if (!flat) return map
+      for (const index of calls.trackedIndices) {
+        const x = flat[index * 2]
+        const y = flat[index * 2 + 1]
+        if (Number.isFinite(x) && Number.isFinite(y)) map.set(index, [x, y])
+      }
+      return map
     }
     getZoomLevel() {
       return 1
@@ -171,6 +210,11 @@ beforeEach(() => {
   calls.render = 0
   calls.simulationEnabled = []
   calls.start = 0
+  calls.lastPositions = null
+  calls.trackedIndices = []
+  calls.gpuPositions = null
+  calls.readbacks = 0
+  calls.labelReadbacks = 0
   cosmosReady.isReady = true
   cosmosReady.ready = Promise.resolve()
   vi.useFakeTimers()
@@ -559,5 +603,61 @@ describe('★ [KI-1] cosmos readiness gate — 미준비 상태를 시뮬레이�
     addNodes('a')
 
     expect(calls.setPointPositions).toBeGreaterThan(0)
+  })
+})
+
+
+describe('★ [13-B] CH2(3) GPU readback — mock 이 값을 되돌려주므로 관측된다', () => {
+  test('settle 이 끝나면 GPU 에서 배치를 실제로 읽어온다', () => {
+    render(<OverviewCanvas highlighted={[]} />)
+    addNodes('a', 'b')
+
+    // 시뮬레이션이 좌표를 움직인 것을 흉내낸다 — 업로드한 값과 **다른** 값을
+    // 돌려주는 것이 readback 의 요점이다.
+    const seeded = calls.lastPositions
+    expect(seeded).not.toBeNull()
+    const moved = Float32Array.from(seeded as Float32Array)
+    for (let i = 0; i < moved.length; i += 1) moved[i] += 100
+    calls.gpuPositions = moved
+
+    act(() => vi.advanceTimersByTime(600))
+    act(() => vi.advanceTimersByTime(4000)) // settle 상한까지 — FROZEN 에서 capture
+
+    // ★ 이 단언이 capturePositions 본문 삭제를 잡는다. 이전 mock 은 항상 빈 값을
+    // 돌려줬으므로 그 본문을 통째로 지워도 288/288 초록이었다 — [7-D]
+    // SETTLING→FROZEN 의 배치 보존과 "NaN 은 seed 앵커가 되면 안 된다" 가드가
+    // 함께 사라져도 아무 테스트도 몰랐다.
+    expect(calls.readbacks).toBeGreaterThan(0)
+  })
+
+  test('NaN 좌표는 seed 앵커로 저장되지 않는다', () => {
+    // capturePositions 와 retainLivePositions 가 공유하는 불변식. 없는 점은
+    // cosmos 가 설계상 NaN 으로 돌려주므로, 삭제된 노드가 이웃의 seed 앵커로
+    // 되살아나면 안 된다.
+    const built = {
+      ids: ['a', 'b', 'c'],
+      pointPositions: Float32Array.from([1, 2, Number.NaN, 5, 7, Number.NaN]),
+    } as unknown as Parameters<typeof retainLivePositions>[0]
+
+    const live = retainLivePositions(built)
+    expect([...live.keys()]).toEqual(['a'])
+    expect(live.get('a')).toEqual([1, 2])
+  })
+
+  test('라벨 오버레이가 GPU 읽기 파이프라인을 실제로 돈다', () => {
+    render(<OverviewCanvas highlighted={[]} />)
+    addNodes('a', 'b')
+    act(() => vi.advanceTimersByTime(600))
+    act(() => vi.advanceTimersByTime(4000)) // 라벨 갱신은 스로틀돼 있다
+
+    // 이전 mock 은 항상 빈 Map 을 돌려줬으므로 이 파이프라인이 도는지 여부가
+    // 288건 어디에도 나타나지 않았다. 이제는 호출 자체가 관측된다.
+    expect(calls.labelReadbacks).toBeGreaterThan(0)
+    expect(calls.trackedIndices.length).toBeGreaterThan(0)
+
+    // ★ 여기까지가 vitest 에서 정직하게 볼 수 있는 범위다. 라벨이 실제로 DOM 에
+    // **놓이는지**는 jsdom 에서 확인할 수 없다 — getBoundingClientRect 가 전부 0
+    // 이라 화면 안/밖 판정이 성립하지 않는다. 그 축은 실제 브라우저가 필요하고
+    // frontend/e2e/graph.spec.ts 가 담당한다.
   })
 })

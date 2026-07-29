@@ -92,16 +92,31 @@ def test_loopback_hosts_are_allowed(client, host):
 def test_foreign_origin_is_rejected_on_the_websocket(client):
     from starlette.websockets import WebSocketDisconnect as WSDisconnect
 
-    with pytest.raises((WSDisconnect, Exception)):
+    # [13-B] CH2(6c) — `(WSDisconnect, Exception)` 은 타입 제약이 없다: Exception 이
+    # 튜플에 있으면 무엇이 나도 통과하므로 서버가 **왜** 닫았는지는커녕 정상 거부와
+    # 크래시조차 구분하지 못했다. 좁히고 close code 를 단언한다 — 서버는 origin/host
+    # 를 4403, 토큰을 4401 로 이미 구분해 닫는다.
+    with pytest.raises(WSDisconnect) as caught:
         with client.websocket_connect(
             "/live", headers={"host": HOST, "origin": "http://evil.test"}
         ) as ws:
             ws.receive_text()
+    assert caught.value.code == 4403
 
 
-def test_whitelisted_origin_connects(client):
-    with client.websocket_connect("/live", headers=HEADERS):
-        pass  # handshake accepted
+def test_whitelisted_origin_connects(client, graph):
+    """[13-B] CH2(6c) — 수락된 연결이 **실제로 살아 있음**을 단언한다.
+
+    이전에는 `pass` 뿐이라 단언이 0이었고, 핸드셰이크 수락 판정이 라이브러리가
+    언제 예외를 던지느냐에 달려 있었다.
+
+    ★ 서버는 연결 직후 프레임을 보내지 않는다(accept 후 바로 수신 루프). 그래서
+    'hello 를 받는다'로 단언했다가 무한 대기에 걸렸다 — 존재하지 않는 계약을
+    단언한 것이다. 대신 그래프를 실제로 바꿔 그 이벤트가 도착하는지 본다."""
+    with client.websocket_connect("/live", headers=HEADERS) as ws:
+        graph.add_node(id="ws-live", label="Live", type="class")
+        frame = json.loads(ws.receive_text())
+        assert frame["op"] in {"node.add", "graph.batch"}
 
 
 def test_ipv6_loopback_origin_connects(client):
@@ -455,14 +470,17 @@ def test_ws_live_rejects_missing_or_wrong_token(tmp_path, graph):
 
     app = _token_app(tmp_path, graph)
     with TestClient(app, base_url=f"http://{HOST}") as c:
-        with pytest.raises((WSDisconnect, Exception)):  # no token → closed
+        # [13-B] CH2(6c) — 거부 이유를 코드로 구분한다(토큰 = 4401).
+        with pytest.raises(WSDisconnect) as missing:
             with c.websocket_connect("/live", headers=HEADERS) as ws:
                 ws.receive_text()
-        with pytest.raises((WSDisconnect, Exception)):  # wrong token → closed
+        assert missing.value.code == 4401
+        with pytest.raises(WSDisconnect) as wrong:
             with c.websocket_connect(
                 "/live", headers={**HEADERS, "authorization": "Bearer nope"}
             ) as ws:
                 ws.receive_text()
+        assert wrong.value.code == 4401
 
 
 def test_ws_live_accepts_correct_bearer_header(tmp_path, graph):
