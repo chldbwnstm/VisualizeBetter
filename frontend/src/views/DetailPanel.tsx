@@ -20,6 +20,7 @@ import dagre from 'cytoscape-dagre'
 import fcose from 'cytoscape-fcose'
 import { useStrings } from '../i18n'
 import { graphData, useGraphStore } from '../stores/graphStore'
+import { edgeKeyOf } from '../types'
 import { rgbToCss, typeColor } from './palette'
 import { extractSubgraph } from './subgraph'
 import { visibleNodeIds } from './temporal'
@@ -99,7 +100,14 @@ export function toCytoscapeElements(
     const dimmed = isDimmed(edge.source) || isDimmed(edge.target)
     elements.push({
       data: {
-        id: `${edge.source}|${edge.target}|${edge.relation}|${edge.key}`,
+        // [13-B] CH2(7a) — the store's injective encoding, not a delimiter join.
+        // `${source}|${target}|${relation}|${key}` collides whenever an id
+        // contains '|': relation="x", key="y|z" and relation="x|y", key="z" both
+        // produce "a|b|x|y|z". cytoscape then keeps the first element and drops
+        // the second **with no exception and no console error** (verified against
+        // the real headless cytoscape in node_modules), so a relation simply
+        // vanishes from the detail view with nothing to tell the user why.
+        id: edgeKeyOf(edge),
         source: edge.source,
         target: edge.target,
         label: edge.relation,

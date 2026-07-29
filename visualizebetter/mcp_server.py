@@ -434,7 +434,7 @@ def create_server(
         try:
             finding = graph.update_finding(finding_id, patch, reason=reason)
         except KeyError:
-            raise ToolError(f"finding not found: {finding_id}") from None
+            raise ToolError(f"finding not found: {brief(finding_id)}") from None
         except ValueError as exc:
             raise ToolError(str(exc)) from None
         return {"ok": True, "finding": finding.to_dict()}
@@ -480,7 +480,7 @@ def create_server(
         """
         finding = graph.get_finding(finding_id)
         if finding is None:
-            raise ToolError(f"finding not found: {finding_id}")
+            raise ToolError(f"finding not found: {brief(finding_id)}")
         # Never truncated: a finding is bounded at creation ([23-B] 크기 불변식),
         # and this tool exists to read gold back whole. Cutting evidence or body
         # here would damage the very thing the project preserves.
@@ -496,7 +496,7 @@ def create_server(
         try:
             graph.delete_finding(finding_id)
         except KeyError:
-            raise ToolError(f"finding not found: {finding_id}") from None
+            raise ToolError(f"finding not found: {brief(finding_id)}") from None
         return {"ok": True}
 
     @mcp.tool
@@ -509,7 +509,7 @@ def create_server(
         try:
             node = graph.cite(node_id, source_url, source_title)
         except KeyError:
-            raise ToolError(f"node not found: {node_id}") from None
+            raise ToolError(f"node not found: {brief(node_id)}") from None
         except ValueError as exc:  # [13-B] CH1(4) — the citation cap is a refusal
             raise ToolError(str(exc)) from None
         return {"ok": True, "node": node.to_dict()}
@@ -524,6 +524,28 @@ def create_server(
         _register_persistence(mcp, graph, store, snapshotter)
 
     return mcp
+
+
+MAX_IDENTIFIER_IN_MESSAGE = 80
+"""[13-B] CH2(7b) — how much of an identifier an error message may quote.
+
+An error is read by an AI, and a 60KB node id put the whole 60KB back into its
+context — one failed call, 60KB of tokens, none of it useful after the first
+line. Measured: a KeyError on a 60,000-character id produced a 60,002-character
+message that ToolError carried through verbatim.
+
+80 characters is enough to recognise a real id (paths, dotted names, uuids all
+fit) and the suffix says how much was left out, so nothing is silently lost —
+it is just not repeated at length.
+"""
+
+
+def brief(identifier: object) -> str:
+    """An identifier safe to put in a message ([13-B] CH2(7b))."""
+    text = identifier if isinstance(identifier, str) else repr(identifier)
+    if len(text) <= MAX_IDENTIFIER_IN_MESSAGE:
+        return text
+    return f"{text[:MAX_IDENTIFIER_IN_MESSAGE]}… ({len(text)} chars)"
 
 
 def _register_apps(mcp: FastMCP, graph: Graph) -> None:
@@ -545,7 +567,7 @@ def _register_apps(mcp: FastMCP, graph: Graph) -> None:
         try:
             subgraph = build_subgraph(graph, node_id)
         except KeyError:
-            raise ToolError(f"node not found: {node_id}") from None
+            raise ToolError(f"node not found: {brief(node_id)}") from None
         return ResourceResult(
             contents=[ResourceContent(render_card_html(subgraph), mime_type=UI_MIME_TYPE)]
         )
@@ -561,7 +583,7 @@ def _register_apps(mcp: FastMCP, graph: Graph) -> None:
         try:
             subgraph = build_subgraph(graph, node_id)
         except KeyError:
-            raise ToolError(f"node not found: {node_id}") from None
+            raise ToolError(f"node not found: {brief(node_id)}") from None
         return {
             "node_id": node_id,
             "neighbor_count": len(subgraph["neighbors"]),
@@ -894,7 +916,7 @@ def _register_write(
         try:
             node = graph.update_node(id, patch, reason=reason)
         except KeyError:
-            raise ToolError(f"node not found: {id}") from None
+            raise ToolError(f"node not found: {brief(id)}") from None
         except ValueError as exc:
             raise ToolError(str(exc)) from None
         return {"ok": True, "node": node.to_dict()}
@@ -922,7 +944,7 @@ def _register_write(
         try:
             edge = graph.update_edge(source, target, relation, key, patch, reason=reason)
         except KeyError:
-            raise ToolError(f"edge not found: {(source, target, relation, key)}") from None
+            raise ToolError(f"edge not found: {brief((source, target, relation, key))}") from None
         except ValueError as exc:
             raise ToolError(str(exc)) from None
         return {"ok": True, "edge": edge.to_dict()}
@@ -938,7 +960,7 @@ def _register_write(
         try:
             return graph.delete_node(id, cascade=cascade)
         except KeyError:
-            raise ToolError(f"node not found: {id}") from None
+            raise ToolError(f"node not found: {brief(id)}") from None
 
     @mcp.tool(annotations={"destructiveHint": True})
     def delete_edge(source: str, target: str, relation: str, key: str = "") -> dict[str, Any]:
@@ -946,7 +968,7 @@ def _register_write(
         try:
             return graph.delete_edge(source, target, relation, key)
         except KeyError:
-            raise ToolError(f"edge not found: {(source, target, relation, key)}") from None
+            raise ToolError(f"edge not found: {brief((source, target, relation, key))}") from None
 
     @mcp.tool(annotations={"destructiveHint": True})
     async def clear_layer(layer: str) -> dict[str, Any]:
@@ -1723,7 +1745,7 @@ def _register_read(mcp: FastMCP, graph: Graph) -> None:
         """
         node = graph.get_node(id)
         if node is None:
-            raise ToolError(f"node not found: {id}")
+            raise ToolError(f"node not found: {brief(id)}")
         result: dict[str, Any] = {"node": node.to_dict()}
         if include_neighbors:
             result["neighbors"] = _neighbor_summary(graph, id)
@@ -1812,7 +1834,7 @@ def _register_read(mcp: FastMCP, graph: Graph) -> None:
         """
         center = graph.get_node(id)
         if center is None:
-            raise ToolError(f"node not found: {id}")
+            raise ToolError(f"node not found: {brief(id)}")
         allowed = _matched_edge_keys(graph, edge_filter)
 
         # BFS. Truncation is explicit (truncated=true), never silent: a summary
