@@ -80,8 +80,76 @@ def test_summary_top_hubs_by_degree(mcp):
     assert top["Island"] == 0
 
 
-def test_summary_is_deterministic(mcp):
-    assert call(mcp, "get_graph_summary") == call(mcp, "get_graph_summary")
+# --- [13-B] CH2(6d) — 요약의 결정성은 정렬 계약이다 ---
+#
+# 이전 판은 `call(...) == call(...)` — 같은 프로세스에서 같은 함수를 연속 두 번
+# 부르고 서로 비교했다. dict/set 의 반복 순서는 한 프로세스 안에서 안정적이므로 그
+# 단언은 원리적으로 실패할 수 없었고, 실제로 tie-break 를 둘 다 지워도 통과했다.
+# 결정성이 깨지는 진짜 모습은 "같은 그래프인데 만들어진 순서가 다르면 요약이
+# 다르다" 이고, 그것은 (1) 동률이 있는 픽스처에서 정렬 계약을 직접 단언하거나
+# (2) 삽입 순서를 뒤바꾼 그래프와 비교해야만 보인다. 아래 셋이 그 둘이다.
+#
+# 이 요약은 인수인계 때 AI 가 **가장 먼저** 부르는 도구다([5-B] MVP 3대). 순서가
+# 흔들리면 두 세션이 같은 그래프를 두고 서로 다른 "주요 허브"를 읽는다.
+
+
+def _built_graph(order: str) -> Graph:
+    """상단 `graph` 픽스처와 같은 그래프를, 지정한 삽입 순서로."""
+    nodes = [
+        dict(id="app.Order", label="OrderContext", type="class", properties={"field_count": 12}),
+        dict(id="UI.View", label="MainView", type="component", properties={"field_count": 3}),
+        dict(id="Svc.User", label="PaymentService", type="service"),
+        dict(id="Svc.Auth", label="AuthService", type="service"),
+        dict(id="Island", label="Lonely", type="module"),
+    ]
+    edges = [
+        dict(source="app.Order", target="UI.View", relation="owns", weight=2.0),
+        dict(source="UI.View", target="Svc.User", relation="uses"),
+        dict(source="Svc.User", target="Svc.Auth", relation="calls"),
+    ]
+    if order == "reversed":
+        nodes, edges = list(reversed(nodes)), list(reversed(edges))
+    g = Graph(name="test")
+    for spec in nodes:
+        g.add_node(**spec)
+    for spec in edges:
+        g.add_edge(**spec)
+    return g
+
+
+# ★ 두 순서 **모두** 로 건다. 한쪽만으로는 이빨이 없을 수 있다: forward 순서에서는
+# type 의 삽입 순서(class, component, service, module)가 우연히 알파벳 tie-break 와
+# 같은 결과를 내서, tie-break 를 지운 구현도 기대 리스트를 그대로 만족한다(실측 —
+# 그 뮤턴트는 아래 두 테스트 중 insertion-order 만 죽였다). 뒤집은 순서에서는
+# 갈라진다. 계약이 순서와 무관하다는 주장이니 두 순서로 묻는 게 맞기도 하다.
+@pytest.mark.parametrize("order", ["forward", "reversed"])
+def test_summary_sorts_types_by_count_then_name(order):
+    """[5-B] 계약: (count desc, type asc). count==1 인 type 이 셋 있어 tie-break 가
+    없으면 그 셋의 순서가 곧 삽입 순서가 된다."""
+    s = call(create_server(_built_graph(order)), "get_graph_summary")
+
+    assert [row["count"] for row in s["types"]].count(1) == 3, "동률이 없으면 이 테스트는 아무것도 안 본다"
+    assert [row["type"] for row in s["types"]] == ["service", "class", "component", "module"]
+
+
+@pytest.mark.parametrize("order", ["forward", "reversed"])
+def test_summary_sorts_top_hubs_by_degree_then_id(order):
+    """[5-B] 계약: (degree desc, id asc). 동률이 두 쌍(2/2, 1/1) 있다."""
+    s = call(create_server(_built_graph(order)), "get_graph_summary")
+
+    assert [h["degree"] for h in s["top_hubs"]] == [2, 2, 1, 1, 0], "동률 쌍이 사라졌다"
+    assert [h["id"] for h in s["top_hubs"]] == [
+        "Svc.User", "UI.View", "Svc.Auth", "app.Order", "Island",
+    ]
+
+
+def test_summary_does_not_depend_on_insertion_order():
+    """같은 그래프를 반대 순서로 만들면 같은 요약이 나와야 한다 — 프로세스 안에서
+    두 번 부르는 것으로는 절대 볼 수 없는 축."""
+    forward = call(create_server(_built_graph("forward")), "get_graph_summary")
+    backward = call(create_server(_built_graph("reversed")), "get_graph_summary")
+
+    assert forward == backward
 
 
 # --- get_node ([5-B]) ---

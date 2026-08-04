@@ -1010,29 +1010,74 @@ def test_the_destructive_call_audit_has_teeth():
         source = breadcrumb_only + f"\ndef _bad(p):\n    p.{call}()\n"
         assert any(call in o for o in _destructive_offenders(source)), call
 
-def test_concurrent_processes_leave_both_stores_intact(canonical):
+_CONCURRENT_PROCESSES = 6
+
+
+def test_concurrent_processes_leave_both_stores_intact(canonical, tmp_path):
     """R1 ★ 실프로세스 N개 동시 실행 — RN2 의 unlink→rename 은 여기서 25회 중
-    1회 'gold 전멸'(target·legacy 둘 다 없음)을 냈다. 복사는 원리적으로 불가능."""
+    1회 'gold 전멸'(target·legacy 둘 다 없음)을 냈다. 복사는 원리적으로 불가능.
+
+    [13-B] CH2(6e): 이전 판은 `proc.wait(timeout=...)` 만 하고 **returncode 를 보지
+    않았다.** 6개 중 5개가 시작하자마자 ImportError 로 죽어도 아래 세 단언은 전부
+    통과한다 — 살아남은 1개가 정상 이관을 마치기 때문이다. 즉 이 테스트의 주장인
+    "N개 동시 실행" 이 실효 N=1 로 줄어들어도 초록이었고, 그러면 재현하려던 경합
+    자체가 일어나지 않는다. 실측으로 확인했다(5개를 즉시 죽여도 통과).
+
+    그래서 두 가지를 더 본다: (1) 전원이 0으로 끝났는가, (2) 실제로 **겹쳤는가**.
+    (2)를 운에 맡기지 않으려고 랑데부를 둔다 — import 비용이 프로세스마다 달라
+    그냥 띄우면 순차 실행이 되기 쉽고, 순차 실행은 경합을 재현하지 못한다."""
     target, legacy = canonical
     legacy_db = legacy / snap_mod._LEGACY_DB_FILENAME
     ids = [f"s{i}" for i in range(5)]
     _store_db(legacy_db, ids)
     legacy_bytes = legacy_db.read_bytes()
 
+    rendezvous = tmp_path / "rendezvous"
+    rendezvous.mkdir()
+
     program = textwrap.dedent(
         f"""
-        import sys
+        import sys, time
         sys.path.insert(0, {str(Path.cwd())!r})
         from pathlib import Path
         from visualizebetter.graph import snapshots as s
         target, legacy = Path({str(target)!r}), Path({str(legacy)!r})
+        rendezvous, me = Path({str(rendezvous)!r}), sys.argv[1]
+
+        # 전원이 무거운 import 를 끝낸 뒤에 함께 들어간다.
+        (rendezvous / ("ready." + me)).write_text("1")
+        deadline = time.monotonic() + 30
+        while len(list(rendezvous.glob("ready.*"))) < {_CONCURRENT_PROCESSES}:
+            if time.monotonic() > deadline:
+                raise SystemExit("rendezvous timed out")
+            time.sleep(0.005)
+
         s._default_base_pair = lambda: (target, legacy)
+        entered = time.time()
         s.SnapshotStore(target)
+        (rendezvous / ("window." + me)).write_text(f"{{entered}} {{time.time()}}")
         """
     )
-    procs = [subprocess.Popen([sys.executable, "-c", program]) for _ in range(6)]
-    for proc in procs:
-        proc.wait(timeout=120)
+    procs = [
+        subprocess.Popen([sys.executable, "-c", program, str(i)])
+        for i in range(_CONCURRENT_PROCESSES)
+    ]
+    codes = [proc.wait(timeout=120) for proc in procs]
+
+    # ★ 전원이 실제로 일을 했는가. 이게 없으면 아래 단언들은 살아남은 하나에
+    # 대한 단언이지 동시성에 대한 단언이 아니다.
+    assert codes == [0] * _CONCURRENT_PROCESSES, f"동시 실행이 실효 N<{_CONCURRENT_PROCESSES} 로 줄었다: {codes}"
+
+    # ★ 그리고 정말 겹쳤는가. 한 시점에 최소 둘이 이관 구간 안에 있어야 한다.
+    windows = sorted(
+        tuple(float(v) for v in (rendezvous / f"window.{i}").read_text().split())
+        for i in range(_CONCURRENT_PROCESSES)
+    )
+    peak = max(
+        sum(1 for start, end in windows if start <= probe < end)
+        for probe, _ in windows
+    )
+    assert peak >= 2, f"이관 구간이 겹치지 않았다 — 순차 실행이라 경합을 재현하지 못한다 (peak={peak})"
 
     assert legacy_db.exists()
     assert legacy_db.read_bytes() == legacy_bytes          # ★ 원본 불변

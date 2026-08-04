@@ -417,6 +417,61 @@ def test_clear_layer_recovery_point(mcp, graph):
     assert graph.get_node("a") is not None
 
 
+# --- [13-B] CH2(6a) — replace 모드 import 의 복구지점 ---
+#
+# clear_all/clear_layer 는 위에서 두 축으로 고정돼 있다: 스냅샷 행이 남는가, 그리고
+# 그것을 load 하면 되살아나는가. 같은 _pre_clear_snapshot 을 부르는 replace import
+# 두 경로는 어느 테스트도 지나지 않았다 — 두 호출을 지워도 1134건 전부 통과했다.
+# replace import 는 clear_all 과 같은 크기의 파괴(그래프 전체 교체)이므로 같은
+# 대칭이 있어야 한다. 아래 두 테스트가 그 두 축이고, 두 경로 모두에 건다.
+
+_REPLACE_IMPORTS = ("import_graph", "import_from_file")
+
+
+def _replace_import(mcp, store, tool: str, payload: dict) -> None:
+    """두 replace 경로를 하나의 호출로 — 페이로드 전달 방식만 다르다."""
+    if tool == "import_graph":
+        call(mcp, "import_graph", data=payload, merge=False)
+        return
+    incoming = store.data_dir / "incoming.json"
+    incoming.parent.mkdir(parents=True, exist_ok=True)
+    incoming.write_text(json.dumps(payload), encoding="utf-8")
+    call(mcp, "import_from_file", path="incoming.json", merge=False)
+
+
+def _auto_snapshots_for(mcp, tool: str) -> list[dict]:
+    return [
+        row
+        for row in call(mcp, "list_snapshots")["snapshots"]
+        if row["kind"] == "auto" and row["name"].startswith(f"pre-{tool}(replace)-")
+    ]
+
+
+@pytest.mark.parametrize("tool", _REPLACE_IMPORTS)
+def test_replace_import_saves_a_recovery_point_first(mcp, graph, store, tool):
+    """[5-A]/[5-E]: merge=False 는 그래프를 통째로 버린다 — 그 직전 지점이 남는다."""
+    call(mcp, "push_node", id="doomed", label="Doomed", type="class")
+
+    _replace_import(mcp, store, tool, {"nodes": [{"id": "fresh", "label": "F", "type": "class"}]})
+
+    # 전제: replace 가 실제로 교체했다. 아니면 아래 단언은 아무것도 안 지킨다.
+    assert graph.get_node("doomed") is None
+    assert len(_auto_snapshots_for(mcp, tool)) == 1
+
+
+@pytest.mark.parametrize("tool", _REPLACE_IMPORTS)
+def test_the_pre_import_snapshot_actually_recovers(mcp, graph, store, tool):
+    """행이 남는 것과 되살아나는 것은 다른 주장이다 — 후자가 복구지점의 존재 이유다."""
+    call(mcp, "push_node", id="precious", label="Precious", type="class")
+
+    _replace_import(mcp, store, tool, {"nodes": [{"id": "fresh", "label": "F", "type": "class"}]})
+    (pre,) = _auto_snapshots_for(mcp, tool)
+    call(mcp, "load_snapshot", snapshot_id=pre["id"])
+
+    assert graph.get_node("precious") is not None, "a mistaken replace import is undoable"
+    assert graph.get_node("fresh") is None
+
+
 # --- ★ WS: the loop AI draws → human sees ([8-C]) ---
 
 

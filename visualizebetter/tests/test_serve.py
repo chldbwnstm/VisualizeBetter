@@ -7,6 +7,7 @@ through FastAPI's TestClient rather than mocking the seams.
 
 import asyncio
 import json
+import logging
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,6 +16,7 @@ from visualizebetter.graph.core import Graph
 from visualizebetter.server import (
     DEFAULT_PORT,
     MCP_PATH,
+    _flush_loop,
     create_app,
     frontend_dist,
     is_loopback,
@@ -658,3 +660,152 @@ def test_the_repository_bundle_survives_this_module(request):
     )
     # 번들이 원래 없는 환경(CI backend job)에서는 없는 것이 정상이다.
     assert dist.is_dir() or not stray.exists()
+
+
+# --- [13-B] CH2(6b) — _flush_loop 의 예외 가드 ---
+#
+# `_flush_loop` 의 주석은 스스로 존재 이유를 밝힌다: "여기서 예외가 올라오면 모든
+# 클라이언트가 조용히 업데이트를 못 받는다 — [5-E] 자동 스냅샷 루프와 같은 정책."
+# 그런데 그 정책을 고정하는 장치가 없었다. try/except 를 통째로 지워도 1134건이
+# 전부 통과했다 — 즉 한 번의 flush 실패로 세션 전체의 브로드캐스트가 끝나는
+# 회귀가 조용히 들어올 수 있었다. 서버는 계속 살아 있고 MCP 도 응답하므로 사용자
+# 눈에는 "브라우저가 갱신을 멈췄다" 로만 보인다.
+#
+# 가드는 두 방향의 주장이다. (1) 일반 예외는 삼키고 계속 돈다. (2) 취소는 삼키지
+# **않는다** — 그것을 놓치면 lifespan 종료가 flusher.cancel() 뒤 영원히 기다린다.
+
+
+class _FlakyHub:
+    """flush 가 정해진 회차에 한 번 터지고, 그 뒤로는 정상 브로드캐스트한다."""
+
+    def __init__(self, fail_on: int = 1):
+        self._fail_on = fail_on
+        self.calls = 0
+        self.broadcasts: list[int] = []
+
+    async def flush(self) -> int:
+        self.calls += 1
+        if self.calls == self._fail_on:
+            raise RuntimeError("boom: a connection died mid-encode")
+        self.broadcasts.append(self.calls)
+        return 1
+
+
+class _SlowHub:
+    """flush 가 나가는 도중에 머문다 — 종료 취소가 도착하는 실제 지점."""
+
+    def __init__(self):
+        self.entered = asyncio.Event()
+        self.calls = 0
+
+    async def flush(self) -> int:
+        self.calls += 1
+        self.entered.set()
+        await asyncio.sleep(30)  # 취소는 여기서 도착한다
+        return 0
+
+
+async def _drive(hub, *, until_broadcasts: int, timeout: float = 5.0):
+    """짧은 간격으로 _flush_loop 를 돌리고, 목표 브로드캐스트 수에 도달하거나
+    태스크가 죽을 때까지 기다린다. 태스크를 살아있는 채로 돌려준다."""
+    task = asyncio.create_task(_flush_loop(hub, 0.001))
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while len(hub.broadcasts) < until_broadcasts and not task.done():
+        if loop.time() > deadline:
+            break
+        await asyncio.sleep(0.005)
+    return task
+
+
+async def _settle(task) -> bool:
+    """취소를 걸고 **시간 제한 안에** 결과를 본다. 끝났으면 True.
+
+    `await task` 도 `asyncio.run` 의 종료 정리도 쓰지 않는다 — 둘 다 취소를
+    삼키는 회귀에서 끝나지 않아, 테스트가 실패하는 대신 영원히 매달린다.
+    매달림은 빨간불이 아니다(이 저장소는 존재하지 않는 계약을 기다리다 한 번
+    당했다 — CH2(6c)). `asyncio.wait` 는 예외를 올리지도, 시간을 넘기지도 않는다."""
+    task.cancel()
+    done, _ = await asyncio.wait({task}, timeout=2.0)
+    return bool(done)
+
+
+def _drive_in_own_loop(go):
+    """asyncio.run 대신 직접 만든 루프.
+
+    asyncio.run 은 종료할 때 남은 태스크를 취소하고 **끝날 때까지 기다린다.**
+    취소를 삼키는 회귀에서는 그 대기가 끝나지 않는다 — 위와 같은 이유로 그냥
+    루프를 닫는다. 판정은 단언이 하지, 대기가 하지 않는다."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(go())
+    finally:
+        loop.close()
+
+
+def test_flush_loop_survives_a_failing_flush(caplog):
+    """실패한 flush 한 번이 이후 모든 갱신을 데려가지 않는다."""
+    caplog.set_level(logging.ERROR, logger="visualizebetter.serve")
+    hub = _FlakyHub(fail_on=1)
+
+    async def go():
+        task = await _drive(hub, until_broadcasts=3)
+        alive = not task.done()
+        await _settle(task)
+        return alive
+
+    alive = _drive_in_own_loop(go)
+
+    # ★ 검사하려는 상황에 실제로 도달했는가 — 터지는 회차를 지나쳤어야 한다.
+    assert hub.calls > 1, "flush 가 실패 회차를 지나지 못했다 — 죽은 단언"
+    assert alive, "한 번의 flush 실패가 루프를 죽였다 — 이후 모든 클라이언트가 조용해진다"
+    assert hub.broadcasts[:3] == [2, 3, 4], "실패 이후 브로드캐스트가 재개되지 않았다"
+
+    (record,) = [r for r in caplog.records if "WS flush failed" in r.message]
+    assert record.exc_info is not None, "무엇이 터졌는지 없이 삼키면 진단이 불가능하다"
+
+
+def test_flush_loop_stops_when_cancelled():
+    """[8-D] 종료 경로: lifespan 은 flusher.cancel() 뒤 await 한다. 가드가 취소까지
+    삼키면 그 await 가 영원히 끝나지 않고, 서버가 종료되지 않는다."""
+    hub = _FlakyHub(fail_on=0)  # 절대 실패하지 않는다 — 여기서 보는 건 취소뿐이다
+
+    async def go():
+        task = await _drive(hub, until_broadcasts=2)
+        assert not task.done(), "취소를 보기 전에 루프가 이미 죽었다 — 죽은 단언"
+        seen = len(hub.broadcasts)
+        if not await _settle(task):
+            return "still running", seen
+        return ("cancelled" if task.cancelled() else "returned"), seen
+
+    outcome, seen = _drive_in_own_loop(go)
+
+    assert seen >= 2, "루프가 돌기도 전에 취소됐다 — 죽은 단언"
+    assert outcome == "cancelled", f"CancelledError 가 전파되지 않았다 ({outcome})"
+
+
+def test_flush_loop_stops_when_cancelled_mid_flush():
+    """★ 취소는 flush 가 **진행 중일 때** 도착한다 — 그게 정상이다.
+
+    위 테스트만으로는 부족했다(실측): 루프는 대부분의 시간을 `asyncio.sleep` 에서
+    보내고 그 자리는 try 밖이라, 취소는 가드를 거치지 않고 전파된다. 그래서 가드의
+    CancelledError 절을 `raise` 에서 `continue` 로 바꿔도 위 테스트는 통과했다.
+
+    실제로 그 절이 일하는 순간은 여기다. `hub.flush()` 는 열린 소켓 전부로 나가고,
+    lifespan 종료는 그 도중에 `flusher.cancel()` 한다. 이때 CancelledError 가 가드에
+    잡혀 삼켜지면 루프는 살아남고, 종료 훅의 `await flusher` 는 끝나지 않는다 —
+    서버가 안 죽는다."""
+    hub = _SlowHub()
+
+    async def go():
+        task = asyncio.create_task(_flush_loop(hub, 0.001))
+        # ★ 검사하려는 상황에 실제로 도달했는지 먼저: 지금 flush 안에 있다.
+        await asyncio.wait_for(hub.entered.wait(), timeout=5.0)
+        if not await _settle(task):
+            return "still running"
+        return "cancelled" if task.cancelled() else "returned"
+
+    outcome = _drive_in_own_loop(go)
+
+    assert hub.calls == 1, "flush 에 들어가지 못했다 — 죽은 단언"
+    assert outcome == "cancelled", f"flush 중 도착한 취소가 삼켜졌다 ({outcome})"
