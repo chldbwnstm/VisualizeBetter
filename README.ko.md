@@ -268,11 +268,19 @@ MCP 차트 서버들은 차트 위주라 노드-엣지 그래프나 대규모(10
 | **도메인 무관** | schema-less(임의 K/V properties) — 코드, API, 조직도, 무엇이든 |
 | **100% 로컬** | 외부 통신 없음, 텔레메트리 없음, 모든 asset self-hosted |
 
-100K는 목표가 아니라 실측이다: 100K 노드 기준 렌더 59.9 FPS, import 9.3초,
-라이브 push 반영 73.9 ms — 메인테이너 장비(RTX 4070 SUPER)에서 측정한 값이다.
+100K는 목표가 아니라 실측이다 — 그리고 하니스는 **미달인 항목에 대해서도** 정직하다.
+메인테이너 장비(RTX 4070 SUPER), 100K 노드 기준: 렌더 **59.9 FPS**, 대량 import
+**13초** — 둘 다 재측정했고 각자의 기준(≥30 FPS, <30초) 안에 있다.
+
+**라이브 push 반영은 현재 기준 미달이다.** 기준 <100 ms 에 대해 73.9 ms 로
+기록됐으나, 하니스를 다시 돌리면 5회에 걸쳐 **119~134 ms** 가 나온다. 원인은
+조사 중이고, 실측에 맞춰 기준을 올리지 않는다 — 실행 수치와 구간 분해는
+[docs/benchmarks.md § Open](./docs/benchmarks.md#open-the-live-push-figure-does-not-reproduce)
+에 있다(영문).
+
 하니스·픽스처 생성기·재현 절차는 [docs/benchmarks.md](./docs/benchmarks.md) 에
-있고, 무엇을 보장하지 **않는지**도 함께 적었다 — 손으로 돌리는 프로브이지
-CI 게이트가 아니다.
+있고, 무엇을 보장하지 **않는지**도 함께 적었다 — 성능 프로브는 손으로 돌리는
+것이지 CI 게이트가 아니다(CI 가 막는 것은 기능 e2e 스위트다).
 
 ---
 
@@ -353,7 +361,7 @@ Claude: save_snapshot("프로젝트-구조-v1")   ← 다음 세션이 이걸 �
 | **M0** POC | push/조회 3 tool + 최소 뷰 + E2E 검증 | ✅ 완료 |
 | **M1** MVP | 전체 MCP API, 이중 뷰, 필터 DSL(기본), 스냅샷, layer, finding, JSON import/export, 사람↔AI 공유 뷰, 성능 KPI, 보안 감사 | ✅ **기능 완성** (2026-07-18) |
 | **M2** Feature Complete | MCP Apps(대화창 inline 렌더), 필터 DSL direction, GraphML/dot/cytoscape export, undo/redo, **Tauri 데스크톱 앱(Win .msi 실빌드)**, stdio 프록시(실 MCP 클라 연결) | ✅ **사실상 완성** (2026-07-19, 잔여=니치 IDA/ReClass 어댑터) |
-| **M3** Production | ✅ 100K 성능 튜닝(렌더 59.9FPS·import 9.3s·라이브 push 73.9ms) · ✅ temporal(시간축 스크러버) · ⏳ 멀티유저 · ⏳ 3D 뷰 | 🚧 핵심 2/4 (2026-07-19) |
+| **M3** Production | ✅ 100K 성능 튜닝(렌더 59.9FPS·import 13s) · ⚠️ 라이브 push 는 <100ms 기준 **미달** — 119~134ms, [조사 중](./docs/benchmarks.md#open-the-live-push-figure-does-not-reproduce) · ✅ temporal(시간축 스크러버) · ⏳ 멀티유저 · ⏳ 3D 뷰 | 🚧 핵심 2/4 (2026-07-19) |
 
 ### 다음 로드맵 (2026-07-28 확정)
 

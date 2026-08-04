@@ -83,34 +83,50 @@ draws.
 | Browser | Chromium via Playwright, `--use-angle=d3d11` |
 | Graph | 100,000 nodes / 200,000 edges (generator defaults, seed 20260729) |
 
-| Metric | Target | Measured |
+> ⚠️ **Two of these three rows no longer reproduce.** This table is the original
+> record, kept as written; the current numbers are in
+> [§ Open](#open-the-live-push-figure-does-not-reproduce) directly below.
+
+| Metric | Target | Measured (as recorded) |
 |---|---|---|
 | Static render, pan/zoom | ≥ 30 FPS | **59.9 FPS** median |
-| Bulk import (100K) | — | **9.3 s** |
+| Bulk import (100K) | < 30 s | **9.3 s** |
 | Live push → on screen | < 100 ms | **73.9 ms** median |
 
 These are one machine's numbers. They are quoted in the README as measured
 figures because they were measured, not because they are a promise about yours —
 which is the reason this page exists rather than a bare claim.
 
-### Open: a re-measurement disagrees (2026-08-05)
+### Open: the live-push figure does not reproduce
+
+*(2026-08-05. The README links here; the heading is kept stable so that link does
+not rot.)*
 
 Re-running the procedure above on the same machine and the same fixture seed, on
 the day the targets became assertions, did not reproduce two of these rows:
 
-| Metric | Recorded above | Re-measured (4 runs) |
-|---|---|---|
-| Static render, pan/zoom | 59.9 FPS | 59.9 FPS — reproduces exactly |
-| Bulk import (100K) | 9.3 s | 12.6 – 14.5 s |
-| Live push → on screen | 73.9 ms | 119.4 / 120.5 / 126.1 / 133.6 ms |
+| Metric | Target | Recorded above | Re-measured (5 runs) | Verdict |
+|---|---|---|---|---|
+| Static render, pan/zoom | ≥ 30 FPS | 59.9 FPS | 59.9 FPS — reproduces exactly | **passes** |
+| Bulk import (100K) | < 30 s | 9.3 s | 12.6 – 14.5 s | **passes**, but 9.3 s does not reproduce |
+| Live push → on screen | < 100 ms | 73.9 ms | 119.4 / 120.5 / 126.1 / 133.6 / 134.0 ms | **misses** |
 
-So the live-push row misses its < 100 ms target, and the perf suite now says so
-out loud instead of printing it. The gap is not an artifact of a full snapshot
-store — a clean data directory gives 119.4 ms — and the accompanying diagnostic
-spec puts most of it in the client leg (server 32 ms vs client 88 ms), which grows
-with graph size (9.3× from 100 nodes to 100K).
+Two different problems, and they are worth separating.
 
-This is recorded rather than corrected because the cause is not yet known, and a
-number should not be edited to match the most recent run any more than it should
-be left standing when a measurement contradicts it. The rows above are what was
-measured then; the table here is what was measured now.
+**Live push misses its target.** The perf suite now says so out loud instead of
+printing it into a log. The gap is not an artifact of a full snapshot store — a
+clean data directory gives 119.4 ms — and the accompanying diagnostic spec puts
+most of it in the client leg (server 32 ms vs client 88 ms), which grows with
+graph size (9.3× from 100 nodes to 100K).
+
+**Bulk import still passes, but the published number was optimistic.** 9.3 s
+against a < 30 s target is comfortably inside it, and so is 13.4 s — the criterion
+was never in danger. What was wrong was quoting the faster figure as *the*
+measurement.
+
+The target itself is not being moved to meet the measurement. Whether the
+live-push gap is a regression or a change in what the harness measures is under
+investigation; until that is answered, the honest state is a target that is missed
+and said to be missed. The recorded column is what was measured then; the
+re-measured column is what was measured now, and the README quotes neither number
+as a promise it cannot currently keep.

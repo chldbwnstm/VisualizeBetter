@@ -286,11 +286,22 @@ One system-prompt line, usable with any AI, enforces the habit (planned):
 | **Domain-agnostic** | Schema-less (arbitrary K/V properties) — code, APIs, org charts, anything |
 | **100% local** | No external calls, no telemetry, every asset self-hosted |
 
-The 100K figure is measured, not aspirational: 59.9 FPS rendering, a 9.3 s import,
-and 73.9 ms live-push apply at 100K nodes — measured on the maintainer's hardware
-(RTX 4070 SUPER). The harness, the fixture generator and the repro steps are in
+The 100K figures are measured, not aspirational — and the harness is now honest
+about the one that misses. On the maintainer's hardware (RTX 4070 SUPER), at 100K
+nodes: **59.9 FPS** rendering and a **13 s** bulk import, both re-measured and
+inside their targets (≥ 30 FPS, < 30 s).
+
+**Live-push apply currently misses its target.** It was recorded at 73.9 ms
+against a < 100 ms target; re-running the harness measures **119–134 ms** across
+five runs. The cause is under investigation and the target is not being moved to
+meet the measurement — see
+[docs/benchmarks.md § Open](./docs/benchmarks.md#open-the-live-push-figure-does-not-reproduce)
+for the runs and the diagnostic breakdown.
+
+The harness, the fixture generator and the repro steps are in
 [docs/benchmarks.md](./docs/benchmarks.md), including what it does *not* guarantee:
-it is a probe you run by hand, not a CI gate.
+the performance probe is run by hand, not in CI (the functional end-to-end suite
+is what CI gates).
 
 ---
 
@@ -375,7 +386,7 @@ Claude: save_snapshot("project-structure-v1")   ← the next session loads this 
 | **M0** POC | 3 push/query tools + minimal view + E2E verification | ✅ done |
 | **M1** MVP | full MCP API, dual views, filter DSL (base), snapshots, layers, findings, JSON import/export, human↔AI shared view, performance KPIs, security audit | ✅ **feature-complete** (2026-07-18) |
 | **M2** Feature Complete | MCP Apps (inline chat render), filter DSL direction, GraphML/dot/cytoscape export, undo/redo, **Tauri desktop app (real Win .msi build)**, stdio proxy (real MCP client connection) | ✅ **essentially complete** (2026-07-19; remainder = niche IDA/ReClass adapters) |
-| **M3** Production | ✅ 100K performance tuning (render 59.9FPS · import 9.3s · live push 73.9ms) · ✅ temporal (time-axis scrubber) · ⏳ multi-user · ⏳ 3D view | 🚧 core 2/4 (2026-07-19) |
+| **M3** Production | ✅ 100K performance tuning (render 59.9FPS · import 13s) · ⚠️ live push **misses** its <100ms target — 119–134ms, [investigating](./docs/benchmarks.md#open-the-live-push-figure-does-not-reproduce) · ✅ temporal (time-axis scrubber) · ⏳ multi-user · ⏳ 3D view | 🚧 core 2/4 (2026-07-19) |
 
 ### Next up (locked in 2026-07-28)
 
