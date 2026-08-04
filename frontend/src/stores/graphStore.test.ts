@@ -3,7 +3,8 @@
  */
 
 import { beforeEach, describe, expect, test } from 'vitest'
-import { graphData, useGraphStore } from './graphStore'
+import { graphData, timelineBoundsNow, useGraphStore } from './graphStore'
+import { temporalCounters, timelineBounds } from '../views/temporal'
 import type { Edge, Finding, GraphBatchData, Node, WSEvent } from '../types'
 import { edgeKey } from '../types'
 
@@ -515,5 +516,110 @@ describe('local actions ([9-C])', () => {
 
     expect(useGraphStore.getState().viewMode).toBe('split')
     expect(useGraphStore.getState().zoom).toBe(2.5)
+  })
+})
+
+/**
+ * ★ [15] (5) — 타임라인 경계는 push 경로에 O(N+E) 를 두지 않는다 (TASK PERF1).
+ *
+ * M3c 는 스크러버의 [min,max] 를 structureSeq 마다 전체 스캔으로 구했다. 그것은
+ * React render phase 안이라 cosmos effect **앞에** 통째로 얹혔고, push 1회당
+ * 노드+엣지+finding 전부를 Date.parse 로 훑었다 — @100K 300,015회.
+ *
+ * ★ 이 블록이 시간이 아니라 **호출 수**를 세는 이유: 그 회귀는 시간으로 재면
+ * 머신 소음(중앙값 111~184ms)에 묻혀 한 렌즈가 "기여 ~0" 으로 오판했지만,
+ * 세면 N 에 정확히 비례하는 것이 한 번에 드러난다([15 개정] 측정 규율).
+ */
+describe('★ [15] (5) 타임라인 경계 — push 경로가 N 에 무관하다', () => {
+  function seed(count: number): void {
+    const nodes = Array.from({ length: count }, (_, i) =>
+      node(`n${i}`, { created_at: `2026-07-17T00:00:${String(i % 60).padStart(2, '0')}+00:00` }),
+    )
+    const edges = Array.from({ length: count }, (_, i) =>
+      edge(`n${i}`, `n${(i + 1) % count}`, {
+        created_at: `2026-07-17T00:01:${String(i % 60).padStart(2, '0')}+00:00`,
+      }),
+    )
+    apply(batch({ nodes_added: nodes, edges_added: edges }))
+  }
+
+  /** push 1회 + 스크러버가 트랙을 읽는 것까지 — 그 동안의 created_at 파싱 수. */
+  function parsesForOnePush(graphSize: number): number {
+    useGraphStore.getState().reset()
+    seed(graphSize)
+    timelineBoundsNow(useGraphStore.getState().findings) // 스크러버가 이미 한 번 읽은 상태
+    temporalCounters.parses = 0
+
+    apply(batch({ nodes_added: [node('fresh', { created_at: '2026-07-18T00:00:00+00:00' })] }))
+    timelineBoundsNow(useGraphStore.getState().findings)
+    return temporalCounters.parses
+  }
+
+  test('push 1회당 파싱 수가 그래프 크기와 무관하다', () => {
+    const at1k = parsesForOnePush(1_000)
+    const at3k = parsesForOnePush(3_000)
+    const at10k = parsesForOnePush(10_000)
+
+    // 회귀 판이라면 각각 2,001 / 6,001 / 20,001 로 정확히 선형이었다.
+    expect({ at3k, at10k }, '파싱 수가 그래프 크기를 따라간다 — O(N) 이 push 경로에 돌아왔다')
+      .toEqual({ at3k: at1k, at10k: at1k })
+    // 상수라는 것만으로는 부족하다 — 그 상수가 작아야 한다(추가된 항목 수 수준).
+    expect(at1k).toBeLessThan(10)
+  })
+
+  test('트랙은 실제로 넓어진다 — 캐시가 낡으면 기능이 죽는다', () => {
+    useGraphStore.getState().reset()
+    apply(batch({ nodes_added: [node('a', { created_at: '2026-07-17T00:00:00+00:00' })] }))
+    const before = timelineBoundsNow(useGraphStore.getState().findings)!
+
+    apply(batch({ nodes_added: [node('b', { created_at: '2026-07-20T00:00:00+00:00' })] }))
+    const after = timelineBoundsNow(useGraphStore.getState().findings)!
+
+    expect(after.max).toBeGreaterThan(before.max)
+    expect(after.min).toBe(before.min)
+  })
+
+  test('finding 과 엣지도 트랙을 넓힌다', () => {
+    useGraphStore.getState().reset()
+    apply(batch({ nodes_added: [node('a', { created_at: '2026-07-17T12:00:00+00:00' })] }))
+    apply({
+      op: 'finding.add',
+      seq: ++seq,
+      data: finding('f1', { created_at: '2026-07-10T00:00:00+00:00' }),
+    } as WSEvent)
+    apply(batch({ edges_added: [edge('a', 'b', { created_at: '2026-07-25T00:00:00+00:00' })] }))
+
+    const bounds = timelineBoundsNow(useGraphStore.getState().findings)!
+    expect(bounds.min).toBe(Date.parse('2026-07-10T00:00:00+00:00')) // finding 이 가장 이르다
+    expect(bounds.max).toBe(Date.parse('2026-07-25T00:00:00+00:00')) // 엣지가 가장 늦다
+  })
+
+  test('★ 증분 경계가 전체 스캔과 언제나 같다 (삭제·clear 포함)', () => {
+    // 증분 유지의 유일한 위험은 "제거 뒤 경계가 낡는 것" 이다. 그래서 무작위
+    // 연산 뒤 매번 정답(전체 스캔)과 대조한다 — 캐시가 조용히 어긋나면 여기서
+    // 터진다.
+    useGraphStore.getState().reset()
+    const stamp = (day: number) => `2026-07-${String(day).padStart(2, '0')}T00:00:00+00:00`
+    const live: string[] = []
+
+    for (let step = 0; step < 60; step += 1) {
+      const day = ((step * 7) % 28) + 1
+      const id = `n${step}`
+      if (step % 5 === 4 && live.length > 0) {
+        const victim = live.splice(step % live.length, 1)[0]
+        apply(batch({ nodes_deleted: [{ id: victim }] }))
+      } else if (step % 11 === 10) {
+        apply({ op: 'clear', seq: ++seq, data: { layer: null } } as WSEvent)
+        live.length = 0
+      } else {
+        apply(batch({ nodes_added: [node(id, { created_at: stamp(day) })] }))
+        live.push(id)
+      }
+
+      const findings = useGraphStore.getState().findings
+      expect(timelineBoundsNow(findings), `step ${step}`).toEqual(
+        timelineBounds(graphData.nodes, graphData.edges, findings),
+      )
+    }
   })
 })

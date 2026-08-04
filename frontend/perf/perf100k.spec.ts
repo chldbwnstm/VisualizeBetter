@@ -104,23 +104,40 @@ async function panZoom(durationMs: number) {
     await page.mouse.wheel(0, i % 2 === 0 ? -120 : 120)
   }
 }
-/** push → DOM(nodeCount) reflect, single page clock (as perf.spec.ts (3)). */
+/**
+ * push → **실제 그려질 때까지**, 페이지 단일 클럭 (계획서 [15 개정] 확정 2).
+ *
+ * ★ 종료점이 DOM 관측이 아니라 코드다. 예전에는 노드 카운트 텍스트의
+ * MutationObserver 로 끝을 잡았는데, 그 자리는 React 가 cosmos effect 를 DOM
+ * 커밋과 같은 태스크에 붙여 줄 때만 "그려진 뒤" 다 — 스케줄링이 달라지면 같은
+ * 코드가 조용히 다른 양을 잰다. 공표값 73.9ms 가 그 사고였고(effect 앞에서 끊긴
+ * 측정), 그래서 재현이 불가능했다. 지금은 OverviewCanvas 가 데이터를 캔버스에
+ * 올린 시점에 직접 찍는 `window.__vbPainted` 를 읽는다.
+ *
+ * 카운터로 판정한다(시각 비교가 아니라): arm 시점의 n 을 기억하고 그보다 커질
+ * 때까지 기다린다. 그래야 arm 이전의 페인트를 새 것으로 착각하지 않는다.
+ */
+interface PaintMark { n: number; at: number }
 async function measurePushLatency(count: number, tag: string): Promise<number[]> {
   const samples: number[] = []
   for (let i = 0; i < count; i += 1) {
     await page.evaluate(() => {
-      const w = window as unknown as { __armedAt: number; __latency: number | null }
-      w.__latency = null
-      const t = document.querySelector('[data-testid="node-count"]')
-      if (!t) throw new Error('node-count not found')
+      const w = window as unknown as { __armedAt: number; __paintBase: number; __vbPainted?: PaintMark }
+      if (!w.__vbPainted) throw new Error('__vbPainted 없음 — 종료점 마크가 사라졌다(측정 무효)')
+      w.__paintBase = w.__vbPainted.n
       w.__armedAt = performance.now()
-      new MutationObserver(() => { if (w.__latency === null) w.__latency = performance.now() - w.__armedAt })
-        .observe(t, { childList: true, subtree: true, characterData: true })
     })
     await callTool('push_node', { id: `${tag}.${Date.now()}.${i}`, label: `lat${i}`, type: 'probe' })
     await page.waitForFunction(
-      () => (window as unknown as { __latency: number | null }).__latency !== null, undefined, { timeout: 60_000 })
-    samples.push(await page.evaluate(() => (window as unknown as { __latency: number }).__latency))
+      () => {
+        const w = window as unknown as { __paintBase: number; __vbPainted: PaintMark }
+        return w.__vbPainted.n > w.__paintBase
+      },
+      undefined, { timeout: 60_000 })
+    samples.push(await page.evaluate(() => {
+      const w = window as unknown as { __armedAt: number; __vbPainted: PaintMark }
+      return w.__vbPainted.at - w.__armedAt
+    }))
   }
   return samples
 }

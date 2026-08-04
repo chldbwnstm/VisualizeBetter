@@ -15,6 +15,7 @@
  */
 
 import { create } from 'zustand'
+import { TimelineTracker, type TimelineBounds } from '../views/temporal'
 import {
   type ClearData,
   type Edge,
@@ -38,6 +39,16 @@ import {
 const nodes = new Map<string, Node>()
 const edges = new Map<EdgeKey, Edge>()
 
+/**
+ * ★ [15] (5) — the temporal scrubber's track, maintained incrementally.
+ *
+ * See TimelineTracker: the scrubber used to derive its [min, max] by scanning every
+ * node/edge/finding on each structural change, which put an O(N+E) walk on the push
+ * path. Every timestamped insert below feeds this instead; every removal marks it
+ * for one lazy rebuild.
+ */
+const timeline = new TimelineTracker()
+
 /** Renderer-facing accessors. Not reactive by design ([7-D]). */
 export const graphData = {
   nodes,
@@ -49,7 +60,18 @@ export const graphData = {
   reset(): void {
     nodes.clear()
     edges.clear()
+    timeline.reset()
   },
+}
+
+/**
+ * The scrubber's [min, max] created_at, or null for an empty graph ([2-B]/M3).
+ *
+ * O(1) on the streaming path — the cost is paid one item at a time as data arrives,
+ * not re-derived per push. Only a removal makes the next call rescan.
+ */
+export function timelineBoundsNow(findings: Map<string, Finding>): TimelineBounds | null {
+  return timeline.bounds(nodes, edges, findings)
 }
 
 /** [5-D] one applied AI style — the resolved ids and the allowlisted values. */
@@ -325,15 +347,18 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     for (const node of snapshot.nodes) {
       nodes.set(node.id, node)
       noteLayer(layers, node.layer)
+      timeline.observe(node.created_at)
     }
     for (const edge of snapshot.edges) {
       edges.set(edgeKeyOf(edge), edge)
       noteLayer(layers, edge.layer)
+      timeline.observe(edge.created_at)
     }
     const findings = new Map<string, Finding>()
     for (const finding of snapshot.findings) {
       findings.set(finding.finding_id, finding)
       noteLayer(layers, finding.layer)
+      timeline.observe(finding.created_at)
     }
     for (const layer of snapshot.layers ?? []) noteLayer(layers, layer)
 
@@ -392,23 +417,33 @@ export const useGraphStore = create<GraphState>((set, get) => ({
             nodes.set(node.id, node)
             noteLayer(layers, node.layer)
             noteNodeAdd(node.id, isNew)
+            timeline.observe(node.created_at)
           }
           for (const upd of d.nodes_updated) {
             applyNodeUpdate(upd, layers)
             noteNodeUpdate(upd.id)
           }
-          for (const del of d.nodes_deleted) if (nodes.delete(del.id)) noteNodeDelete(del.id)
+          for (const del of d.nodes_deleted) {
+            if (nodes.delete(del.id)) {
+              noteNodeDelete(del.id)
+              timeline.invalidate()
+            }
+          }
           for (const edge of d.edges_added) {
             const key = edgeKeyOf(edge)
             const isNew = !edges.has(key)
             edges.set(key, edge)
             noteLayer(layers, edge.layer)
             noteEdgeAdd(key, isNew)
+            timeline.observe(edge.created_at)
           }
           for (const upd of d.edges_updated) applyEdgeUpdate(upd, layers)
           for (const del of d.edges_deleted) {
             const key = edgeKeyOf(del)
-            if (edges.delete(key)) noteEdgeDelete(key)
+            if (edges.delete(key)) {
+              noteEdgeDelete(key)
+              timeline.invalidate()
+            }
           }
           // *_updated is deliberately absent: an update changes what a node says,
           // never whether it exists, so it is an overlay concern, not a layout one.
@@ -427,6 +462,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
           nodes.set(event.data.id, event.data)
           noteLayer(layers, event.data.layer)
           noteNodeAdd(event.data.id, isNew)
+          timeline.observe(event.data.created_at)
           structural = true
           break
         }
@@ -435,7 +471,10 @@ export const useGraphStore = create<GraphState>((set, get) => ({
           noteNodeUpdate(event.data.id)
           break
         case 'node.delete':
-          if (nodes.delete(event.data.id)) noteNodeDelete(event.data.id)
+          if (nodes.delete(event.data.id)) {
+            noteNodeDelete(event.data.id)
+            timeline.invalidate()
+          }
           structural = true
           break
         case 'edge.add': {
@@ -444,6 +483,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
           edges.set(key, event.data)
           noteLayer(layers, event.data.layer)
           noteEdgeAdd(key, isNew)
+          timeline.observe(event.data.created_at)
           structural = true
           break
         }
@@ -452,13 +492,17 @@ export const useGraphStore = create<GraphState>((set, get) => ({
           break
         case 'edge.delete': {
           const key = edgeKeyOf(event.data)
-          if (edges.delete(key)) noteEdgeDelete(key)
+          if (edges.delete(key)) {
+            noteEdgeDelete(key)
+            timeline.invalidate()
+          }
           structural = true
           break
         }
         case 'finding.add':
           findings.set(event.data.finding_id, event.data)
           noteLayer(layers, event.data.layer)
+          timeline.observe(event.data.created_at)
           break
         case 'finding.update': {
           const existing = findings.get(event.data.finding_id)
@@ -471,7 +515,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
           break
         }
         case 'finding.delete':
-          findings.delete(event.data.finding_id)
+          if (findings.delete(event.data.finding_id)) timeline.invalidate()
           break
         case 'filter.set':
           // [5-C] An error reply means the server rejected this filter and left
@@ -632,6 +676,9 @@ function applyEdgeUpdate(update: EdgeUpdateData, layers: Map<string, LayerInfo>)
  * longer has.
  */
 function applyClear(data: ClearData, layers: Map<string, LayerInfo>): void {
+  // Either shape removes graph data, so the scrubber's track may have narrowed —
+  // findings survive a clear ([5-A]) and can still hold the bounds open.
+  timeline.invalidate()
   if (!data.layer) {
     nodes.clear()
     edges.clear()

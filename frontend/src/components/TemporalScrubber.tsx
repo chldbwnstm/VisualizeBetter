@@ -14,8 +14,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useStrings } from '../i18n'
-import { graphData, useGraphStore } from '../stores/graphStore'
-import { timelineBounds } from '../views/temporal'
+import { timelineBoundsNow, useGraphStore } from '../stores/graphStore'
 
 const PLAY_DURATION_MS = 6000
 
@@ -33,11 +32,15 @@ export function TemporalScrubber() {
   const cutoff = useGraphStore((s) => s.temporalCutoff)
   const setCutoff = useGraphStore((s) => s.setTemporalCutoff)
 
-  // The track: [earliest, latest] created_at. Recomputed only when the graph grows.
-  const bounds = useMemo(
-    () => timelineBounds(graphData.nodes, graphData.edges, findings),
-    [structureSeq, findings],
-  )
+  // The track: [earliest, latest] created_at.
+  //
+  // ★ [15] (5): this used to call timelineBounds(), walking every node, edge and
+  // finding — inside the render phase, on every structural change, i.e. once per
+  // push. At 100K that was 300,015 Date.parse calls landing in front of the cosmos
+  // effect ([15 개정] 렌즈 B). The store now keeps the bounds as data arrives, so
+  // reading them here is O(1); the dependency list is unchanged because the track
+  // must still refresh whenever the graph grows.
+  const bounds = useMemo(() => timelineBoundsNow(findings), [structureSeq, findings])
   const [playing, setPlaying] = useState(false)
   const rafRef = useRef<number | undefined>(undefined)
 

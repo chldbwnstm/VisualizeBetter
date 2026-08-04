@@ -36,6 +36,10 @@ const calls = {
   readbacks: 0,
   /** [13-B] CH2(3) — label-overlay readbacks, counted separately. */
   labelReadbacks: 0,
+  /** [15] (5) 레버 (b) — 카메라 재프레이밍 횟수. push 경로에서 빠졌는지 본다. */
+  fitViews: 0,
+  /** [15] (5) 레버 (a) — tracking 호출 횟수(무엇을 추적했는지와 별개로). */
+  trackCalls: 0,
 }
 
 /**
@@ -95,8 +99,11 @@ vi.mock('@cosmos.gl/graph', () => ({
       return source ? Array.from(source) : []
     }
     destroy() {}
-    fitView() {}
+    fitView() {
+      calls.fitViews += 1
+    }
     trackPointPositionsByIndices(indices: number[]) {
+      calls.trackCalls += 1
       calls.trackedIndices = Array.from(indices ?? [])
     }
     getTrackedPointPositionsMap() {
@@ -215,6 +222,9 @@ beforeEach(() => {
   calls.gpuPositions = null
   calls.readbacks = 0
   calls.labelReadbacks = 0
+  calls.fitViews = 0
+  calls.trackCalls = 0
+  ;(window as unknown as { __vbPainted?: unknown }).__vbPainted = undefined
   cosmosReady.isReady = true
   cosmosReady.ready = Promise.resolve()
   vi.useFakeTimers()
@@ -659,5 +669,125 @@ describe('★ [13-B] CH2(3) GPU readback — mock 이 값을 되돌려주므로 
     // **놓이는지**는 jsdom 에서 확인할 수 없다 — getBoundingClientRect 가 전부 0
     // 이라 화면 안/밖 판정이 성립하지 않는다. 그 축은 실제 브라우저가 필요하고
     // frontend/e2e/graph.spec.ts 가 담당한다.
+  })
+})
+
+/**
+ * ★ [15] (5) push→표시 — 종료점 고정과 두 레버 (계획서 [15 개정], TASK PERF1).
+ *
+ * 이 블록이 지키는 것은 "빨라졌다" 가 아니라 **어디까지가 push 경로인가** 다.
+ * 시간은 이 환경(jsdom + mock)에서 아무 의미가 없고, 의미가 있는 것은 push 1회가
+ * 무엇을 부르고 무엇을 부르지 않느냐다. M3c 회귀가 3주간 숨었던 이유도 정확히
+ * 이것을 세는 단언이 없어서였다.
+ */
+describe('★ [15] (5) push→표시: 종료점과 push 경로', () => {
+  test('[1] 데이터가 캔버스에 올라간 시점을 코드가 직접 찍는다', () => {
+    const painted = () => (window as unknown as { __vbPainted?: { n: number; at: number } }).__vbPainted
+    render(<OverviewCanvas highlighted={[]} />)
+
+    // 마운트도 한 번 적용한다(빈 그래프). harness 가 시각이 아니라 **카운터
+    // 증가**로 판정하는 이유가 이것이다 — 자기 push 이전의 페인트를 새 것으로
+    // 착각하지 않는다.
+    const base = painted()?.n ?? 0
+    addNodes('a', 'b')
+
+    // ★ harness 의 KPI 종료점이 바로 이 마크다. 없으면 (5)는 다시 React 스케줄링
+    // 우연에 기대는 DOM 관측으로 돌아가고, 그게 73.9ms 를 만든 사고였다.
+    expect(painted()?.n, 'push 가 페인트 마크를 올리지 않았다').toBe(base + 1)
+    const first = painted()!.at
+    expect(Number.isFinite(first)).toBe(true)
+
+    // 시각이 실제로 그때그때 찍히는지 — 가짜 타이머로 시간을 밀고 다시 push 한다.
+    // (절대값은 이 환경에서 의미가 없다. 실제 수치는 perf harness 가 잰다.)
+    act(() => vi.advanceTimersByTime(500))
+    addNodes('c')
+    expect(painted()!.n, '두 번째 push 도 세어져야 harness 가 자기 push 를 구분한다').toBe(base + 2)
+    expect(painted()!.at, '시각이 갱신되지 않으면 두 번째 측정이 첫 번째를 다시 잰다')
+      .toBeGreaterThan(first)
+  })
+
+  test('[3a] tracking 은 push 경로에서 빠지고 라벨 주기로 옮겨간다', () => {
+    render(<OverviewCanvas highlighted={[]} />)
+    addNodes('a', 'b')
+    act(() => vi.advanceTimersByTime(600))
+    act(() => vi.advanceTimersByTime(4000)) // 라벨 스로틀을 지나 tracking 이 한 번 돈다
+    calls.trackCalls = 0
+
+    addNodes('c') // 조용한 구간 뒤 단발 push — (5)가 재는 바로 그 모양
+
+    // push 그 자리에서는 tracking 이 없다(16.0ms 가 여기 있었다).
+    expect(calls.trackCalls, 'tracking 이 여전히 push 경로에 있다').toBe(0)
+
+    // 그래도 결국은 갱신된다 — 라벨이 새 노드를 못 받으면 기능이 죽는다.
+    act(() => vi.advanceTimersByTime(300))
+    expect(calls.trackCalls, '라벨 주기에서도 tracking 이 일어나지 않았다').toBeGreaterThan(0)
+    expect(calls.trackedIndices.length).toBeGreaterThan(0)
+  })
+
+  test('[3b] 재프레이밍은 push 경로에서 빠지되 곧 따라온다', () => {
+    render(<OverviewCanvas highlighted={[]} />)
+    addNodes('a', 'b')
+    act(() => vi.advanceTimersByTime(3000)) // settle 까지 끝낸 조용한 상태
+    calls.fitViews = 0
+
+    addNodes('c')
+
+    // push 그 자리에서는 fitView 가 없다(17.5ms 가 여기 있었다).
+    expect(calls.fitViews, 'keepFramed 가 여전히 push 경로에 있다').toBe(0)
+
+    // ★ 그러나 카메라는 반드시 따라온다. 안 그러면 화면 밖에 놓인 새 노드를
+    // 사용자가 영영 못 본다 — 그건 성능이 아니라 기능 파손이다.
+    act(() => vi.advanceTimersByTime(150))
+    expect(calls.fitViews, '새 노드가 온 뒤에도 카메라가 따라오지 않았다').toBeGreaterThan(0)
+  })
+
+  test('[3b] 버스트가 길어도 프레이밍이 굶지 않는다 (디바운스가 아니라 스로틀)', () => {
+    render(<OverviewCanvas highlighted={[]} />)
+    addNodes('seed')
+    act(() => vi.advanceTimersByTime(3000))
+    calls.fitViews = 0
+
+    // 100ms 간격보다 촘촘하게 계속 밀어넣는다.
+    for (let i = 0; i < 12; i += 1) {
+      addNodes(`burst${i}`)
+      act(() => vi.advanceTimersByTime(40))
+    }
+
+    // 디바운스였다면 여기서 0 이다 — 매 push 가 마감을 미루므로.
+    expect(calls.fitViews, '버스트 내내 카메라가 한 번도 따라오지 않았다').toBeGreaterThan(0)
+  })
+
+  test('[3b] settle 이 끝나면 프레이밍이 반드시 맞춰진다', () => {
+    render(<OverviewCanvas highlighted={[]} />)
+    addNodes('a', 'b')
+    act(() => vi.advanceTimersByTime(600)) // settle 진입
+    calls.fitViews = 0
+
+    act(() => vi.advanceTimersByTime(2500)) // SETTLE_MAX_MS 를 지나 finishSettle
+
+    // 레이아웃이 최종 위치로 움직인 뒤의 프레이밍은 디바운스에 맡기지 않는다.
+    expect(calls.fitViews, 'settle 종료 시 프레이밍이 없었다').toBeGreaterThan(0)
+    expect(calls.simulationEnabled).toContain(false) // FROZEN 도달
+  })
+
+  test('[7-D] 두 레버가 상태기계를 건드리지 않는다', () => {
+    const { rerender } = render(<OverviewCanvas highlighted={[]} />)
+    addNodes('a', 'b')
+    act(() => vi.advanceTimersByTime(3000)) // INGESTING → SETTLING → FROZEN
+    calls.simulationEnabled = []
+    calls.start = 0
+    calls.setPointPositions = 0
+
+    // highlight-only 는 여전히 레이아웃을 깨우지 않는다(structureSeq 가드).
+    rerender(<OverviewCanvas highlighted={['a']} />)
+    act(() => vi.advanceTimersByTime(2000))
+    expect(calls.simulationEnabled).not.toContain(true)
+    expect(calls.start).toBe(0)
+    expect(calls.setPointPositions).toBe(0)
+
+    // 반대로 구조 변경은 여전히 settle 을 재무장한다.
+    addNodes('c')
+    act(() => vi.advanceTimersByTime(600))
+    expect(calls.simulationEnabled).toContain(true)
   })
 })

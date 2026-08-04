@@ -49,6 +49,18 @@ const ANCHOR_SIZE_BOOST = 1.8
 const LABEL_REFRESH_MS = 80
 
 /**
+ * ★ [15] (5) — how long the camera may lag new nodes.
+ *
+ * fitView costs ~17.5ms, and paying it inline on every push is 17.5ms of the
+ * push→display budget. It is not optional work though: without it a node that
+ * lands outside the current view is drawn where nobody can see it. So it runs on
+ * a trailing throttle instead — the node appears immediately, the framing catches
+ * up within this window. Same order as the label throttle above, for the same
+ * reason: fast enough to read as immediate, slow enough to stay off the hot path.
+ */
+const KEEP_FRAMED_MS = 100
+
+/**
  * Quiet time before the layout settles ([7-D] SETTLING).
  *
  * Long enough that a burst of pushes does not trigger a settle mid-burst (each
@@ -95,6 +107,27 @@ function timed<T>(bucket: string, fn: () => T): T {
   const out = fn()
   mark(bucket, performance.now() - start)
   return out
+}
+
+/**
+ * ★ [15] (5) push→표시의 **종료점**을 코드에 못박는다 (계획서 [15 개정] 확정 2).
+ *
+ * harness 는 예전에 노드 카운트 DOM 텍스트의 MutationObserver 로 끝을 잡았다.
+ * 그건 React 스케줄링이 우연히 cosmos effect 를 DOM 커밋과 같은 태스크에 붙여 준
+ * 덕에 "그려진 뒤" 를 재고 있었을 뿐이고, 스케줄링이 달라지면 **조용히 다른 양을
+ * 잰다**. 공표값 73.9ms 가 정확히 그 사고였다 — 같은 리포트의 산술이 서버 53 +
+ * effect 69.1 ≈ 122ms 인데 73.9 를 실었다. 종료점이 effect **앞에서** 끊긴
+ * 낙관적 측정이었고, 3주 뒤 그 숫자를 재현할 수 없었던 이유가 그것이다.
+ *
+ * 그래서 정의를 관측 방식이 아니라 코드에 둔다: **데이터가 실제로 캔버스에
+ * 적용된 시점**이 (5)의 끝이다. arm 조건을 두지 않은 것도 같은 이유다 — harness
+ * 가 arm 을 잊으면 정의가 다시 흔들린다. 비용은 flush 당 속성 쓰기 두 번이다.
+ */
+function notePainted(): void {
+  const w = window as unknown as { __vbPainted?: { n: number; at: number } }
+  const slot = (w.__vbPainted ??= { n: 0, at: 0 })
+  slot.n += 1
+  slot.at = performance.now()
 }
 
 export interface OverviewCanvasProps {
@@ -244,6 +277,13 @@ export function OverviewCanvas({ highlighted = [], onSelectNode }: OverviewCanva
   const lastLabelRefresh = useRef(0)
   const trailingLabels = useRef<number | undefined>(undefined)
   const refreshLabelsRef = useRef<((force?: boolean) => void) | undefined>(undefined)
+  /**
+   * ★ [15] (5) 레버 (a): the point set changed, so the tracked indices are stale.
+   * refreshLabels re-tracks before its readback — see there for why it moved.
+   */
+  const trackedDirty = useRef(true)
+  /** ★ [15] (5) 레버 (b): a pending trailing re-frame, or undefined. */
+  const framedTimer = useRef<number | undefined>(undefined)
   /** ★ [7-D] 레이아웃 수명주기 상태. */
   const phase = useRef<LayoutPhase>('ingesting')
   const settleTimer = useRef<number | undefined>(undefined)
@@ -297,6 +337,23 @@ export function OverviewCanvas({ highlighted = [], onSelectNode }: OverviewCanva
     // to run a simulation for anyway.
     timed('fitView', () => graph.fitView(0, undefined, false))
   }, [])
+
+  /**
+   * ★ [15] (5) 레버 (b) — keepFramed 를 push 경로에서 뺀다.
+   *
+   * 트레일링 전용 스로틀이다. 선행(leading) 실행이 없는 것이 요점 — 있으면 조용한
+   * 구간 뒤 첫 push 가 그대로 17.5ms 를 문다(그게 (5)가 재는 바로 그 push 다).
+   * 이미 예약돼 있으면 다시 예약하지 않으므로 **디바운스가 아니다**: 버스트가
+   * 아무리 길어도 KEEP_FRAMED_MS 마다 한 번은 카메라가 따라붙는다. 노드 자체는
+   * 이미 그려져 있고 늦는 것은 프레이밍뿐이다.
+   */
+  const scheduleKeepFramed = useCallback(() => {
+    if (framedTimer.current !== undefined) return
+    framedTimer.current = window.setTimeout(() => {
+      framedTimer.current = undefined
+      keepFramed()
+    }, KEEP_FRAMED_MS)
+  }, [keepFramed])
 
   const [labels, setLabels] = useState<LabelPlacement[]>([])
   const [hovered, setHovered] = useState<Hovered | null>(null)
@@ -437,6 +494,34 @@ export function OverviewCanvas({ highlighted = [], onSelectNode }: OverviewCanva
     const graph = cosmos.current
     if (!graph || !arrays.current) return
 
+    // Trailing edge, and it is load-bearing rather than polish. With the
+    // simulation off ([7-D] INGESTING/FROZEN) nothing ticks, so a throttled call
+    // that simply returned would be the *last* word — the labels for a node
+    // pushed inside the window would never appear at all. Re-arm instead.
+    const armTrailing = () => {
+      if (trailingLabels.current !== undefined) return
+      trailingLabels.current = window.setTimeout(() => {
+        trailingLabels.current = undefined
+        refreshLabelsRef.current?.(true)
+      }, LABEL_REFRESH_MS)
+    }
+
+    // ★ [15] (5) 레버 (a) — 추적 갱신은 **forced 경로에서만** 한다.
+    //
+    // trackPointPositionsByIndices 는 push 마다 16.0ms 였다(렌즈 A 실측). 처음엔
+    // 그냥 라벨의 80ms 스로틀 아래로 옮겼는데 **그것만으로는 부족했다** — 조용한
+    // 구간 뒤 첫 push 는 스로틀이 열려 있어 선행 실행이 그대로 인라인으로 돌고,
+    // (5)가 재는 것이 정확히 그 push 다(테스트가 이 실수를 잡았다). 그래서 추적이
+    // 밀렸으면 인라인에서는 읽기도 추적도 하지 않고 트레일링으로 넘긴다.
+    //
+    // 라벨이 늦지 않는다는 보장은 트레일링이 준다: LABEL_REFRESH_MS 안에 forced
+    // 로 다시 들어와 추적과 읽기를 함께 한다. settle 종료(finishSettle)도 forced
+    // 라 최종 위치에서 반드시 한 번 돈다.
+    if (!force && trackedDirty.current) {
+      armTrailing()
+      return
+    }
+
     // Throttled on purpose. getTrackedPointPositionsMap reads back from the GPU,
     // and the simulation ticks at frame rate — doing this every tick stalls the
     // main thread (chromium logs "GPU stall due to ReadPixels"), which is the
@@ -444,16 +529,7 @@ export function OverviewCanvas({ highlighted = [], onSelectNode }: OverviewCanva
     // re-places ~12 times a second reads as smooth.
     const now = performance.now()
     if (!force && now - lastLabelRefresh.current < LABEL_REFRESH_MS) {
-      // Trailing edge, and it is load-bearing rather than polish. With the
-      // simulation off ([7-D] INGESTING/FROZEN) nothing ticks, so a throttled
-      // call that simply returned would be the *last* word — the labels for a
-      // node pushed inside the window would never appear at all. Re-arm instead.
-      if (trailingLabels.current === undefined) {
-        trailingLabels.current = window.setTimeout(() => {
-          trailingLabels.current = undefined
-          refreshLabelsRef.current?.(true)
-        }, LABEL_REFRESH_MS)
-      }
+      armTrailing()
       return
     }
     if (trailingLabels.current !== undefined) {
@@ -462,6 +538,16 @@ export function OverviewCanvas({ highlighted = [], onSelectNode }: OverviewCanva
     }
     lastLabelRefresh.current = now
 
+    // render() **뒤**여야 하는 제약은 그대로 지켜진다: refreshLabels 는 어느
+    // 경로에서든 render 뒤에 불린다(트레일링 타이머도 마찬가지로 그 뒤다).
+    // 그보다 먼저 부르면 pointsTextureSize 가 아직 없어 조용히 no-op 이 되고
+    // tracked 맵이 영원히 빈 채로 남는다.
+    if (trackedDirty.current && arrays.current) {
+      trackedDirty.current = false
+      timed('labels:trackPointPositions', () =>
+        graph.trackPointPositionsByIndices(pickTrackedIndices(arrays.current!)),
+      )
+    }
     const box = container.current?.getBoundingClientRect()
     // ★ TASK N 계측: readback 만 따로 — 이게 스톨의 후보 1번이다.
     const tracked = timed('readback(getTrackedPointPositionsMap)', () =>
@@ -533,6 +619,7 @@ export function OverviewCanvas({ highlighted = [], onSelectNode }: OverviewCanva
       if (settleTimer.current !== undefined) window.clearTimeout(settleTimer.current)
       if (settleMaxTimer.current !== undefined) window.clearTimeout(settleMaxTimer.current)
       if (trailingLabels.current !== undefined) window.clearTimeout(trailingLabels.current)
+      if (framedTimer.current !== undefined) window.clearTimeout(framedTimer.current)
       cosmos.current?.destroy()
       cosmos.current = null
       inc.current = null // a new cosmos gets a fresh builder ([7-D]/M3b baseline)
@@ -627,6 +714,7 @@ export function OverviewCanvas({ highlighted = [], onSelectNode }: OverviewCanva
       timed('overlay:render', () => graph.render(undefined, 0))
       // A renamed node needs its label redrawn; positions did not move.
       timed('overlay:refreshLabels', () => refreshLabels())
+      notePainted()
       return
     }
 
@@ -691,21 +779,27 @@ export function OverviewCanvas({ highlighted = [], onSelectNode }: OverviewCanva
     // which starts an animation on every flush *and* pauses the simulation for
     // its duration. Neither is wanted here; 0 snaps the data in.
     timed('effect:render', () => graph.render(undefined, 0))
-    // [7-A] track only the top-N by degree — those are the ones that get labels.
-    // After render(), not before: tracking allocates against pointsTextureSize,
-    // which render() is what sets. Called earlier it silently no-ops and the
-    // tracked map stays empty forever.
-    timed('effect:trackPointPositions', () =>
-      graph.trackPointPositionsByIndices(pickTrackedIndices(built)),
-    )
-    // cosmos fits on init, but the app starts empty, so that fit framed nothing.
-    // keepFramed carries the view from here until the user takes over.
-    timed('effect:keepFramed', () => keepFramed())
+    // ★ [15] (5) 레버 (a) — tracking 은 여기서 하지 않는다.
+    //
+    // [7-A] 는 상위 N 개만 추적하고 그 결과는 **라벨** 이 쓴다. 그런데 이 호출이
+    // push 경로에 있어 push 마다 16.0ms 를 물었다(렌즈 A 실측). 라벨 자체는 이미
+    // 80ms 스로틀 + 트레일링이라, tracking 을 그 옆으로 옮기면 같은 주기로 함께
+    // 갱신되면서 push 경로에서는 사라진다. 필요하다는 표시만 남긴다.
+    trackedDirty.current = true
+    // ★ [15] (5) 레버 (b) — 재프레이밍도 여기서 하지 않는다 (push 당 17.5ms).
+    //
+    // 카메라는 여전히 새 노드를 따라가야 한다. 그래서 제거가 아니라 **트레일링
+    // 스로틀**이다: 버스트 중에도 KEEP_FRAMED_MS 마다 한 번은 반드시 돌고, 단발
+    // push 뒤에도 그 안에 한 번 돈다. 노드는 이미 그려져 있고 늦는 것은 카메라
+    // 맞춤뿐이다. settle 종료 시점에는 finishSettle 이 직접 keepFramed 를 부른다.
+    scheduleKeepFramed()
     // Not forced. force here bypassed the 80ms throttle on every flush, paying a
     // GPU readback per push — the very stall 7d.1 added the throttle to stop. The
     // trailing edge guarantees the labels still land while the simulation is off.
     timed('effect:refreshLabels', () => refreshLabels())
     mark('effect(total)', performance.now() - effectStart)
+    // ★ [15] (5) 종료점 — 여기까지가 "실제 그려질 때까지" 다.
+    notePainted()
 
     // The graph just changed, so any settle in flight is stale — re-arm it.
     scheduleSettle()
