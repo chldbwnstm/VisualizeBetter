@@ -110,5 +110,14 @@ test('★ 진단: 클라 구간이 N 에 비례하는가 (100K vs 100노드)', a
   const ratio = big.client / Math.max(0.1, small.client)
   record('★ 진단 O(N) 판정', `클라 @100K ${big.client.toFixed(1)}ms vs @100 ${small.client.toFixed(1)}ms (배율 ${ratio.toFixed(1)}×) — ` +
     `근접(≈1×)이면 flush 당 고정비용, 비례(≫1×)이면 push 당 O(N) 재구축`)
-  expect(small.client).toBeGreaterThan(0)
+  // [13-B] CH2(5): 이 판정은 **일부러** 단언으로 승격하지 않는다. 위 두 스펙의
+  // 판정은 [15] 가 적어 둔 숫자를 옮겨 적는 것이지만, 여기엔 대응하는 인수 기준이
+  // 없다 — "배율 몇 배까지 허용" 은 지금 지어내야 하는 값이고, 인수 기준을 새로
+  // 만드는 것은 CLAUDE.md 의 STOP&ASK 다. 이건 [7-D] 상태기계를 고르게 만든
+  // **진단**이고 그 성격 그대로 둔다.
+  // 대신 진단이 성립할 조건은 단언한다: 두 구간이 **둘 다** 실제로 측정됐어야
+  // 배율에 의미가 있다. big.client 는 여기서 처음 단언된다 — 100K 구간이 0 이어도
+  // 배율은 0× 로 계산되고 테스트는 초록이었다.
+  expect(small.client, '@100 구간이 측정되지 않았다 — 배율의 분모가 없다').toBeGreaterThan(0)
+  expect(big.client, '@100K 구간이 측정되지 않았다 — 배율의 분자가 없다').toBeGreaterThan(0)
 })

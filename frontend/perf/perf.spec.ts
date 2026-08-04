@@ -9,12 +9,17 @@
  * Everything here is real: a live `visualizebetter serve`, real MCP calls, a real
  * WebSocket, cosmos.gl on a real WebGL context, and the browser's own rAF clock.
  *
- * These tests measure; they do not gate. A number that misses its target is
- * reported as a miss — that is the deliverable, not a failure to hide. Only a
- * broken *measurement* fails the run.
+ * ★ [13-B] CH2(5) — these tests used to measure without gating: a number that
+ * missed its target was printed as a miss and the run stayed green. That made
+ * the console the only place a regression appeared, and nothing turns a console
+ * red. The [15] verdicts below are `expect.soft` assertions now (see `./kpi.ts`
+ * for why soft, and why the numbers are [15]'s and not new ones). A broken
+ * *measurement* still fails hard and first — a verdict on noise is worse than
+ * no verdict.
  */
 
 import { expect, test } from '@playwright/test'
+import { kpiAtLeast, kpiExactly, kpiUnder } from './kpi'
 import { BASE, callTool, connectMcp, nodeSpecs } from './mcpClient'
 
 const NODE_TARGET = 10_000
@@ -224,11 +229,8 @@ test('(2) 10K 노드 정적 렌더 프레임율 — 목표 >=30 FPS', async () =
   const stats = frameStats(await stopFrameProbe())
 
   record('(2) 10K 정적 렌더 (pan/zoom, push 없음) — 목표 >=30 FPS', fmt(stats))
-  record(
-    '  → (2) 판정',
-    stats.medianFps >= 30 ? `통과 (${stats.medianFps.toFixed(1)} >= 30)` : `미달 (${stats.medianFps.toFixed(1)} < 30)`,
-  )
-  expect(stats.frames).toBeGreaterThan(30) // the probe ran; not a target assertion
+  expect(stats.frames).toBeGreaterThan(30) // 프로브가 실제로 돌았다 — 판정의 전제
+  kpiAtLeast(stats.medianFps, 30, '10K 렌더 >= 30 FPS')
 })
 
 // --- (3) [15] Node push → 화면 반영 < 100ms ---
@@ -282,8 +284,8 @@ test('(3) node push → 화면 반영 지연 — 목표 <100ms', async () => {
     '(3) push → 화면 반영 @10K (20 samples) — 목표 <100ms',
     `median ${mid.toFixed(1)}ms, p95 ${sorted[Math.floor(sorted.length * 0.95)].toFixed(1)}ms, max ${sorted[sorted.length - 1].toFixed(1)}ms`,
   )
-  record('  → (3) 판정', mid < 100 ? `통과 (${mid.toFixed(1)}ms < 100ms)` : `미달 (${mid.toFixed(1)}ms >= 100ms)`)
   expect(samples).toHaveLength(20)
+  kpiUnder(mid, 100, 'push → 화면 표시 < 100ms (@10K)')
 })
 
 // --- (6) [15] MCP tool 응답 (단일 push) < 50ms ---
@@ -303,8 +305,8 @@ test('(6) MCP tool 응답 — 단일 push, 목표 <50ms', async () => {
     '(6) MCP tool 응답 (단일 push, 순차 20회) — 목표 <50ms',
     `median ${mid.toFixed(1)}ms, max ${Math.max(...samples).toFixed(1)}ms`,
   )
-  record('  → (6) 판정', mid < 50 ? `통과 (${mid.toFixed(1)}ms < 50ms)` : `미달 (${mid.toFixed(1)}ms >= 50ms)`)
   expect(samples).toHaveLength(20)
+  kpiUnder(mid, 50, 'MCP tool 응답(단일 push) < 50ms')
 })
 
 // --- (1) ★ [7-D]/[15] 핵심 인수기준 ---
@@ -324,17 +326,13 @@ test('★ (1) 10K + 1000 push/s 중 pan/zoom 무렉 — [7-D] D2/배칭 전략 �
     `${load.achievedRate.toFixed(0)}/s (목표 ${PUSH_RATE}/s, sent ${load.sent}, failed ${load.failed}, ${(load.elapsedMs / 1000).toFixed(2)}s)`,
   )
   record('★ (1) 10K + 1000 push/s 중 pan/zoom — 목표 프레임 드랍 없음', fmt(stats))
-  record(
-    '  → (1) 판정',
-    stats.dropped === 0
-      ? `통과 (드랍 0)`
-      : `미달 (드랍 ${stats.dropped}/${stats.frames} = ${stats.droppedPct.toFixed(1)}%, >33ms)`,
-  )
 
   // The measurement must be valid even when the result is bad: too few frames,
-  // or a load far below target, would make the verdict meaningless.
+  // or a load far below target, would make the verdict meaningless. These stay
+  // hard, and stay first — a soft verdict on an invalid measurement is noise.
   expect(stats.frames).toBeGreaterThan(30)
   expect(load.sent).toBeGreaterThan(0)
+  kpiExactly(stats.dropped, 0, '10K + 1000 push/s 중 pan/zoom 프레임 드랍 0 ([7-D] 인수 기준)')
 })
 
 // --- (4) [15] 스냅샷 저장/복원 10K < 2s ---
@@ -354,14 +352,11 @@ test('(4) 스냅샷 save/restore 10K 왕복 — 목표 <2s', async () => {
     '(4) 스냅샷 save/restore 왕복 — 목표 <2s',
     `save ${saveMs.toFixed(0)}ms + restore ${loadMs.toFixed(0)}ms = ${(totalMs / 1000).toFixed(2)}s`,
   )
-  record(
-    '  → (4) 판정',
-    totalMs < 2000 ? `통과 (${(totalMs / 1000).toFixed(2)}s < 2s)` : `미달 (${(totalMs / 1000).toFixed(2)}s >= 2s)`,
-  )
   // restore is not just a load: [23-C] takes a recovery snapshot of the live 10K
   // graph first, so what a user pays for load_snapshot includes that save.
   record('  (4) 주: restore 는 [23-C] 파괴적 작업 직전 auto-snapshot(10K save) 포함', 'measured as user-visible cost')
   expect(snapshotId).toBeTruthy()
+  kpiUnder(totalMs, 2000, '스냅샷 save/restore 10K 왕복 < 2s')
 })
 
 // --- 진단: 미달 원인이 그래프 크기에 비례하는가 ---

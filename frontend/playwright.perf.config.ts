@@ -3,12 +3,23 @@ import { defineConfig } from '@playwright/test'
 /**
  * [15] 성능 측정 harness — separate from the functional e2e suite on purpose.
  *
- * Kept out of `npx playwright test` so the 13-test functional gate stays fast and
- * its pass/fail meaning stays clean: these tests measure and report, they do not
- * gate on hitting a target.
+ * Kept out of `npx playwright test`, and out of CI, for a reason that has not
+ * changed: every number here is decided by the GPU in the machine, and GPU
+ * throughput varies by an order of magnitude across machines. A [15] verdict on a
+ * runner with no GPU would fail where nothing is wrong — so the functional suite
+ * is the gate ([13-B] CH2(5) added it to CI) and this one is run deliberately.
  *
- *   uv run visualizebetter serve --port 8790 --no-open
+ * ★ What did change: the [15] verdicts inside these specs are real `expect.soft`
+ * assertions now, not strings printed into a console (see `perf/kpi.ts`). Running
+ * this by hand now *tells you* when a target was missed instead of leaving it to
+ * be spotted in the log.
+ *
+ *   uv run visualizebetter serve --port 8790 --no-open --data-dir .perfdata
  *   npx playwright test -c playwright.perf.config.ts
+ *
+ * ★ `--data-dir` is not optional: these specs call `clear_all`, and without it
+ * serve opens the real user store. See docs/benchmarks.md for the full procedure
+ * (the 100K fixture has to live in that directory anyway).
  */
 export default defineConfig({
   testDir: './perf',

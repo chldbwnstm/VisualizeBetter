@@ -4,7 +4,11 @@
  * Extends the [15] measurement methodology (TASK M/N, perf.spec.ts) to the M3 scale:
  * 100K nodes on a real cosmos.gl/WebGL context (RTX GPU via --use-angle=d3d11), a
  * live `visualizebetter serve`, real MCP + WebSocket, the browser's own rAF clock. Every
- * number is a measurement of the real path; a miss is reported as a miss.
+ * number is a measurement of the real path.
+ *
+ * ★ [13-B] CH2(5): a miss is no longer only *reported* — the [15] verdicts are
+ * `expect.soft` assertions now, so a regression turns this spec red instead of
+ * printing FAIL into a console nobody gates on. See `./kpi.ts` for why soft.
  *
  * The 100K graph is loaded through the [5-E] import_from_file path (the M3 KPI's own
  * ingest route), then rendered from the [8-C] /graph.json resync — exactly what a
@@ -14,6 +18,7 @@
  */
 
 import { expect, test, type Page } from '@playwright/test'
+import { kpiAtLeast, kpiUnder } from './kpi'
 import { BASE, callTool, connectMcp } from './mcpClient'
 
 const NODE_TARGET = 100_000
@@ -48,6 +53,23 @@ function fmt(s: FrameStats): string {
 function median(v: number[]): number { return [...v].sort((a, b) => a - b)[Math.floor(v.length / 2)] }
 
 let page: Page
+
+/**
+ * ★ [15] 판정은 측정이 **전부 끝난 뒤** 마지막 테스트가 한꺼번에 한다.
+ *
+ * 이 파일은 serial 이다(공유 page + 한 번만 적재하는 100K). serial 에서는 한
+ * 테스트가 실패하면 **뒤 테스트가 아예 실행되지 않는다** — 실측으로 확인했다:
+ * (5) 의 판정을 그 자리에서 단언했더니 (5) 미달과 함께 (6f) 메모리와 (7) settle
+ * 이 "did not run" 이 됐다. 회귀를 진단할 때 가장 필요한 게 그 전경인데 KPI 하나가
+ * 그것을 지운다. 그래서 측정은 전부 돌리고 판정만 끝에 모은다.
+ *
+ * (perf.spec.ts 는 serial 이 아니라 판정을 측정 자리에 둔다 — 거기서는 한 테스트의
+ * 실패가 다음 테스트를 막지 않으므로 실패가 제 지표 이름을 달고 뜨는 쪽이 낫다.)
+ */
+const verdicts: { criterion: string; check: () => void }[] = []
+function verdict(criterion: string, check: () => void) {
+  verdicts.push({ criterion, check })
+}
 
 async function startFrameProbe() {
   await page.evaluate(() => {
@@ -115,7 +137,7 @@ test.beforeAll(async ({ browser }) => {
   const imp = await callTool('import_from_file', { path: IMPORT_FILE })
   const importMs = Date.now() - importStart
   record('(2) import_from_file 100K (server in-process)', `${(importMs / 1000).toFixed(2)}s → ${JSON.stringify(imp)}`)
-  record('  → (2) 판정 (KPI <30s)', importMs < 30_000 ? `PASS (${(importMs / 1000).toFixed(2)}s)` : `FAIL (${(importMs / 1000).toFixed(2)}s)`)
+  verdict('배치 import 100K < 30s', () => kpiUnder(importMs, 30_000, '배치 import 100K < 30s'))
 
   page = await browser.newPage()
   await page.goto(BASE)
@@ -151,8 +173,10 @@ test('★ (1) 100K 정적 렌더 프레임율 (pan/zoom) — 목표 >=30 FPS', a
   await panZoom(6000)
   const stats = frameStats(await stopFrameProbe())
   record('★ (1) 100K 정적 렌더 (pan/zoom, push 없음)', fmt(stats))
-  record('  → (1) 판정 (KPI >=30 FPS)', stats.medianFps >= 30 ? `PASS (${stats.medianFps.toFixed(1)} >= 30)` : `FAIL (${stats.medianFps.toFixed(1)} < 30)`)
-  expect(stats.frames).toBeGreaterThan(30) // probe ran; not a target assertion
+  // 프로브가 실제로 돌았는지는 여기서 hard 로 본다 — 프레임이 몇 개 없으면 아래
+  // 판정은 측정이 아니라 잡음에 대한 판정이 되고, 그건 뒤 측정을 막을 만하다.
+  expect(stats.frames).toBeGreaterThan(30)
+  verdict('100K 렌더 >= 30 FPS', () => kpiAtLeast(stats.medianFps, 30, '100K 렌더 >= 30 FPS'))
 })
 
 // --- (5) [15] push → 화면 반영 @100K ---
@@ -162,15 +186,28 @@ test('(5) push → 화면 반영 지연 @100K — 목표 <100ms', async () => {
   const sorted = [...samples].sort((a, b) => a - b)
   const mid = sorted[Math.floor(sorted.length / 2)]
   record('(5) push → 화면 반영 @100K (20 samples)', `median ${mid.toFixed(1)}ms, p95 ${sorted[Math.floor(sorted.length * 0.95)].toFixed(1)}ms, max ${sorted[sorted.length - 1].toFixed(1)}ms`)
-  record('  → (5) 판정 (<100ms)', mid < 100 ? `PASS (${mid.toFixed(1)}ms)` : `FAIL (${mid.toFixed(1)}ms)`)
   expect(samples).toHaveLength(20)
+  verdict('push → 화면 표시 < 100ms (@100K)', () =>
+    kpiUnder(mid, 100, 'push → 화면 표시 < 100ms (@100K)'))
 })
 
 // --- (6f) 프론트엔드 메모리 @100K ---
 test('(6f) 프론트엔드 JS heap @100K', async () => {
-  const heap = await page.evaluate(() => (performance as unknown as { memory?: { usedJSHeapSize: number; totalJSHeapSize: number } }).memory)
-  record('(6f) 프론트 usedJSHeapSize @100K', heap ? `${(heap.usedJSHeapSize / 1e6).toFixed(0)} MB (total ${(heap.totalJSHeapSize / 1e6).toFixed(0)} MB)` : 'performance.memory 미제공')
-  expect(true).toBe(true)
+  // ★ 숫자를 **페이지 안에서** 꺼낸다. `performance.memory` 를 통째로 돌려주면
+  // 값이 프로토타입의 getter 라 직렬화에서 전부 떨어져 나가고, 남는 것은 빈
+  // 객체다. 그래서 이전 판은 "NaN MB (total NaN MB)" 를 기록하고 있었고 —
+  // `expect(true).toBe(true)` 라 아무도 몰랐다. 측정이 없는 측정이었다.
+  const heap = await page.evaluate(() => {
+    const m = (performance as unknown as { memory?: { usedJSHeapSize: number; totalJSHeapSize: number } }).memory
+    return m ? { used: m.usedJSHeapSize, total: m.totalJSHeapSize } : null
+  })
+  record('(6f) 프론트 usedJSHeapSize @100K', heap ? `${(heap.used / 1e6).toFixed(0)} MB (total ${(heap.total / 1e6).toFixed(0)} MB)` : 'performance.memory 미제공')
+  // [15] 에 프론트 메모리 인수 기준은 없다 — 이건 보고용 실측이라 문턱을 지어내지
+  // 않는다. 대신 **측정이 실제로 일어났는지**를 단언한다. 값을 못 얻은 경우는
+  // 조용한 통과가 아니라 skip 으로 보이게 한다.
+  test.skip(heap === null, 'performance.memory 미제공 — 이 브라우저에서는 측정 자체가 불가')
+  expect(heap!.used, '힙 수치를 얻지 못했다 — 기록된 값이 측정이 아니다').toBeGreaterThan(0)
+  expect(heap!.used).toBeLessThanOrEqual(heap!.total)
 })
 
 // --- (7) [7-D] 상태기계 settle @100K: 버스트 → SETTLING → FROZEN 비용 ---
@@ -194,4 +231,23 @@ test('(7) [7-D] settle @100K — 재개 스톨 + 100K 수렴 + 위치 readback',
   record('(7) settle 위치 회수 readback @100K', `${avg('capturePositions').toFixed(1)}ms`)
   record('(7) 버스트 종료→읽을 수 있기까지 @100K', `${readableAfterMs}ms (debounce 포함)`)
   expect(perf['settle:total(→readable)']).toBeTruthy()
+})
+
+// --- ★ [15] 판정 — 위 측정들을 인수 기준과 대조한다 ---
+//
+// 여기가 이 파일에서 회귀가 빨간불이 되는 자리다. 이전에는 각 판정이
+// `record('… 판정', cond ? 'PASS' : 'FAIL')` 로 콘솔에만 남았고, 콘솔은 아무도
+// 빨갛게 만들지 않았다.
+test('★ [15] 판정 — 실측을 M3 인수 기준과 대조', async () => {
+  // 판정할 것이 실제로 모였는가. 측정 테스트가 안 돌았는데 "미달 0건" 으로 초록인
+  // 것이 정확히 고치려는 상태다.
+  expect(
+    verdicts.map((v) => v.criterion),
+    '판정이 모이지 않았다 — 위 측정이 돌지 않았는데 통과할 뻔했다',
+  ).toEqual([
+    '배치 import 100K < 30s',
+    '100K 렌더 >= 30 FPS',
+    'push → 화면 표시 < 100ms (@100K)',
+  ])
+  for (const { check } of verdicts) check()
 })

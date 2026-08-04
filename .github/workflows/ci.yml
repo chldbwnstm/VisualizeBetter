@@ -36,6 +36,54 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  # ★ [13-B] CH2(5): until now no job started a browser. e2e/graph.spec.ts and the
+  # perf specs were written, green, and gating nothing — a regression in the loop the
+  # README sells (AI pushes over MCP → the browser draws it) could not turn CI red.
+  # `frontend` only proves the bundle compiles; jsdom cannot tell a canvas that
+  # paints from one that never does.
+  #
+  # The perf specs stay out, and that split is the point. They measure a GPU, and a
+  # runner has none — a [15] verdict here would fail where nothing is wrong. The
+  # functional suite does not care how fast a frame is, only that it arrives, so it
+  # runs on the runner's software renderer. Measured before adding this: forced onto
+  # SwiftShader (ANGLE/Vulkan/Subzero), the suite passed 21/21 in ~12s, four runs in
+  # a row, readPixels-based "the GPU actually drew" assertion included.
+  #
+  # Playwright starts `serve` itself (see frontend/playwright.config.ts), against a
+  # throwaway data dir — the suite calls clear_all.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+        with:
+          enable-cache: true
+      # `uv run visualizebetter serve` is what Playwright launches, so the venv has
+      # to exist before the browser does.
+      - run: uv sync --frozen
+      - run: npm ci
+        working-directory: frontend
+      - run: npx playwright install --with-deps chromium
+        working-directory: frontend
+      # serve mounts dist at / ([9-A]); without this the SPA is the 503 build page
+      # and every assertion below fails for a reason that is not a product bug.
+      - run: npm run build
+        working-directory: frontend
+      - run: npx playwright test
+        working-directory: frontend
+      - name: Upload the report when it fails
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: e2e-report
+          path: frontend/test-results/
+          if-no-files-found: ignore
+
   # ★ The claim no other job checks: "clone this, follow the README, get an app."
   # backend runs inside TestClient and frontend only proves the bundle builds —
   # neither starts a real `serve` and asks for `/`. That gap let a 404-on-a-fresh-

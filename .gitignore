@@ -40,6 +40,12 @@ Thumbs.db
 frontend/test-results/
 frontend/playwright-report/
 
+# The perf harness's data directory (docs/benchmarks.md tells you to make it).
+# It holds a 28MB generated fixture and the snapshot store the probe writes to —
+# neither belongs in the repository, and the store carries whatever graph was
+# loaded. Same reason serve.json is ignored above.
+.perfdata/
+
 # Internal design document — not part of the published tree
 VISUALIZEBETTER_PROJECT_PLAN.txt
 
